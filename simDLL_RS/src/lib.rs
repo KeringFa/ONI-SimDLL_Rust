@@ -15,6 +15,7 @@ pub mod logger;
 pub mod message_handler;
 pub mod sim;
 pub mod sim_api;
+pub mod sim_events;
 pub mod sim_frame_manager;
 pub mod sysinfo;
 pub mod stl_shim;
