@@ -10,7 +10,6 @@ use std::os::raw::{c_char, c_int, c_schar, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::abi::GameMessageHandler;
-use crate::abi::SYSINFO_STUB_JSON;
 use crate::crashdump;
 use crate::globals::G_GAME_MESSAGE_HANDLER;
 use crate::logger;
@@ -205,6 +204,7 @@ pub extern "C" fn SYSINFO_Release() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::SYSINFO_STUB_JSON;
 
     #[test]
     fn sim_initialize_with_null_handler_does_not_panic() {
