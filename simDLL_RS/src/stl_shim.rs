@@ -52,6 +52,28 @@ pub struct MsvcFunction {
     pub storage: [u8; 56],
 }
 
+/// std::mutex (MSVC, IDL>=1) = 80B。
+///
+/// 占位：内部 `_Mtx_internal_imp_t` struct，包含 SRWLOCK 或 RTL_CRITICAL_SECTION
+/// + iterator debugging 头部 + 计数字段。Phase 6+ 接入业务逻辑（lock/unlock）时
+/// 替换为真实实现或调用 Win32 SRW API。
+///
+/// **对齐**：`#[repr(C, align(8))]` 保证 8 字节对齐（std::mutex 在 MSVC x64
+/// 上对齐为 8，因为内部含指针）。
+#[repr(C, align(8))]
+pub struct MsvcMutex {
+    pub _internal: [u8; 80],
+}
+
+/// std::condition_variable (MSVC) = 8B。
+///
+/// 占位：基于 SRWCONDITION_VARIABLE（Win32 `SleepConditionVariableSRW`）。
+/// 无论 IDL 等级，sizeof(std::condition_variable) 始终 8B。
+#[repr(C, align(8))]
+pub struct MsvcCondVar {
+    pub _internal: [u8; 8],
+}
+
 // Safety: 这些是 POD 占位 struct，跨线程共享原始指针是安全的
 // （Phase 1 不实际使用这些容器，只占内存布局）。
 unsafe impl<T: Send> Send for MsvcVector<T> {}
@@ -84,5 +106,18 @@ mod tests {
     #[test]
     fn msvc_function_size() {
         assert_eq!(size_of::<MsvcFunction>(), 64);
+    }
+
+    #[test]
+    fn msvc_mutex_size() {
+        // 80B —— MSVC std::mutex with _ITERATOR_DEBUG_LEVEL >= 1
+        // （Concurrency::details::stl_critical_section_win7 + IDL 头部 + 计数字段）
+        assert_eq!(size_of::<MsvcMutex>(), 80);
+    }
+
+    #[test]
+    fn msvc_cond_var_size() {
+        // 8B —— SRWCONDITION_VARIABLE，无论 IDL 等级
+        assert_eq!(size_of::<MsvcCondVar>(), 8);
     }
 }
