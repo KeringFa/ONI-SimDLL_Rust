@@ -15,3 +15,14 @@ pub mod sim;
 pub mod sim_api;
 pub mod sim_frame_manager;
 pub mod sysinfo;
+
+pub mod globals {
+    //! 全局静态变量，对应原版 simDLL 的全局状态。
+    //! Phase 0：仅 GameMessageHandler，其他状态在 Phase 1+ 添加。
+
+    use crate::abi::GameMessageHandler;
+    use once_cell::sync::OnceCell;
+
+    /// C# 注册的消息回调。对应原版 `gGameMessageHandler`。
+    pub static G_GAME_MESSAGE_HANDLER: OnceCell<GameMessageHandler> = OnceCell::new();
+}

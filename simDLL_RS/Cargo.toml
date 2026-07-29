@@ -13,10 +13,13 @@ crate-type = ["cdylib", "rlib"]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",        # 新增：MiniDumpWriteDump/EXCEPTION_POINTERS/SetUnhandledExceptionFilter
+    "Win32_System_Memory",        # 新增：MiniDumpWriteDump
     "Win32_System_Threading",
     "Win32_System_SystemInformation",
     "Win32_System_LibraryLoader",
     "Win32_System_WindowsProgramming",
+    "Win32_Security",             # 新增：CreateFileA
     "Win32_Storage_FileSystem",
 ] }
 tracing = "0.1"
