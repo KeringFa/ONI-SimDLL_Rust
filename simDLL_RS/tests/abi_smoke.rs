@@ -3,7 +3,7 @@
 //! 运行：cargo test --test abi_smoke
 
 use SimDLL::sim_api::*;
-use std::os::raw::{c_char, c_int, c_schar, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 
 #[test]
 fn sim_initialize_with_null_handler_smoke() {
@@ -84,4 +84,30 @@ fn full_lifecycle_smoke() {
     let _ = SYSINFO_Acquire();
     SYSINFO_Release();
     SIM_Shutdown();
+}
+
+#[test]
+fn binary_buffer_round_trip_integration() {
+    use SimDLL::buffer::{BinaryBufferReader, BinaryBufferWriter};
+
+    let mut writer = BinaryBufferWriter::new();
+    writer.write_int(42).unwrap();
+    writer.write_uint(0xDEAD_BEEF).unwrap();
+    writer.write_float(3.14).unwrap();
+    writer.write_string("hello simDLL").unwrap();
+    writer.write_byte(0xFF).unwrap();
+    writer.write_short(-1).unwrap();
+    writer.write_ushort(60000).unwrap();
+
+    let bytes = writer.into_bytes();
+    let mut reader = BinaryBufferReader::new(&bytes);
+
+    assert_eq!(reader.read_int().unwrap(), 42);
+    assert_eq!(reader.read_uint().unwrap(), 0xDEAD_BEEF);
+    assert_eq!(reader.read_float().unwrap(), 3.14);
+    assert_eq!(reader.read_string().unwrap(), "hello simDLL");
+    assert_eq!(reader.read_byte().unwrap(), 0xFF);
+    assert_eq!(reader.read_short().unwrap(), -1);
+    assert_eq!(reader.read_ushort().unwrap(), 60000);
+    assert!(reader.is_at_end());
 }
