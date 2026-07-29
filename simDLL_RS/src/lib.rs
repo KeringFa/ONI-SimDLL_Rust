@@ -8,6 +8,7 @@
 pub mod abi;
 pub mod buffer;
 pub mod crashdump;
+pub mod element;
 pub mod frame_sync;
 pub mod logger;
 pub mod message_handler;
