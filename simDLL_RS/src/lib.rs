@@ -16,6 +16,7 @@ pub mod sim_api;
 pub mod sim_frame_manager;
 pub mod sysinfo;
 pub mod stl_shim;
+pub mod vector_math;
 
 pub mod globals {
     //! 全局静态变量，对应原版 simDLL 的全局状态。
