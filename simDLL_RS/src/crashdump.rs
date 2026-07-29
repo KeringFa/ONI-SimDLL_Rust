@@ -42,7 +42,7 @@ const MAX_FRAMES: usize = 64;
 pub fn initialize() {
     unsafe {
         // SAFETY: SetUnhandledExceptionFilter 注册回调，副作用是修改进程级状态。
-        // 回调本身是 unsafe extern "C" fn，签名匹配 EXCEPTION_FILTER_HANDLER。
+        // 回调本身是 unsafe extern "system" fn，签名匹配 EXCEPTION_FILTER_HANDLER。
         SetUnhandledExceptionFilter(Some(sim_dll_unhandled_exception_filter));
     }
 }
@@ -162,7 +162,7 @@ unsafe extern "system" fn sim_dll_unhandled_exception_filter(
         }
         // 把字符串 leak 成 C 字符串
         let trace_cstr = leak_c_string(trace);
-        let filename_cstr = leak_c_string(format!("{}\0", dump_filename));
+        let filename_cstr = leak_c_string(dump_filename.clone());
 
         let payload = CrashNotifyPayload {
             stacktrace: trace_cstr as *const c_char,
@@ -182,7 +182,7 @@ unsafe extern "system" fn sim_dll_unhandled_exception_filter(
         loop {
             // SwitchToThread 在 windows crate 中需要 Win32_System_Threading
             unsafe {
-                windows::Win32::System::Threading::SwitchToThread();
+                let _ = windows::Win32::System::Threading::SwitchToThread();
             }
             // 避免 Rust 编译器优化掉空循环
             std::hint::spin_loop();
