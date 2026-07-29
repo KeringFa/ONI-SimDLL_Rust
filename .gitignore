@@ -1,0 +1,29 @@
+# 原版游戏二进制与反编译产物（体积大、不进 git）
+OxygenNotIncluded_Data/
+OxygenNotIncluded_Source/Assembly-CSharp/
+OxygenNotIncluded_Source/SimDLL_Source.c
+*.dll
+*.pdb
+*.bank
+*.bundle
+
+# Rust 构建产物
+simDLL_RS/target/
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE / 系统文件
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志与崩溃转储
+logs/
+*.dmp
+*.log
+
+# Trae skills（项目自带，不进版本库）
+.trae/
