@@ -1683,6 +1683,7 @@ mod tests {
     /// 依赖任务 1 的 Phase 3 Load bug 修复（5 ints + 1 byte 头部对称读取）。
     #[test]
     fn save_then_load_round_trip() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_save_buffer();
 
         // 注册 1 个元素：id=99, idx=0
@@ -1698,7 +1699,7 @@ mod tests {
         }
 
         // 设置 SimData：1×1，1 个 cell，element_idx=0, temp=300, mass=2, radiation=0.5
-        let cells_ptr = {
+        let _cells_ptr = {
             let mut g = G_SIM_DATA.lock().unwrap();
             g.width = 1;
             g.height = 1;
