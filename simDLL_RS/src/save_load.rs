@@ -374,17 +374,19 @@ pub fn load(reader: &mut BinaryBufferReader) -> Result<(), BufferError> {
     // 读 version（L34）
     let version = reader.read_int()?;
 
-    let mut inner_w: i32 = 0;
     let mut inner_h: i32 = 0;
     let mut start_offset: i32 = 0;
     let mut save_settings_byte: u8 = 0;
     let mut local_60: i32 = 0;
 
     // header 读取（L35-46）
+    // 修复 Phase 3 多读 bug：源码 L36/L37 各只调用 1 次 ReadInt，
+    // Phase 3 误读为 3 次（inner_w/inner_h/start_offset）。
+    // 依据源码 L51-52 使用点：L36→local_res18[0]→iVar8（inner bound=inner_h），
+    // L37→local_res20→iVar9（outer bound=start_offset）。inner_w 移除（未使用）。
     if version < 0x10 {
-        inner_w = reader.read_int()?;       // L36 local_res18[0]
-        inner_h = reader.read_int()?;       // L37 local_res18[1]（Ghidra 遗漏）
-        start_offset = reader.read_int()?;  // L37 local_res20（决策 #3：Ghidra 误判丢弃）
+        inner_h = reader.read_int()?;       // L36 → local_res18[0] → iVar8（inner bound）
+        start_offset = reader.read_int()?;  // L37 → local_res20 → iVar9（outer bound）
         local_60 = 0;
         if version > 0xd {
             local_60 = reader.read_int()?;  // L40 saveSettings
@@ -401,7 +403,7 @@ pub fn load(reader: &mut BinaryBufferReader) -> Result<(), BufferError> {
         }
     }
 
-    tracing::info!(version, inner_w, inner_h, start_offset, "Load: header parsed");
+    tracing::info!(version, inner_h, start_offset, "Load: header parsed");
 
     // 三阶段双层循环（L48-192）
     let (width, updated_cells_ptr) = {
@@ -1270,5 +1272,33 @@ mod tests {
     #[test]
     fn prepare_game_data_update_does_not_panic() {
         prepare_game_data_update();
+    }
+
+    /// 验证 Phase 4 修复：Load 头部读取与 BeginSave 写入对称（5 ints + 1 byte）。
+    /// 构造一个 version=0xf 的最小 save buffer（仅头部 29 字节，0 cells），
+    /// 调 load 应成功读取所有头部字段且到达 buffer 末尾。
+    #[test]
+    fn load_version_0xf_reads_header_symmetric_with_begin_save() {
+        // 构造 buffer：magic(8) + version=0xf(4) + width=0(4) + height=0(4)
+        //                + p2=0(4) + p3=0(4) + saved_options=0(1) = 29 字节
+        // 注意：version=0xf 触发 if version < 0x10 分支；width=0/height=0
+        // 让 start_offset/inner_h 都为 0，跳过三阶段循环
+        let mut w = crate::buffer::BinaryBufferWriter::new();
+        w.write_bytes(&[0x53, 0x49, 0x4d, 0x53, 0x41, 0x56, 0x45, 0x00]).unwrap(); // "SIMSAVE\0"
+        w.write_int(0x0f).unwrap();  // version = 15
+        w.write_int(0).unwrap();     // width (L36 → inner_h，源码 local_res18[0]）
+        w.write_int(0).unwrap();     // height/start_offset (L37 → start_offset，源码 local_res20）
+        // version > 0xd：读 local_60 + _extra
+        w.write_int(0).unwrap();     // local_60 (L40)
+        w.write_int(0).unwrap();     // _extra (L41, discarded)
+        // version > 0xc：读 saved_options byte
+        w.write_byte(0).unwrap();    // saved_options (L45)
+        let buf = w.into_bytes();
+        assert_eq!(buf.len(), 29);
+
+        let mut reader = crate::buffer::BinaryBufferReader::new(&buf);
+        let result = load(&mut reader);
+        assert!(result.is_ok(), "load should succeed with 29-byte header: {:?}", result);
+        assert!(reader.is_at_end(), "reader should consume all 29 bytes (no over-read)");
     }
 }
