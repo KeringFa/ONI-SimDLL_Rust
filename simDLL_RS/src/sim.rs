@@ -48,6 +48,13 @@ pub struct Sim {
     pub frame_sync: *mut FrameSync,
 }
 
+impl Sim {
+    /// 构造零初始化的 Sim。
+    pub fn new_zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 // Safety: Sim 含裸指针，跨线程共享需 unsafe（Phase 3+ 接入业务逻辑时审视）
 unsafe impl Send for Sim {}
 unsafe impl Sync for Sim {}
@@ -61,5 +68,11 @@ mod tests {
     fn sim_size_matches_source() {
         // operator_new(0x228) 是源码硬编码值（01_sim_api.c L330）
         assert_eq!(size_of::<Sim>(), 0x228);  // 552B
+    }
+
+    #[test]
+    fn sim_new_zeroed() {
+        let s = Sim::new_zeroed();
+        assert!(s.frame_sync.is_null());
     }
 }

@@ -38,6 +38,13 @@ pub struct FrameSync {
 }
 // 估算总计 = 200B（80B mutex × 2 + 8B cond_var × 2 + 24B 头部 + 8B padding）
 
+impl FrameSync {
+    /// 构造零初始化的 FrameSync。
+    pub fn new_zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +56,12 @@ mod tests {
         // 范围断言容纳 std::mutex 实际可能 8B（总 120B）或 80B（总 200B）
         let actual = size_of::<FrameSync>();
         assert!(actual > 150 && actual < 250, "FrameSync size = {}", actual);
+    }
+
+    #[test]
+    fn frame_sync_new_zeroed() {
+        let fs = FrameSync::new_zeroed();
+        assert!(!fs.m_sim_ready_to_swap);
+        assert!(!fs.m_initialized);
     }
 }

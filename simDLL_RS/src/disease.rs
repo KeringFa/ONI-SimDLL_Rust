@@ -30,6 +30,16 @@ pub struct Disease {
     pub disease_names: MsvcVector<MsvcString>, // L9349 (32B)
 }
 
+impl Disease {
+    /// 构造空 Disease（2 个空 MsvcVector）。
+    pub fn new() -> Self {
+        Self {
+            diseases: MsvcVector::new(),
+            disease_names: MsvcVector::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +55,12 @@ mod tests {
     fn disease_size_matches_original() {
         // 原版 operator_new(0x40) = 64 字节
         assert_eq!(size_of::<Disease>(), 0x40);
+    }
+
+    #[test]
+    fn disease_new_empty_vectors() {
+        let d = Disease::new();
+        assert!(d.diseases.is_empty());
+        assert!(d.disease_names.is_empty());
     }
 }

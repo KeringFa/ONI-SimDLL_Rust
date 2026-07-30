@@ -140,6 +140,12 @@ pub struct UniquePtr<T> {
 
 /// std::string (MSVC SSO) = 32 字节。
 /// `_Bxty` union（16B：SSO inline buffer 或 heap pointer）+ size + capacity。
+///
+/// **Phase 3 Task T3 授权 derive 补全**：`MsvcString` 是纯 POD（无 Drop、无指针
+/// 语义业务字段），`Default`（全零 = 空 SSO string，与 MSVC `std::string` 默认
+/// 构造语义一致）+ `Copy` + `Clone` 都是安全且语义正确的。此次 derive 用于让
+/// `MsvcVector<MsvcString>::new()` 与 `is_empty()` 满足 `T: Default + Copy` bound。
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct MsvcString {
     pub buffer_or_inline: [u8; 16],

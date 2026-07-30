@@ -311,6 +311,39 @@ pub struct SimData {
     pub worlds: MsvcVector<WorldOffsetData>,                // L8432
 }
 
+impl SimData {
+    /// 构造零初始化的 SimData。
+    ///
+    /// 对照源码 11_msvcrt_ignored.c L24427 之前的 SimData::SimData 构造函数。
+    /// Phase 3 stub：仅初始化字段为零，不分配 cells/backwall 内存
+    /// （AllocateCells 后由 ResizeAndInitializeVacuumCells 填充）。
+    pub fn new_zeroed() -> Self {
+        // unsafe { std::mem::zeroed() } 是简单可靠的零初始化方式。
+        // MsvcVector 全零表示空 vector（_First=_Last=_End=null），
+        // UniquePtr 全零表示 null 指针，bool 全零表示 false。
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl CellSOA {
+    /// 构造空 CellSOA（11 个 MsvcVector 全空）。
+    pub fn new() -> Self {
+        Self {
+            element_idx: MsvcVector::new(),
+            temperature: MsvcVector::new(),
+            mass: MsvcVector::new(),
+            properties: MsvcVector::new(),
+            insulation: MsvcVector::new(),
+            strength_info: MsvcVector::new(),
+            disease_idx: MsvcVector::new(),
+            disease_count: MsvcVector::new(),
+            disease_infestation_tick_count: MsvcVector::new(),
+            disease_growth_accumulated_error: MsvcVector::new(),
+            radiation: MsvcVector::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +458,25 @@ mod tests {
                 actual, actual, actual as i64 - 0x890
             );
         }
+    }
+
+    #[test]
+    fn sim_data_new_zeroed_all_zero() {
+        let sd = SimData::new_zeroed();
+        assert_eq!(sd.width, 0);
+        assert_eq!(sd.height, 0);
+        assert_eq!(sd.num_game_cells, 0);
+        assert_eq!(sd.vacuum_element_idx, 0);
+        assert_eq!(sd.unobtanium_element_idx, 0);
+        assert_eq!(sd.saved_options, 0);
+        assert!(!sd.init_settle_thermal_boundaries);
+    }
+
+    #[test]
+    fn cell_soa_new_empty() {
+        let cs = CellSOA::new();
+        assert!(cs.element_idx.is_empty());
+        assert!(cs.temperature.is_empty());
+        assert!(cs.mass.is_empty());
     }
 }
