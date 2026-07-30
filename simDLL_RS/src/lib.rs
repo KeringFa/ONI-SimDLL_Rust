@@ -10,6 +10,7 @@ pub mod buffer;
 pub mod crashdump;
 pub mod disease;
 pub mod element;
+pub mod elements_table;
 pub mod frame_sync;
 pub mod game_data;
 pub mod logger;
