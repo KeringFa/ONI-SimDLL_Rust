@@ -314,7 +314,7 @@ fn create_element_interactions(reader: &mut BinaryBufferReader) -> Result<(), Bu
     let count_usize = count as usize;
 
     for _ in 0..count_usize {
-        // 每 entry 0x20=32 字节，读 30 字节 + skip 2 字节 padding（决策 #2）
+        // 每 entry 0x20=32 字节，与源码 stride 一致
         let signature = reader.read_int()?;
         let elem_idx1 = reader.read_ushort()?;
         let elem_idx2 = reader.read_ushort()?;
@@ -325,8 +325,7 @@ fn create_element_interactions(reader: &mut BinaryBufferReader) -> Result<(), Bu
         let elem1_mass_destruction_percent = reader.read_float()?;
         let elem2_mass_required_multiplier = reader.read_float()?;
         let elem_result_mass_creation_multiplier = reader.read_float()?;
-        // 共读 4 + 2*4 + 5*4 = 30 字节，剩 2 字节 padding @0x1e-0x1f
-        reader.skip(2)?;
+        // 共读 4 + 2*4 + 5*4 = 32 字节，与源码 0x20 stride 对齐
 
         if signature == GAS_OBLITERATION_SIGNATURE {
             // 用 default() 初始化（_pad1 是 element.rs 私有字段，跨模块 struct literal
@@ -660,7 +659,7 @@ mod tests {
             // @0x14 f32 elem1_mass_destruction_percent (4)
             // @0x18 f32 elem2_mass_required_multiplier (4)
             // @0x1c f32 elem_result_mass_creation_multiplier (4)
-            // 总计 30 字节，剩 2 字节 padding @0x1e-0x1f
+            // 总计 32 字节，与源码 0x20 stride 对齐
             w.write_int(sig).unwrap();
             w.write_ushort(idx1).unwrap();
             w.write_ushort(idx2).unwrap();
@@ -671,7 +670,6 @@ mod tests {
             w.write_float(destroy_pct).unwrap();
             w.write_float(req_mult).unwrap();
             w.write_float(create_mult).unwrap();
-            w.write_ushort(0).unwrap();  // 末尾 2 字节 padding
         }
         w.into_bytes()
     }
@@ -714,7 +712,13 @@ mod tests {
         // 验证 entry 2 字段（应该 push 到 [1]）
         let g1 = &table.gas_obliterations[1];
         assert_eq!(g1.elem_idx1, 7);
+        assert_eq!(g1.elem_idx2, 8);
         assert_eq!(g1.elem_result_idx, 9);
+        assert!((g1.interaction_probability - 0.3).abs() < 1e-6);
+        assert!((g1.min_mass - 5.0).abs() < 1e-6);
+        assert!((g1.elem1_mass_destruction_percent - 0.1).abs() < 1e-6);
+        assert!((g1.elem2_mass_required_multiplier - 0.8).abs() < 1e-6);
+        assert!((g1.elem_result_mass_creation_multiplier - 0.4).abs() < 1e-6);
 
         // liquid_obliterations / liquid_conversions 严格按源码只清空不填充
         assert!(table.liquid_obliterations.is_empty());
