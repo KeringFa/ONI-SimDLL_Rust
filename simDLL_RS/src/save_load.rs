@@ -54,11 +54,194 @@ unsafe impl Sync for GameDataUpdate {}
 pub static G_GAME_DATA_UPDATE: Lazy<Mutex<GameDataUpdate>> =
     Lazy::new(|| Mutex::new(GameDataUpdate::default()));
 
-use crate::buffer::{BinaryBufferReader, BufferError};
+use crate::buffer::{BinaryBufferReader, BinaryBufferWriter, BufferError};
 use crate::sim_data::CellSOA;
 use crate::stl_shim::MsvcVector;
 use crate::element::{INVALID_ELEMENT_HASH, INVALID_ELEMENT_INDEX};
 use crate::elements_table::get_element_index_pub;
+
+/// Save 操作错误类型（Phase 4 新增）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveError {
+    /// SimData 未初始化（updated_cells 指针为 null）。
+    SimDataNotInitialized,
+    /// 元素表为空（无法查找 element id）。
+    ElementsTableEmpty,
+}
+
+/// 全局 SaveBuffer 单例（对应原版 SaveBuffer 裸指针）。
+///
+/// **所有权**：`begin_save` 构造 `Vec<u8>` → `into_boxed_slice()` → 存入此全局；
+/// `end_save` 置 None 释放。指针有效期：begin_save 返回 → end_save 调用之间
+/// （单线程契约，与原版一致）。C# 必须在调 SIM_EndSave 前拷走数据。
+pub static G_SAVE_BUFFER: Lazy<Mutex<Option<Box<[u8]>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// BeginSave — 构造 save buffer 并写入完整存档数据。
+///
+/// 对照源码 `01_sim_api.c L7-171`（SIM_BeginSave）。
+///
+/// 返回值：save buffer 的数据指针（裸指针，C# 拷贝后调 end_save 释放）。
+/// 错误时返回 Err（FFI 层转 null）。
+///
+/// **写入顺序**（严格镜像源码）：
+/// 1. 头部 29 字节：magic "SIMSAVE\0" + version=15 + width + height + p2 + p3 + saved_options
+/// 2. Loop 1（每 cell 16B）：element_id + temperature + mass + radiation
+/// 3. Loop 2（每 cell 8B）：disease_hash（idx==0xff 时写 0）+ disease_count
+/// 4. Loop 3（每 cell 12B）：backwall_element_id（idx==0xffff 替换 vacuum）+ mass + temp
+pub fn begin_save(p2: i32, p3: i32) -> Result<*mut u8, SaveError> {
+    // 1. 若 SaveBuffer 已存在，先 drop（对应源码 if (SaveBuffer != NULL) 析构）
+    {
+        let mut g = G_SAVE_BUFFER.lock().unwrap();
+        *g = None;
+    }
+
+    // 2. 读取 SimData 字段（持锁期间拷贝所需数据，避免长时间持锁）
+    let (width, height, saved_options, updated_cells_ptr, backwall_ptr) = {
+        let g = G_SIM_DATA.lock().unwrap();
+        (
+            g.width,
+            g.height,
+            g.saved_options,
+            g.updated_cells.ptr,
+            g.backwall.ptr,
+        )
+    };
+
+    // 3. 计算所需 buffer 大小（源码 L27-28：iVar11 * 0x24 + 0x1d）
+    let total_cells = (width as i64).saturating_mul(height as i64);
+    let buffer_size = (total_cells.saturating_mul(36).saturating_add(29)) as usize;
+
+    // 4. 构造 BinaryBufferWriter 并写入头部（源码 L46-52）
+    let mut writer = BinaryBufferWriter::new();
+    writer.write_bytes(b"SIMSAVE\0").unwrap();              // magic (8)
+    writer.write_int(0x0f).unwrap();                         // version = 15
+    writer.write_int(width).unwrap();                        // 内部宽
+    writer.write_int(height).unwrap();                       // 内部高
+    writer.write_int(p2).unwrap();                            // p2
+    writer.write_int(p3).unwrap();                            // p3
+    writer.write_byte(saved_options).unwrap();                // saved_options (1)
+
+    // 5. 若 updated_cells 为 null，跳过三阶段循环（返回仅含头部的 buffer）
+    //    （源码不检查 null，但 Phase 3 stub 可能未 AllocateCells；防御性处理）
+    if !updated_cells_ptr.is_null() {
+        let updated_cells = unsafe { &*updated_cells_ptr };
+        let total = total_cells as usize;
+
+        // 6. 读元素表（用于 element_idx → element.id 查找）
+        let elements_snapshot: Vec<i32> = {
+            let table = crate::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.iter().map(|e| e.id).collect()
+        };
+
+        // === Loop 1（源码 L55-89）：每 cell 16 字节 ===
+        for i in 0..total {
+            let elem_idx = updated_cells.element_idx.get(i);  // u16，越界返回 0
+            let element_id = if (elem_idx as usize) < elements_snapshot.len() {
+                elements_snapshot[elem_idx as usize]
+            } else {
+                tracing::warn!(i, elem_idx, "begin_save: element_idx out of bounds, writing 0");
+                0
+            };
+            let temperature = updated_cells.temperature.get(i);
+            let mass = updated_cells.mass.get(i);
+            let radiation = updated_cells.radiation.get(i);
+            writer.write_int(element_id).unwrap();
+            writer.write_float(temperature).unwrap();
+            writer.write_float(mass).unwrap();
+            writer.write_float(radiation).unwrap();
+        }
+
+        // === Loop 2（源码 L90-117）：每 cell 8 字节 ===
+        // 读 disease 表（用于 disease_idx → name_hash 查找）
+        let disease_hashes_snapshot: Vec<u32> = {
+            let g = G_DISEASE.lock().unwrap();
+            // DiseaseInfo 是 Copy，直接收集 name_hash
+            let len = g.diseases.len();
+            (0..len).map(|i| g.diseases.get(i).name_hash).collect()
+        };
+        for i in 0..total {
+            let disease_idx = updated_cells.disease_idx.get(i);  // u8，越界返回 0
+            let disease_hash = if disease_idx == 0xff {
+                0  // 源码：无 disease 写 0
+            } else {
+                let idx = disease_idx as usize;
+                if idx < disease_hashes_snapshot.len() {
+                    disease_hashes_snapshot[idx]
+                } else {
+                    tracing::warn!(i, disease_idx, "begin_save: disease_idx out of bounds, writing 0");
+                    0
+                }
+            };
+            let disease_count = updated_cells.disease_count.get(i);
+            writer.write_uint(disease_hash).unwrap();
+            writer.write_int(disease_count).unwrap();
+        }
+
+        // === Loop 3（源码 L118-157）：每 cell 12 字节 ===
+        // backwall 可能未分配（Phase 3 stub）；检查指针
+        if !backwall_ptr.is_null() {
+            let backwall = unsafe { &mut *backwall_ptr };
+            for i in 0..total {
+                let mut bw_elem_idx = backwall.element_idx.get(i);  // u16
+                if bw_elem_idx == 0xffff {
+                    // 源码 L121-124：替换为 vacuum idx + 清零副作用
+                    bw_elem_idx = backwall.vacuum_element_idx;
+                    // 副作用：清零 mass 与 temperature（源码 L122-123）
+                    if i < backwall.mass.len() {
+                        backwall.mass.set(i, 0.0);
+                    }
+                    if i < backwall.temperature.len() {
+                        backwall.temperature.set(i, 0.0);
+                    }
+                }
+                let backwall_element_id = if (bw_elem_idx as usize) < elements_snapshot.len() {
+                    elements_snapshot[bw_elem_idx as usize]
+                } else {
+                    tracing::warn!(i, bw_elem_idx, "begin_save: backwall element_idx out of bounds, writing 0");
+                    0
+                };
+                let bw_mass = backwall.mass.get(i);
+                let bw_temp = backwall.temperature.get(i);
+                writer.write_int(backwall_element_id).unwrap();
+                writer.write_float(bw_mass).unwrap();
+                writer.write_float(bw_temp).unwrap();
+            }
+        } else {
+            // backwall 未分配：写 total * 12 字节零（保持字节布局对齐）
+            tracing::warn!("begin_save: backwall is null, writing zeros for loop 3");
+            for _ in 0..total {
+                writer.write_int(0).unwrap();
+                writer.write_float(0.0).unwrap();
+                writer.write_float(0.0).unwrap();
+            }
+        }
+    }
+
+    // 7. 存入全局 G_SAVE_BUFFER 并返回数据指针
+    let bytes = writer.into_bytes();
+    debug_assert_eq!(bytes.len(), buffer_size, "save buffer size mismatch");
+    let boxed: Box<[u8]> = bytes.into_boxed_slice();
+    let ptr = boxed.as_ptr() as *mut u8;
+    let mut g = G_SAVE_BUFFER.lock().unwrap();
+    *g = Some(boxed);
+    tracing::info!(buffer_size, "begin_save: save buffer constructed");
+    Ok(ptr)
+}
+
+/// EndSave — 释放全局 SaveBuffer。
+///
+/// 对照源码 `01_sim_api.c L195-204`（SIM_EndSave）。
+/// 若 SaveBuffer 为 None，no-op（幂等）。
+pub fn end_save() {
+    let mut g = G_SAVE_BUFFER.lock().unwrap();
+    if g.is_some() {
+        *g = None;
+        tracing::info!("end_save: save buffer released");
+    } else {
+        tracing::debug!("end_save: save buffer already null, no-op");
+    }
+}
 
 /// AllocateCells — 分配 SimData 的 cells/updated_cells/backwall SOA。
 ///
@@ -1300,5 +1483,153 @@ mod tests {
         let result = load(&mut reader);
         assert!(result.is_ok(), "load should succeed with 29-byte header: {:?}", result);
         assert!(reader.is_at_end(), "reader should consume all 29 bytes (no over-read)");
+    }
+
+    /// 辅助：构造一个 empty SimData（width=0/height=0，无 cells）。
+    /// 调用前需持 G_SIM_DATA 锁设置 width/height，并确保 updated_cells/backwall 为 null。
+    fn setup_empty_sim_data() {
+        let mut g = G_SIM_DATA.lock().unwrap();
+        g.width = 0;
+        g.height = 0;
+        g.saved_options = 0;
+        g.updated_cells.ptr = std::ptr::null_mut();
+        g.backwall.ptr = std::ptr::null_mut();
+    }
+
+    /// 辅助：清空 G_SAVE_BUFFER（测试间隔离）。
+    fn reset_save_buffer() {
+        let mut g = G_SAVE_BUFFER.lock().unwrap();
+        *g = None;
+    }
+
+    #[test]
+    fn begin_save_empty_world_returns_header_only() {
+        reset_save_buffer();
+        setup_empty_sim_data();
+        // total_cells = 0 * 0 = 0，buffer = 29 + 0*36 = 29 字节
+        let result = begin_save(0, 0).unwrap();
+        assert!(!result.is_null());
+
+        // 验证 G_SAVE_BUFFER 已存入 29 字节
+        let g = G_SAVE_BUFFER.lock().unwrap();
+        let buf = g.as_ref().expect("save buffer should be Some");
+        assert_eq!(buf.len(), 29);
+
+        // 验证头部字节布局
+        assert_eq!(&buf[0..8], b"SIMSAVE\0");                       // magic
+        assert_eq!(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]), 0x0f); // version=15
+        assert_eq!(i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 0);  // width
+        assert_eq!(i32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]), 0);  // height
+        assert_eq!(i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]), 0);  // p2
+        assert_eq!(i32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]), 0);  // p3
+        assert_eq!(buf[28], 0);                                                       // saved_options
+    }
+
+    /// 辅助：构造一个最小 SimData（1 个 cell），含 updated_cells 但 backwall 为 null。
+    /// 返回 (ptr 用于后续手动释放)。
+    /// 调用者需在测试结束前用 Box::from_raw 回收 updated_cells。
+    fn setup_single_cell_sim_data(element_idx: u16, disease_idx: u8) -> *mut CellSOA {
+        let mut g = G_SIM_DATA.lock().unwrap();
+        g.width = 1;
+        g.height = 1;
+        g.saved_options = 0;
+
+        // 分配 CellSOA 并填入 1 个 cell 数据
+        let mut cells = Box::new(CellSOA::new());
+        cells.element_idx.resize(1, element_idx);
+        cells.temperature.resize(1, 300.0);
+        cells.mass.resize(1, 1.0);
+        cells.radiation.resize(1, 0.0);
+        cells.disease_idx.resize(1, disease_idx);
+        cells.disease_count.resize(1, 0);
+        let ptr = Box::into_raw(cells);
+        g.updated_cells.ptr = ptr;
+        g.backwall.ptr = std::ptr::null_mut();
+        ptr
+    }
+
+    #[test]
+    fn begin_save_one_cell_writes_36_bytes() {
+        reset_save_buffer();
+        // 注册 1 个元素：idx=0, id=42
+        {
+            use crate::elements_table::G_ELEMENTS_TABLE;
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.element_indices.clear();
+            let mut elem = crate::element::Element::default();
+            elem.id = 42;
+            table.elements.push(elem);
+            table.element_indices.insert(42, 0);
+        }
+        let cells_ptr = setup_single_cell_sim_data(0, 0xff);  // element_idx=0, disease_idx=0xff
+
+        let result = begin_save(7, 8).unwrap();
+        assert!(!result.is_null());
+
+        let g = G_SAVE_BUFFER.lock().unwrap();
+        let buf = g.as_ref().unwrap();
+        // 29 头 + 36 cell = 65 字节
+        assert_eq!(buf.len(), 65);
+
+        // 验证头部
+        assert_eq!(&buf[0..8], b"SIMSAVE\0");
+        assert_eq!(i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]), 1);  // width=1
+        assert_eq!(i32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]), 1);  // height=1
+        assert_eq!(i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]), 7);  // p2=7
+        assert_eq!(i32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]), 8);  // p3=8
+
+        // Loop 1 (offset 29, 16 字节)
+        assert_eq!(i32::from_le_bytes([buf[29], buf[30], buf[31], buf[32]]), 42);  // element_id
+        assert_eq!(f32::from_le_bytes([buf[33], buf[34], buf[35], buf[36]]), 300.0);  // temp
+        assert_eq!(f32::from_le_bytes([buf[37], buf[38], buf[39], buf[40]]), 1.0);  // mass
+        assert_eq!(f32::from_le_bytes([buf[41], buf[42], buf[43], buf[44]]), 0.0);  // radiation
+
+        // Loop 2 (offset 45, 8 字节)：disease_idx=0xff → disease_hash=0
+        assert_eq!(u32::from_le_bytes([buf[45], buf[46], buf[47], buf[48]]), 0);  // disease_hash
+        assert_eq!(i32::from_le_bytes([buf[49], buf[50], buf[51], buf[52]]), 0);  // disease_count
+
+        // Loop 3 (offset 53, 12 字节)：backwall 为 null → 写 0
+        assert_eq!(i32::from_le_bytes([buf[53], buf[54], buf[55], buf[56]]), 0);
+        assert_eq!(f32::from_le_bytes([buf[57], buf[58], buf[59], buf[60]]), 0.0);
+        assert_eq!(f32::from_le_bytes([buf[61], buf[62], buf[63], buf[64]]), 0.0);
+
+        // 回收 CellSOA 内存
+        unsafe { drop(Box::from_raw(cells_ptr)) };
+    }
+
+    #[test]
+    fn end_save_releases_buffer() {
+        reset_save_buffer();
+        setup_empty_sim_data();
+        let _ = begin_save(0, 0).unwrap();
+        {
+            let g = G_SAVE_BUFFER.lock().unwrap();
+            assert!(g.is_some());
+        }
+        end_save();
+        {
+            let g = G_SAVE_BUFFER.lock().unwrap();
+            assert!(g.is_none(), "G_SAVE_BUFFER should be None after end_save");
+        }
+    }
+
+    #[test]
+    fn begin_save_twice_drops_first_buffer() {
+        reset_save_buffer();
+        setup_empty_sim_data();
+        let _ = begin_save(1, 2).unwrap();
+        let first_ptr = {
+            let g = G_SAVE_BUFFER.lock().unwrap();
+            g.as_ref().unwrap().as_ptr() as usize
+        };
+        // 第二次 begin_save 应 drop 旧 buffer
+        let _ = begin_save(3, 4).unwrap();
+        let second_ptr = {
+            let g = G_SAVE_BUFFER.lock().unwrap();
+            g.as_ref().unwrap().as_ptr() as usize
+        };
+        assert_ne!(first_ptr, second_ptr, "second begin_save should allocate new buffer");
+        end_save();
     }
 }
