@@ -112,6 +112,16 @@ fn get_element_index(hash: u32) -> u16 {
     get_element_index_inner(&table, hash)
 }
 
+/// 公开包装：查找元素索引（供 save_load.rs 跨模块调用）。
+pub fn get_element_index_pub(hash: u32) -> u16 {
+    get_element_index(hash)
+}
+
+/// 公开包装：销毁元素表（供 save_load.rs 的 CleanUp 调用）。
+pub fn destroy_elements_table_pub() {
+    destroy_elements_table()
+}
+
 /// 反序列化元素表——4 阶段 + 后处理。
 ///
 /// 对照源码 03_elements.c L27-429（CreateElementsTable）。

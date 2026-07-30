@@ -16,6 +16,7 @@ pub mod game_data;
 pub mod game_data_update;
 pub mod logger;
 pub mod message_handler;
+pub mod save_load;
 pub mod sim;
 pub mod sim_api;
 pub mod sim_data;
