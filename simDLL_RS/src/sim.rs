@@ -53,6 +53,25 @@ impl Sim {
     pub fn new_zeroed() -> Self {
         unsafe { std::mem::zeroed() }
     }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L252）。
+    /// Phase 3 stub：仅记日志，不启动线程。
+    pub fn start(&mut self) {
+        tracing::debug!("Thread::start stub called");
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L638）。
+    /// Phase 3 stub：仅记日志，不等待线程。
+    pub fn join(&mut self) {
+        tracing::debug!("Thread::join stub called");
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L633）。
+    /// Phase 3 stub：返回 false（线程未启动）。
+    pub fn joinable(&self) -> bool {
+        tracing::debug!("Thread::joinable stub called, returning false");
+        false
+    }
 }
 
 // Safety: Sim 含裸指针，跨线程共享需 unsafe（Phase 3+ 接入业务逻辑时审视）
@@ -74,5 +93,23 @@ mod tests {
     fn sim_new_zeroed() {
         let s = Sim::new_zeroed();
         assert!(s.frame_sync.is_null());
+    }
+
+    #[test]
+    fn stub_start_does_not_panic() {
+        let mut s = Sim::new_zeroed();
+        s.start();
+    }
+
+    #[test]
+    fn stub_join_does_not_panic() {
+        let mut s = Sim::new_zeroed();
+        s.join();
+    }
+
+    #[test]
+    fn stub_joinable_returns_false() {
+        let s = Sim::new_zeroed();
+        assert!(!s.joinable());
     }
 }

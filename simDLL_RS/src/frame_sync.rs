@@ -43,6 +43,34 @@ impl FrameSync {
     pub fn new_zeroed() -> Self {
         unsafe { std::mem::zeroed() }
     }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L245）。
+    /// Phase 3 stub：仅记日志。
+    pub fn init_game_data(
+        &mut self,
+        inner_width: i32,
+        inner_height: i32,
+        width: i32,
+        height: i32,
+        updated_cells: *mut crate::sim_data::CellSOA,
+    ) {
+        tracing::debug!(
+            inner_width, inner_height, width, height,
+            "FrameSync::init_game_data stub called"
+        );
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L398）。
+    /// Phase 3 stub：仅记日志。
+    pub fn game_sync(&mut self) {
+        tracing::debug!("FrameSync::game_sync stub called");
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L653）。
+    /// Phase 3 stub：仅记日志。
+    pub fn clear(&mut self) {
+        tracing::debug!("FrameSync::clear stub called");
+    }
 }
 
 #[cfg(test)]
@@ -63,5 +91,23 @@ mod tests {
         let fs = FrameSync::new_zeroed();
         assert!(!fs.m_sim_ready_to_swap);
         assert!(!fs.m_initialized);
+    }
+
+    #[test]
+    fn stub_init_game_data_does_not_panic() {
+        let mut fs = FrameSync::new_zeroed();
+        fs.init_game_data(10, 10, 12, 12, std::ptr::null_mut());
+    }
+
+    #[test]
+    fn stub_game_sync_does_not_panic() {
+        let mut fs = FrameSync::new_zeroed();
+        fs.game_sync();
+    }
+
+    #[test]
+    fn stub_clear_does_not_panic() {
+        let mut fs = FrameSync::new_zeroed();
+        fs.clear();
     }
 }

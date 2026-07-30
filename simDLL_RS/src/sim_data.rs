@@ -323,6 +323,30 @@ impl SimData {
         // UniquePtr 全零表示 null 指针，bool 全零表示 false。
         unsafe { std::mem::zeroed() }
     }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L47）。
+    /// Phase 3 stub：仅记日志，不修改 saved_options。
+    pub fn apply_save_settings(&mut self, settings: u8) {
+        tracing::debug!(settings, "SimData::apply_save_settings stub called");
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L104）。
+    /// Phase 3 stub：仅记日志。
+    pub fn do_load_time_state_transition(&mut self, cell_idx: i32) {
+        tracing::debug!(cell_idx, "SimData::do_load_time_state_transition stub called");
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L220）。
+    /// Phase 3 stub：仅记日志。
+    pub fn settle_thermal_boundaries(&mut self) {
+        tracing::debug!("SimData::settle_thermal_boundaries stub called");
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L249）。
+    /// Phase 3 stub：仅记日志。
+    pub fn initialize_boundary(&mut self) {
+        tracing::debug!("SimData::initialize_boundary stub called");
+    }
 }
 
 impl CellSOA {
@@ -341,6 +365,12 @@ impl CellSOA {
             disease_growth_accumulated_error: MsvcVector::new(),
             radiation: MsvcVector::new(),
         }
+    }
+
+    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L218）。
+    /// Phase 3 stub：仅记日志，不拷贝数据。
+    pub fn copy_from(&mut self, other: &CellSOA) {
+        tracing::debug!("CellSOA::copy_from stub called");
     }
 }
 
@@ -478,5 +508,38 @@ mod tests {
         assert!(cs.element_idx.is_empty());
         assert!(cs.temperature.is_empty());
         assert!(cs.mass.is_empty());
+    }
+
+    #[test]
+    fn stub_apply_save_settings_does_not_panic() {
+        let mut sd = SimData::new_zeroed();
+        sd.apply_save_settings(0x05);
+        // stub 不修改 saved_options
+        assert_eq!(sd.saved_options, 0);
+    }
+
+    #[test]
+    fn stub_do_load_time_state_transition_does_not_panic() {
+        let mut sd = SimData::new_zeroed();
+        sd.do_load_time_state_transition(5);
+    }
+
+    #[test]
+    fn stub_settle_thermal_boundaries_does_not_panic() {
+        let mut sd = SimData::new_zeroed();
+        sd.settle_thermal_boundaries();
+    }
+
+    #[test]
+    fn stub_initialize_boundary_does_not_panic() {
+        let mut sd = SimData::new_zeroed();
+        sd.initialize_boundary();
+    }
+
+    #[test]
+    fn stub_cell_soa_copy_from_does_not_panic() {
+        let mut dst = CellSOA::new();
+        let src = CellSOA::new();
+        dst.copy_from(&src);
     }
 }
