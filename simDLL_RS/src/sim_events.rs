@@ -1,29 +1,43 @@
 //! SimEvents / SimFrameInfo — 模拟事件集合 + 单帧信息。
 //!
-//! 字段对照源码：
-//! - SimFrameInfo: 00_types_reference.c L5406-?（30+ 字段含 vector/ComponentMessages）
-//! - SimEvents: 00_types_reference.c L9363-9384（20 个 vector 字段，合计 480B）
-//!
-//! Phase 1 暂用空 struct 占位（size_of=0）。
-//! 字段待 Phase 3 从源码完整定位（需先定义所有引用的子 struct，
-//! 如 DigPoint/CellModification/SubstanceChangeInfo/SpawnOreInfo 等）。
+//! SimEvents 字段对照源码 00_types_reference.c L9363-9384（20 个 MsvcVector 字段）。
+//! SimFrameInfo 仍为占位（Phase 3+ 补全）。
 
-/// SimFrameInfo — 单帧信息。
-///
-/// 源码 L5406 起定义，含 elapsedSeconds + 4B undefined + 30+ vector/ComponentMessages 字段。
-/// Phase 1 占位：空 struct（size_of=0），Phase 3 补全字段后此断言会更新。
+use crate::stl_shim::MsvcVector;
+use crate::game_data::*;
+
+/// SimFrameInfo — 单帧信息（Phase 1 占位，Phase 3+ 补全）。
 #[repr(C)]
 pub struct SimFrameInfo {
-    // Phase 1 占位：字段待 Phase 3 补全
+    pub reserved: [u8; 0],
 }
 
-/// SimEvents — 模拟事件集合。
+/// SimEvents — 模拟事件集合（20 个 MsvcVector 字段）。
 ///
-/// 源码 L9363-9384 定义，含 20 个 vector<X> 字段（substanceChangeInfo/spawnLiquidInfo/.../backwallShouldTransitionInfo）。
-/// Phase 1 占位：空 struct（size_of=0），Phase 3 补全字段后此断言会更新。
+/// 字段对照源码 00_types_reference.c L9363-9384。
+/// 大小 = 20 × 32B = 640B = 0x280。
 #[repr(C)]
 pub struct SimEvents {
-    // Phase 1 占位：字段待 Phase 3 补全
+    pub substance_change_info: MsvcVector<SubstanceChangeInfo>,                // L9364 @0x00
+    pub spawn_liquid_info: MsvcVector<SpawnFallingLiquidInfo>,                 // L9365 @0x20
+    pub spawn_ore_info: MsvcVector<SpawnOreInfo>,                              // L9366 @0x40
+    pub unstable_cell_info: MsvcVector<UnstableCellInfo>,                      // L9367 @0x60
+    pub element_chunk_melted_info: MsvcVector<MeltedInfo>,                     // L9368 @0x80
+    pub building_melted_info: MsvcVector<MeltedInfo>,                          // L9369 @0xa0
+    pub building_overheat_info: MsvcVector<MeltedInfo>,                        // L9370 @0xc0
+    pub building_no_longer_overheated_info: MsvcVector<MeltedInfo>,            // L9371 @0xe0
+    pub cell_melted_info: MsvcVector<CellMeltedInfo>,                          // L9372 @0x100
+    pub callback_info: MsvcVector<CallbackInfo>,                               // L9373 @0x120
+    pub world_damage_info: MsvcVector<WorldDamageInfo>,                        // L9374 @0x140
+    pub mass_consumed_callbacks: MsvcVector<MassConsumedCallback>,             // L9375 @0x160
+    pub radiation_consumed_callbacks: MsvcVector<RadiationConsumedCallback>,   // L9376 @0x180
+    pub mass_emitted_callbacks: MsvcVector<MassEmittedCallback>,               // L9377 @0x1a0
+    pub disease_consumed_callbacks: MsvcVector<DiseaseConsumedCallback>,       // L9378 @0x1c0
+    pub spawn_fx_info: MsvcVector<SpawnFXInfo>,                                // L9379 @0x1e0
+    pub component_state_changed_messages: MsvcVector<ComponentStateChangedMessage>, // L9380 @0x200
+    pub dig_info: MsvcVector<SpawnOreInfo>,                                    // L9381 @0x220
+    pub backwall_element_changed_info: MsvcVector<BackwallElementChangedInfo>, // L9382 @0x240
+    pub backwall_should_transition_info: MsvcVector<BackwallShouldTransitionInfo>, // L9383 @0x260
 }
 
 #[cfg(test)]
@@ -32,14 +46,8 @@ mod tests {
     use std::mem::size_of;
 
     #[test]
-    fn sim_frame_info_size() {
-        // 占位空 struct = 0 字节（Phase 3 补全字段后此断言会更新）
-        assert_eq!(size_of::<SimFrameInfo>(), 0);
-    }
-
-    #[test]
     fn sim_events_size() {
-        // 占位空 struct = 0 字节（Phase 3 补全字段后此断言会更新）
-        assert_eq!(size_of::<SimEvents>(), 0);
+        // 20 × MsvcVector (32B) = 640B = 0x280
+        assert_eq!(size_of::<SimEvents>(), 640);
     }
 }

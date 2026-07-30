@@ -13,6 +13,7 @@ pub mod element;
 pub mod elements_table;
 pub mod frame_sync;
 pub mod game_data;
+pub mod game_data_update;
 pub mod logger;
 pub mod message_handler;
 pub mod sim;
