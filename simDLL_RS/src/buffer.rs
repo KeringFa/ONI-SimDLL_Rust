@@ -44,6 +44,11 @@ impl BinaryBufferReader {
         self.m_buffer_size.saturating_sub(self.m_offset)
     }
 
+    /// 当前读取偏移（用于错误日志输出）。
+    pub fn offset(&self) -> u64 {
+        self.m_offset
+    }
+
     /// 是否读到末尾。
     pub fn is_at_end(&self) -> bool {
         self.m_offset >= self.m_buffer_size
@@ -329,5 +334,26 @@ mod tests {
     fn binary_buffer_reader_size() {
         use std::mem::size_of;
         assert_eq!(size_of::<BinaryBufferReader>(), 24);
+    }
+
+    #[test]
+    fn offset_starts_at_zero_and_advances() {
+        let bytes = [0u8; 16];
+        let mut r = BinaryBufferReader::new(&bytes);
+        assert_eq!(r.offset(), 0);
+        r.read_int().unwrap();  // 4 字节
+        assert_eq!(r.offset(), 4);
+        r.skip(3).unwrap();
+        assert_eq!(r.offset(), 7);
+    }
+
+    #[test]
+    fn offset_reflects_full_read() {
+        let bytes = [0u8; 8];
+        let mut r = BinaryBufferReader::new(&bytes);
+        r.read_bytes(&mut [0u8; 8]).unwrap();
+        assert_eq!(r.offset(), 8);
+        assert!(r.is_at_end());
+        assert_eq!(r.remaining(), 0);
     }
 }
