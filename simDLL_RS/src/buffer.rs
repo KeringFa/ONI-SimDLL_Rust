@@ -17,6 +17,8 @@ pub enum BufferError {
     InvalidBool(u8),
     /// 写入失败（Writer 用，实际几乎不发生）。
     Io,
+    /// 魔数不匹配（Phase 3 新增，存档加载校验）。
+    InvalidMagic,
 }
 
 /// 二进制读取器。
@@ -355,5 +357,11 @@ mod tests {
         assert_eq!(r.offset(), 8);
         assert!(r.is_at_end());
         assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn invalid_magic_variant_exists() {
+        let e = BufferError::InvalidMagic;
+        assert_eq!(e, BufferError::InvalidMagic);
     }
 }

@@ -29,6 +29,109 @@ pub struct MsvcVector<T> {
     pub capacity_end: *mut T,
 }
 
+impl<T: Default + Copy> MsvcVector<T> {
+    /// 构造空 vector（4 个指针全 null，对应 MSVC 默认构造）。
+    pub fn new() -> Self {
+        Self {
+            container_proxy: std::ptr::null_mut(),
+            begin: std::ptr::null_mut(),
+            end: std::ptr::null_mut(),
+            capacity_end: std::ptr::null_mut(),
+        }
+    }
+
+    /// 是否为空（begin == end）。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 元素数量（end - begin，按 T 大小除）。
+    pub fn len(&self) -> usize {
+        if self.begin.is_null() || self.end.is_null() {
+            0
+        } else {
+            let byte_len = (self.end as usize).saturating_sub(self.begin as usize);
+            byte_len / std::mem::size_of::<T>()
+        }
+    }
+
+    /// 读取索引处的元素副本（越界返回 T::default()）。
+    pub fn get(&self, index: usize) -> T {
+        if index < self.len() {
+            unsafe { std::ptr::read(self.begin.add(index)) }
+        } else {
+            T::default()
+        }
+    }
+
+    /// 获取索引处元素的可变引用（越界返回 None）。
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.len() {
+            Some(unsafe { &mut *self.begin.add(index) })
+        } else {
+            None
+        }
+    }
+
+    /// 写入索引处的元素（越界时静默忽略，对应源码 _invalid_parameter_noinfo_noreturn 的安全降级）。
+    pub fn set(&mut self, index: usize, value: T) {
+        if index < self.len() {
+            unsafe { std::ptr::write(self.begin.add(index), value) }
+        }
+    }
+
+    /// 调整容量到 new_len，新元素用 value 填充。
+    ///
+    /// 对应 MSVC vector::resize。Phase 3 简化实现：
+    /// - 分配新缓冲区（Box<[T]>），释放旧缓冲区
+    /// - 不维护 _Container_proxy（Phase 6+ 接入真实 STL 时补）
+    pub fn resize(&mut self, new_len: usize, value: T) {
+        use std::alloc::{alloc, dealloc, Layout};
+        let elem_size = std::mem::size_of::<T>();
+        let elem_align = std::mem::align_of::<T>().max(8);  // MSVC vector 对齐 8B
+        if new_len == 0 {
+            if !self.begin.is_null() {
+                let old_len = self.len();
+                let old_byte_len = old_len * elem_size;
+                let layout = Layout::from_size_align(old_byte_len.max(1), elem_align)
+                    .unwrap();
+                unsafe { dealloc(self.begin as *mut u8, layout) };
+            }
+            self.begin = std::ptr::null_mut();
+            self.end = std::ptr::null_mut();
+            self.capacity_end = std::ptr::null_mut();
+            return;
+        }
+        let new_byte_len = new_len.checked_mul(elem_size).expect("overflow");
+        let layout = Layout::from_size_align(new_byte_len, elem_align).unwrap();
+        let new_buf = unsafe { alloc(layout) as *mut T };
+        if new_buf.is_null() {
+            // 分配失败：保持原状（对应源码 std::bad_alloc 抛异常，Rust 降级为静默）
+            return;
+        }
+        // 填充新值
+        for i in 0..new_len {
+            unsafe { std::ptr::write(new_buf.add(i), value) };
+        }
+        // 释放旧缓冲
+        if !self.begin.is_null() {
+            let old_len = self.len();
+            let old_byte_len = old_len * elem_size;
+            let old_layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
+            unsafe { dealloc(self.begin as *mut u8, old_layout) };
+        }
+        self.begin = new_buf;
+        self.end = unsafe { new_buf.add(new_len) };
+        self.capacity_end = self.end;
+    }
+}
+
+impl<T: Default + Copy> Default for MsvcVector<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// std::unique_ptr<T> = 8 字节（单一指针，default_delete 无状态）。
 #[repr(C)]
 pub struct UniquePtr<T> {
@@ -119,5 +222,42 @@ mod tests {
     fn msvc_cond_var_size() {
         // 8B —— SRWCONDITION_VARIABLE，无论 IDL 等级
         assert_eq!(size_of::<MsvcCondVar>(), 8);
+    }
+
+    #[test]
+    fn msvc_vector_new_is_empty() {
+        let v: MsvcVector<u32> = MsvcVector::new();
+        assert!(v.is_empty());
+        assert_eq!(v.len(), 0);
+    }
+
+    #[test]
+    fn msvc_vector_resize_and_get_set() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(3, 0);
+        assert_eq!(v.len(), 3);
+        assert!(!v.is_empty());
+        v.set(0, 42);
+        v.set(1, -7);
+        v.set(2, 100);
+        assert_eq!(v.get(0), 42);
+        assert_eq!(v.get(1), -7);
+        assert_eq!(v.get(2), 100);
+    }
+
+    #[test]
+    fn msvc_vector_get_mut_modifies() {
+        let mut v: MsvcVector<f32> = MsvcVector::new();
+        v.resize(2, 0.0);
+        if let Some(slot) = v.get_mut(0) {
+            *slot = 3.14;
+        }
+        assert_eq!(v.get(0), 3.14);
+    }
+
+    #[test]
+    fn msvc_vector_get_out_of_bounds_returns_none() {
+        let v: MsvcVector<u8> = MsvcVector::new();
+        assert_eq!(v.get(0), 0);  // 空 vector，get 返回 T::default
     }
 }
