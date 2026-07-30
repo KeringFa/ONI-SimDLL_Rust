@@ -57,12 +57,13 @@
 
 ### Phase 2 — 元素系统
 - `CreateElementsTable` / `DestroyElementsTable` / `GetElementIndex`
-- `CreateElementInteractions`
-- 加载 `OxygenNotIncluded_Data/StreamingAssets/elements/gas.yaml`
+- `CreateElementInteractions` / `CreateElementInteractionsLocked`
+- 从 `BinaryBufferReader` 反序列化元素表（C# 侧读 yaml 后序列化成 buffer 传给 simDLL，simDLL 不直接读 yaml）
 
 **验收**：
 - ✅ 元素表加载后元素 ID 与原版一致
 - ✅ `GetElementIndex(hash)` 返回正确索引
+- ✅ 5 个导出函数可被集成测试调用不 panic
 
 ### Phase 3 — 存档加载 ⭐（关键里程碑）
 - `Load` / `Start` / `AllocateCells` / `DefineWorldOffsets` / `PrepareGameData`
