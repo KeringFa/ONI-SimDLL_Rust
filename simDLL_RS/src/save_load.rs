@@ -1126,8 +1126,15 @@ mod tests {
     use super::*;
     use crate::buffer::{BinaryBufferReader, BinaryBufferWriter};
 
+    /// save_load 模块测试序列化锁：避免共享全局状态（G_SIM_DATA /
+    /// G_SAVE_BUFFER / G_ELEMENTS_TABLE / G_DISEASE 等）的测试并行执行导致
+    /// setup 互相覆盖。所有 save_load::tests 中的测试开头获取此锁，串行执行。
+    /// 不获取此锁的测试不存在（global_singletons_lockable 也获取）。
+    static PHASE4_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn global_singletons_lockable() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _a = G_SIM_DATA.lock().unwrap();
         let _b = G_FRAME_SYNC.lock().unwrap();
         let _c = G_SIM.lock().unwrap();
@@ -1137,6 +1144,7 @@ mod tests {
 
     #[test]
     fn allocate_cells_creates_sim_data_with_dimensions() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 构造 buffer: width=4, height=4, bool1=true, bool2=false
         let mut w = BinaryBufferWriter::new();
         w.write_int(4).unwrap();   // width
@@ -1154,6 +1162,7 @@ mod tests {
 
     #[test]
     fn define_world_offsets_reads_count() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut w = BinaryBufferWriter::new();
         w.write_int(1).unwrap();  // count=1
         // 4×int32 per WorldOffsetData
@@ -1170,6 +1179,7 @@ mod tests {
 
     #[test]
     fn set_saved_options_updates_field() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 先重置 saved_options
         {
             let mut sd = G_SIM_DATA.lock().unwrap();
@@ -1187,6 +1197,7 @@ mod tests {
 
     #[test]
     fn create_disease_table_replaces_global() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut w = BinaryBufferWriter::new();
         // Disease::Disease 构造函数从 reader 读数据，Phase 3 stub 不读
         let buf = w.into_bytes();
@@ -1199,6 +1210,7 @@ mod tests {
 
     #[test]
     fn clear_unoccupied_cells_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 先调用 allocate_cells 确保 SimData 有数据
         let mut w = BinaryBufferWriter::new();
         w.write_int(2).unwrap();
@@ -1226,6 +1238,7 @@ mod tests {
 
     #[test]
     fn cell_read_writes_to_cells_soa() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 注册一个元素
         register_element(0x12345678, 5);
 
@@ -1252,6 +1265,7 @@ mod tests {
 
     #[test]
     fn cell_read_nan_temp_replaced_with_300() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         register_element(0x12345678, 5);
 
         let mut cells = CellSOA::new();
@@ -1275,6 +1289,7 @@ mod tests {
 
     #[test]
     fn cell_read_inf_mass_replaced_with_100() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         register_element(0x12345678, 5);
 
         let mut cells = CellSOA::new();
@@ -1297,6 +1312,7 @@ mod tests {
 
     #[test]
     fn cell_read_invalid_hash_replaced_with_vacuum() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 未注册的 hash → GetElementIndex 返回 0xffff → 用 INVALID_ELEMENT_HASH 重查
         // 先注册 INVALID_ELEMENT_HASH → 7（模拟 vacuum idx）
         register_element(INVALID_ELEMENT_HASH, 7);
@@ -1324,6 +1340,7 @@ mod tests {
 
     #[test]
     fn load_with_empty_buffer_returns_invalid_magic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let buf = [0u8; 0];
         let mut reader = BinaryBufferReader::new(&buf);
         let result = load(&mut reader);
@@ -1332,6 +1349,7 @@ mod tests {
 
     #[test]
     fn load_with_valid_magic_and_high_version_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 构造最小 buffer: magic + version=0x10（高版本，跳过 innerW/innerH/startOffset 读取）
         let mut w = BinaryBufferWriter::new();
         w.write_bytes(&[0x53, 0x49, 0x4d, 0x53, 0x41, 0x56, 0x45, 0x00]).unwrap();
@@ -1344,6 +1362,7 @@ mod tests {
 
     #[test]
     fn resize_and_initialize_vacuum_cells_fills_internal() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 先 allocate_cells: 4×4 → SimData 6×6
         let mut w = BinaryBufferWriter::new();
         w.write_int(4).unwrap();
@@ -1423,6 +1442,7 @@ mod tests {
 
     #[test]
     fn start_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut w = BinaryBufferWriter::new();
         let buf = w.into_bytes();
         let mut reader = BinaryBufferReader::new(&buf);
@@ -1432,11 +1452,13 @@ mod tests {
 
     #[test]
     fn cleanup_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         cleanup();
     }
 
     #[test]
     fn prepare_game_data_returns_ok_when_sim_null() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // gSim 的 frame_sync 是 null，PrepareGameData 应安全返回
         let mut w = BinaryBufferWriter::new();
         let buf = w.into_bytes();
@@ -1446,6 +1468,7 @@ mod tests {
 
     #[test]
     fn game_sync_function_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut w = BinaryBufferWriter::new();
         let buf = w.into_bytes();
         let mut reader = BinaryBufferReader::new(&buf);
@@ -1454,6 +1477,7 @@ mod tests {
 
     #[test]
     fn prepare_game_data_update_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         prepare_game_data_update();
     }
 
@@ -1462,6 +1486,7 @@ mod tests {
     /// 调 load 应成功读取所有头部字段且到达 buffer 末尾。
     #[test]
     fn load_version_0xf_reads_header_symmetric_with_begin_save() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 构造 buffer：magic(8) + version=0xf(4) + width=0(4) + height=0(4)
         //                + p2=0(4) + p3=0(4) + saved_options=0(1) = 29 字节
         // 注意：version=0xf 触发 if version < 0x10 分支；width=0/height=0
@@ -1504,6 +1529,7 @@ mod tests {
 
     #[test]
     fn begin_save_empty_world_returns_header_only() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_save_buffer();
         setup_empty_sim_data();
         // total_cells = 0 * 0 = 0，buffer = 29 + 0*36 = 29 字节
@@ -1550,7 +1576,14 @@ mod tests {
 
     #[test]
     fn begin_save_one_cell_writes_36_bytes() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_save_buffer();
+        // 保存 G_ELEMENTS_TABLE 原始状态，测试结束后恢复（避免污染并行测试）
+        let (orig_elements, orig_indices) = {
+            use crate::elements_table::G_ELEMENTS_TABLE;
+            let table = G_ELEMENTS_TABLE.lock().unwrap();
+            (table.elements.clone(), table.element_indices.clone())
+        };
         // 注册 1 个元素：idx=0, id=42
         {
             use crate::elements_table::G_ELEMENTS_TABLE;
@@ -1596,10 +1629,19 @@ mod tests {
 
         // 回收 CellSOA 内存
         unsafe { drop(Box::from_raw(cells_ptr)) };
+
+        // 恢复 G_ELEMENTS_TABLE 原始状态
+        {
+            use crate::elements_table::G_ELEMENTS_TABLE;
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements = orig_elements;
+            table.element_indices = orig_indices;
+        }
     }
 
     #[test]
     fn end_save_releases_buffer() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_save_buffer();
         setup_empty_sim_data();
         let _ = begin_save(0, 0).unwrap();
@@ -1616,20 +1658,22 @@ mod tests {
 
     #[test]
     fn begin_save_twice_drops_first_buffer() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_save_buffer();
         setup_empty_sim_data();
         let _ = begin_save(1, 2).unwrap();
-        let first_ptr = {
-            let g = G_SAVE_BUFFER.lock().unwrap();
-            g.as_ref().unwrap().as_ptr() as usize
-        };
-        // 第二次 begin_save 应 drop 旧 buffer
+        // 第二次 begin_save 应 drop 旧 buffer，写入新参数
         let _ = begin_save(3, 4).unwrap();
-        let second_ptr = {
+        // 验证 buffer 内容反映第二次调用的参数（p2=3, p3=4），而非第一次（p2=1, p3=2）
+        // 不用指针比较：分配器完全可能复用同一地址（两个 buffer 都是 29 字节）
+        // 注意：锁 guard 必须在 end_save() 前释放，否则 end_save() 内部再次 lock 会死锁
+        // （std::sync::Mutex 不可重入）
+        {
             let g = G_SAVE_BUFFER.lock().unwrap();
-            g.as_ref().unwrap().as_ptr() as usize
-        };
-        assert_ne!(first_ptr, second_ptr, "second begin_save should allocate new buffer");
+            let buf = g.as_ref().unwrap();
+            assert_eq!(i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]), 3, "p2 should be 3 (second call)");
+            assert_eq!(i32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]), 4, "p3 should be 4 (second call)");
+        }
         end_save();
     }
 }
