@@ -343,28 +343,30 @@ mod tests {
         // 保位转换（u32 → i32 bit-pattern preserving）
         // Load with empty buffer → save_load::load 返回 Err(InvalidMagic)
         // SIM_HandleMessage 应记录 error 并返回 null（不 panic）
+        // 不修改任何全局状态（魔数检查在 mutex lock 之前失败），并行安全
         let id: c_int = MessageType::Load as u32 as c_int;
         let result = SIM_HandleMessage(id, 0, std::ptr::null_mut());
         assert!(result.is_null());
     }
 
     #[test]
-    fn sim_handle_message_dispatches_create_disease_table() {
-        // 验证 Disease_CreateTable 消息能正确路由到 save_load::create_disease_table
-        // create_disease_table 替换 G_DISEASE 为新空 Disease（幂等，与 save_load::tests
-        // 的 create_disease_table_replaces_global 并行安全——都替换为相同空 Disease）
-        let id: c_int = MessageType::Disease_CreateTable as u32 as c_int;
-        let result = SIM_HandleMessage(id, 0, std::ptr::null_mut());
+    fn sim_handle_message_dispatches_load_with_valid_magic() {
+        // 验证 Load 消息通过魔数检查后的完整 dispatch 路径
+        // 构造 magic + version=0x10（高版本跳过 header 读取，start_offset=0 跳过所有循环）
+        // 此路径仅读取 G_SIM_DATA（read-only，width/updated_cells_ptr），不修改任何全局状态
+        // 与 save_load::tests::load_with_valid_magic_and_high_version_does_not_panic 并行安全
+        let mut buf: Vec<u8> = vec![0x53, 0x49, 0x4d, 0x53, 0x41, 0x56, 0x45, 0x00]; // "SIMSAVE\0"
+        buf.extend_from_slice(&0x10u32.to_le_bytes()); // version = 0x10
+        let id: c_int = MessageType::Load as u32 as c_int;
+        let result = SIM_HandleMessage(id, buf.len() as c_int, buf.as_ptr() as *mut c_schar);
         assert!(result.is_null());
-        // 验证 G_DISEASE 可锁（无 panic，无 mutex poisoning）
-        let _d = crate::save_load::G_DISEASE.lock().unwrap();
     }
 
     #[test]
     fn sim_handle_messages_loops_count_times() {
-        // count=2, size=0, data=null → 两次空 reader 调用 dispatch
+        // count=2, 每次调用 Load with empty buffer（不修改全局状态，并行安全）
         // 验证循环不 panic，返回 null（最后一次调用的结果）
-        let id: c_int = MessageType::Disease_CreateTable as u32 as c_int;
+        let id: c_int = MessageType::Load as u32 as c_int;
         let result = SIM_HandleMessages(id, 0, 2, std::ptr::null_mut());
         assert!(result.is_null());
     }

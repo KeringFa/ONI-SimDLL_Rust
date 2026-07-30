@@ -18,7 +18,7 @@ fn load_with_empty_buffer_returns_invalid_magic() {
 #[test]
 fn load_with_valid_magic_high_version_does_not_panic() {
     let mut w = BinaryBufferWriter::new();
-    w.write_bytes(&[0x53, 0x49, 0x4d, 0x41, 0x56, 0x45, 0x53, 0x00]).unwrap();
+    w.write_bytes(&[0x53, 0x49, 0x4d, 0x53, 0x41, 0x56, 0x45, 0x00]).unwrap();
     w.write_int(0x10).unwrap();
     let buf = w.into_bytes();
     let mut reader = BinaryBufferReader::new(&buf);

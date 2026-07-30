@@ -346,7 +346,10 @@ fn cell_read(
 /// 返回值：源码返回 BinaryBufferReader* 指针，Rust 实现返回 Result。
 ///
 /// **关键实现细节**：
-/// - 魔数检查（L32）：8 字节 "SIMAVES\0" = [0x53,0x49,0x4d,0x41,0x56,0x45,0x53,0x00]
+/// - 魔数检查（L32）：8 字节 "SIMSAVE\0" = [0x53,0x49,0x4d,0x53,0x41,0x56,0x45,0x00]
+///   原版 Ghidra 字面量 `0x455641534d4953`（u64），x86 小端序下内存字节为
+///   `53 49 4d 53 41 56 45 00` = "SIMSAVE\0"（SIM SAVE，词义合理）。
+///   Phase 3 初版误读为 "SIMAVES\0"（'S' 错位到 byte 6），已修正。
 /// - L37 local_res20 修订（决策 #3）：Ghidra 误判丢弃返回值，实际是 start_offset
 /// - 三阶段双层循环（L48-192）：
 ///   - 阶段 1：填充 updated_cells（CellRead + temp/mass/radiation 检查）
@@ -363,7 +366,7 @@ pub fn load(reader: &mut BinaryBufferReader) -> Result<(), BufferError> {
         tracing::error!(?magic, "Load: failed to read magic number (insufficient data)");
         return Err(BufferError::InvalidMagic);
     }
-    if magic != [0x53, 0x49, 0x4d, 0x41, 0x56, 0x45, 0x53, 0x00] {
+    if magic != [0x53, 0x49, 0x4d, 0x53, 0x41, 0x56, 0x45, 0x00] {
         tracing::error!(?magic, "Load: invalid magic number");
         return Err(BufferError::InvalidMagic);
     }
@@ -1146,7 +1149,7 @@ mod tests {
     fn load_with_valid_magic_and_high_version_does_not_panic() {
         // 构造最小 buffer: magic + version=0x10（高版本，跳过 innerW/innerH/startOffset 读取）
         let mut w = BinaryBufferWriter::new();
-        w.write_bytes(&[0x53, 0x49, 0x4d, 0x41, 0x56, 0x45, 0x53, 0x00]).unwrap();
+        w.write_bytes(&[0x53, 0x49, 0x4d, 0x53, 0x41, 0x56, 0x45, 0x00]).unwrap();
         w.write_int(0x10).unwrap();  // version >= 0x10，跳过 header 读取
         let buf = w.into_bytes();
         let mut reader = BinaryBufferReader::new(&buf);
