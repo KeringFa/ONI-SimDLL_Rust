@@ -292,6 +292,63 @@ fn create_elements_table(reader: &mut BinaryBufferReader) -> Result<i32, BufferE
     Ok(count)
 }
 
+/// 反序列化元素交互——只 push 匹配 GAS_OBLITERATION_SIGNATURE 的 entry。
+///
+/// 对照源码 03_elements.c L517-569（CreateElementInteractions）。
+/// 严格按源码：liquid_obliterations / liquid_conversions 只清空不填充
+/// （源码缺失分支，规格 §2.2.4 注释）。
+fn create_element_interactions(reader: &mut BinaryBufferReader) -> Result<(), BufferError> {
+    let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+
+    // 清空 3 个交互 vector（源码 L517-519）
+    table.liquid_obliterations.clear();
+    table.liquid_conversions.clear();
+    table.gas_obliterations.clear();
+
+    let count = reader.read_int()?;
+    if count < 0 {
+        // 防御性：负 count 视为 0（源码无此检查但 Rust 边界安全优先）
+        tracing::warn!(count, "CreateElementInteractions: negative count, treating as 0");
+        return Ok(());
+    }
+    let count_usize = count as usize;
+
+    for _ in 0..count_usize {
+        // 每 entry 0x20=32 字节，读 30 字节 + skip 2 字节 padding（决策 #2）
+        let signature = reader.read_int()?;
+        let elem_idx1 = reader.read_ushort()?;
+        let elem_idx2 = reader.read_ushort()?;
+        let elem_result_idx = reader.read_ushort()?;
+        let _padding_a = reader.read_ushort()?;  // @0xa-0xb 源码未使用
+        let min_mass = reader.read_float()?;
+        let interaction_probability = reader.read_float()?;
+        let elem1_mass_destruction_percent = reader.read_float()?;
+        let elem2_mass_required_multiplier = reader.read_float()?;
+        let elem_result_mass_creation_multiplier = reader.read_float()?;
+        // 共读 4 + 2*4 + 5*4 = 30 字节，剩 2 字节 padding @0x1e-0x1f
+        reader.skip(2)?;
+
+        if signature == GAS_OBLITERATION_SIGNATURE {
+            // 用 default() 初始化（_pad1 是 element.rs 私有字段，跨模块 struct literal
+            // 与 functional update syntax 都会触发 E0451；改用 default + 逐字段赋值，
+            // _pad1 默认 0 正是所需——与简报预判偏差 #1 的意图一致）
+            let mut g = GasObliteration::default();
+            g.elem_idx1 = elem_idx1;
+            g.elem_idx2 = elem_idx2;
+            g.elem_result_idx = elem_result_idx;
+            g.interaction_probability = interaction_probability;
+            g.min_mass = min_mass;
+            g.elem1_mass_destruction_percent = elem1_mass_destruction_percent;
+            g.elem2_mass_required_multiplier = elem2_mass_required_multiplier;
+            g.elem_result_mass_creation_multiplier = elem_result_mass_creation_multiplier;
+            table.gas_obliterations.push(g);
+        }
+        // 签名不匹配：源码跳过此 entry（不 push 到任何 vector）
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +640,116 @@ mod tests {
 
         let table = G_ELEMENTS_TABLE.lock().unwrap();
         assert!((table.temperature_data[0].mass_area_scale - 0.001).abs() < 1e-6);
+    }
+
+    use crate::element::GAS_OBLITERATION_SIGNATURE;
+
+    /// 构造 interactions buffer：count=N，每 entry 32B
+    fn build_interactions_buffer(entries: &[(i32, u16, u16, u16, f32, f32, f32, f32, f32)]) -> Vec<u8> {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(entries.len() as i32).unwrap();
+        for &(sig, idx1, idx2, result_idx, prob, min_mass, destroy_pct, req_mult, create_mult) in entries {
+            // 每 entry 32 字节布局：
+            // @0  i32 signature (4)
+            // @4  u16 elem_idx1 (2)
+            // @6  u16 elem_idx2 (2)
+            // @8  u16 elem_result_idx (2)
+            // @0xa 2 字节 padding（read_ushort 占位）
+            // @0xc f32 min_mass (4)
+            // @0x10 f32 interaction_probability (4)
+            // @0x14 f32 elem1_mass_destruction_percent (4)
+            // @0x18 f32 elem2_mass_required_multiplier (4)
+            // @0x1c f32 elem_result_mass_creation_multiplier (4)
+            // 总计 30 字节，剩 2 字节 padding @0x1e-0x1f
+            w.write_int(sig).unwrap();
+            w.write_ushort(idx1).unwrap();
+            w.write_ushort(idx2).unwrap();
+            w.write_ushort(result_idx).unwrap();
+            w.write_ushort(0).unwrap();  // padding @0xa-0xb
+            w.write_float(min_mass).unwrap();
+            w.write_float(prob).unwrap();
+            w.write_float(destroy_pct).unwrap();
+            w.write_float(req_mult).unwrap();
+            w.write_float(create_mult).unwrap();
+            w.write_ushort(0).unwrap();  // 末尾 2 字节 padding
+        }
+        w.into_bytes()
+    }
+
+    #[test]
+    fn create_element_interactions_pushes_only_matching_signature() {
+        // 清空交互 vector（创建初始状态）
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.gas_obliterations.clear();
+            table.liquid_obliterations.clear();
+            table.liquid_conversions.clear();
+        }
+
+        let buf = build_interactions_buffer(&[
+            // entry 0: 匹配签名
+            (GAS_OBLITERATION_SIGNATURE, 1, 2, 3, 0.5, 10.0, 0.25, 1.5, 0.75),
+            // entry 1: 不匹配签名
+            (0x12345678, 4, 5, 6, 0.9, 20.0, 0.5, 2.0, 1.0),
+            // entry 2: 匹配签名
+            (GAS_OBLITERATION_SIGNATURE, 7, 8, 9, 0.3, 5.0, 0.1, 0.8, 0.4),
+        ]);
+        let mut reader = BinaryBufferReader::new(&buf);
+        create_element_interactions(&mut reader).unwrap();
+
+        let table = G_ELEMENTS_TABLE.lock().unwrap();
+        assert_eq!(table.gas_obliterations.len(), 2, "只有 2 个 entry 匹配签名");
+
+        // 验证 entry 0 字段
+        let g0 = &table.gas_obliterations[0];
+        assert_eq!(g0.elem_idx1, 1);
+        assert_eq!(g0.elem_idx2, 2);
+        assert_eq!(g0.elem_result_idx, 3);
+        assert!((g0.interaction_probability - 0.5).abs() < 1e-6);
+        assert!((g0.min_mass - 10.0).abs() < 1e-6);
+        assert!((g0.elem1_mass_destruction_percent - 0.25).abs() < 1e-6);
+        assert!((g0.elem2_mass_required_multiplier - 1.5).abs() < 1e-6);
+        assert!((g0.elem_result_mass_creation_multiplier - 0.75).abs() < 1e-6);
+
+        // 验证 entry 2 字段（应该 push 到 [1]）
+        let g1 = &table.gas_obliterations[1];
+        assert_eq!(g1.elem_idx1, 7);
+        assert_eq!(g1.elem_result_idx, 9);
+
+        // liquid_obliterations / liquid_conversions 严格按源码只清空不填充
+        assert!(table.liquid_obliterations.is_empty());
+        assert!(table.liquid_conversions.is_empty());
+    }
+
+    #[test]
+    fn create_element_interactions_clears_before_push() {
+        // 先塞入旧数据
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.gas_obliterations.push(crate::element::GasObliteration::default());
+            table.liquid_obliterations.push(crate::element::LiquidObliteration::default());
+            table.liquid_conversions.push(crate::element::LiquidConversion::default());
+        }
+
+        // 调用后应清空（即使新 buffer 为空也清空）
+        let buf = build_interactions_buffer(&[]);
+        let mut reader = BinaryBufferReader::new(&buf);
+        create_element_interactions(&mut reader).unwrap();
+
+        let table = G_ELEMENTS_TABLE.lock().unwrap();
+        assert!(table.gas_obliterations.is_empty());
+        assert!(table.liquid_obliterations.is_empty());
+        assert!(table.liquid_conversions.is_empty());
+    }
+
+    #[test]
+    fn create_element_interactions_negative_count_returns_early() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1).unwrap();  // 负 count
+        let buf = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&buf);
+        // 不应 panic，应正常返回 Ok(())
+        let result = create_element_interactions(&mut reader);
+        assert!(result.is_ok());
     }
 }
