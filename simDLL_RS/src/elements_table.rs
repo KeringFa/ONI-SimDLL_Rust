@@ -148,7 +148,9 @@ fn create_elements_table(reader: &mut BinaryBufferReader) -> Result<i32, BufferE
         let mut bytes = [0u8; 164];
         reader.read_bytes(&mut bytes)?;
         // 安全转换：Element 是 #[repr(C)] 且 size_of == 164
-        table.elements[i] = unsafe { std::ptr::read(bytes.as_ptr() as *const Element) };
+        // 使用 read_unaligned：bytes 是 [u8; 164]（对齐 1），而 Element 含 i32/f32 字段（对齐 4），
+        // read_unaligned 逐字节拷贝避免对齐假设（std::ptr::read 要求对齐 UB）。
+        table.elements[i] = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Element) };
     }
 
     // 阶段 2: 建立 element_indices（Element.id → index）
