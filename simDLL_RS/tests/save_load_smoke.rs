@@ -128,8 +128,14 @@ fn prepare_game_data_update_does_not_panic() {
 use SimDLL::sim_api::{SIM_BeginSave, SIM_EndSave};
 use SimDLL::save_load::G_SAVE_BUFFER;
 
+// 串行化 4 个直接操作 G_SAVE_BUFFER 的 FFI 测试，避免并行模式下
+// SIM_EndSave() 释放锁与 G_SAVE_BUFFER.lock() 重新获取之间的竞态窗口
+// （参考 save_load.rs mod tests 的 PHASE4_TEST_LOCK 模式）
+static SAVE_LOAD_SMOKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn sim_begin_save_returns_non_null_and_correct_size() {
+    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // empty SimData → 至少 29 字节（header only，无 cells）
     // 注意：G_SIM_DATA 的 width/height 可能被其他测试修改，这里只断言非空 + size>=29
     let mut size: i32 = -1;
@@ -141,6 +147,7 @@ fn sim_begin_save_returns_non_null_and_correct_size() {
 
 #[test]
 fn sim_begin_save_with_null_out_size_does_not_panic() {
+    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let result = SIM_BeginSave(std::ptr::null_mut(), 0, 0);
     assert!(!result.is_null(), "should return non-null even with null out_size");
     SIM_EndSave();
@@ -148,6 +155,7 @@ fn sim_begin_save_with_null_out_size_does_not_panic() {
 
 #[test]
 fn sim_end_save_after_begin_save_no_op() {
+    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // begin_save + end_save + end_save → 第二次 end_save 不 panic（幂等）
     let mut size: i32 = 0;
     let _ = SIM_BeginSave(&mut size as *mut _, 0, 0);
@@ -157,6 +165,7 @@ fn sim_end_save_after_begin_save_no_op() {
 
 #[test]
 fn sim_begin_save_after_end_save_safe() {
+    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // end_save 后再 begin_save 应正常工作
     SIM_EndSave();  // 先调 end_save（此时无 buffer，no-op）
     let mut size: i32 = 0;
