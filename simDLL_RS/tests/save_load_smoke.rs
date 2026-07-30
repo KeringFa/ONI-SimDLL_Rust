@@ -124,3 +124,47 @@ fn game_sync_function_does_not_panic() {
 fn prepare_game_data_update_does_not_panic() {
     prepare_game_data_update();
 }
+
+use SimDLL::sim_api::{SIM_BeginSave, SIM_EndSave};
+use SimDLL::save_load::G_SAVE_BUFFER;
+
+#[test]
+fn sim_begin_save_returns_non_null_and_correct_size() {
+    // empty SimData → 至少 29 字节（header only，无 cells）
+    // 注意：G_SIM_DATA 的 width/height 可能被其他测试修改，这里只断言非空 + size>=29
+    let mut size: i32 = -1;
+    let result = SIM_BeginSave(&mut size as *mut _, 0, 0);
+    assert!(!result.is_null(), "SIM_BeginSave should return non-null");
+    assert!(size >= 29, "size should be at least 29 (header), got {}", size);
+    SIM_EndSave();
+}
+
+#[test]
+fn sim_begin_save_with_null_out_size_does_not_panic() {
+    let result = SIM_BeginSave(std::ptr::null_mut(), 0, 0);
+    assert!(!result.is_null(), "should return non-null even with null out_size");
+    SIM_EndSave();
+}
+
+#[test]
+fn sim_end_save_after_begin_save_no_op() {
+    // begin_save + end_save + end_save → 第二次 end_save 不 panic（幂等）
+    let mut size: i32 = 0;
+    let _ = SIM_BeginSave(&mut size as *mut _, 0, 0);
+    SIM_EndSave();
+    SIM_EndSave();  // 幂等，不应 panic
+}
+
+#[test]
+fn sim_begin_save_after_end_save_safe() {
+    // end_save 后再 begin_save 应正常工作
+    SIM_EndSave();  // 先调 end_save（此时无 buffer，no-op）
+    let mut size: i32 = 0;
+    let result = SIM_BeginSave(&mut size as *mut _, 0, 0);
+    assert!(!result.is_null());
+    SIM_EndSave();
+    {
+        let g = G_SAVE_BUFFER.lock().unwrap();
+        assert!(g.is_none(), "G_SAVE_BUFFER should be None after end_save");
+    }
+}
