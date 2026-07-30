@@ -516,3 +516,213 @@ Task P2-T7: complete (commits 7302208..c41a471, review clean) — 5 C ABI export
 - 游戏能进主菜单（与 Phase 1 一致，无回归）
 - 加载存档行为与 Phase 1 一致（仍会崩溃，Phase 3 才实现存档加载）
 - 日志文件无新增条目（除非 C# 主动调用本 Phase 函数，但 Phase 2 之前 C# 不会调用 CreateElementsTable 等）
+
+---
+
+## Phase 3: 存档加载
+
+> 计划文件：`docs/superpowers/plans/2026-07-30-simdll-rs-phase3-save-loading-plan.md`
+> 起始 commit：`1b5d1c9`（Phase 2 收官，127 测试通过）
+> BASE（T1 分派前）：`1b5d1c9`
+
+## 任务进度
+
+- [x] Task P3-T1：stl_shim.rs + buffer.rs 基础扩展（MsvcVector 7 方法 + BufferError::InvalidMagic）
+- [x] Task P3-T2：sim_events.rs 补全 + game_data_update.rs 新建
+- [x] Task P3-T3：构造函数补充（SimData/Disease/FrameSync/Sim::new_zeroed + CellSOA::new）
+- [x] Task P3-T4：12 个 stub 函数（实际 11 个，简报标题笔误）
+- [x] Task P3-T5：save_load.rs 全局单例 + 5 个简单函数
+- [x] Task P3-T6：CellRead + Load 核心反序列化
+- [x] Task P3-T7：6 个复杂函数
+- [x] Task P3-T8：集成测试 + 文档收尾 + 最终验收
+
+## 完成记录
+
+Task P3-T1: complete (commits 1b5d1c9..63304c2, review passed with notes)
+- 产物：`simDLL_RS/src/stl_shim.rs`（追加 `impl<T: Default + Copy> MsvcVector<T>` 7 方法 + `impl<T: Default + Copy> Default for MsvcVector<T>`，148 行新增）+ `simDLL_RS/src/buffer.rs`（BufferError 追加 InvalidMagic 变体 + 1 测试）
+- 测试：cargo test 全量 132/132 通过（lib 114 + abi_smoke 11 + elements_smoke 7），0 error，1 遗留 warning（crate SimDLL snake_case，不可改）
+- TDD 证据：RED 阶段 6 个 E0599 错误（4 处 MsvcVector::new + 2 处 BufferError::InvalidMagic）→ GREEN 阶段 stl_shim 10 passed + buffer 16 passed
+- 审查结论：规格 ✅，任务质量通过，0 关键，3 项重要（均"计划强制"，Phase 3 简化范围内可接受）
+- **3 项重要发现（计划强制，遗留至 Phase 6+ 接入真实 STL 时修复）**：
+  1. resize 不保留旧元素 —— 当前实现用 value 全覆盖，MSVC vector::resize 标准行为是保留 min(old_len, new_len) 个旧元素。Phase 3 所有调用都是从空到 N，不依赖保留旧元素，故不阻塞
+  2. MsvcVector 无 Drop impl —— resize 分配的内存不自动释放。Phase 3 生产路径不调用 resize（SimData::new_zeroed 用 mem::zeroed），仅测试中短命泄漏
+  3. invalid_magic_variant_exists 测试仅断言自相等 —— T6 `load_with_empty_buffer_returns_invalid_magic` 已覆盖真实流程触发
+- **2 项简报措辞偏差（非代码缺陷）**：
+  1. 简报 step 4 写"buffer 17 原有"，实际 15（Phase 1 Task 3 引入 13 + Task 2 引入 2 = 15，简报预估笔误）
+  2. 简报 step 5 写 `cargo test --lib` 预期 132，实际 `--lib` 跑 114（132 = lib 114 + abi_smoke 11 + elements_smoke 7，需不带 `--lib`）
+- 控制者派发前核实：MsvcVector 现有字段名（container_proxy/begin/end/capacity_end）与简报代码字面一致；BufferError 现有 4 变体与简报预期一致。预判偏差 = 0
+- **遗留观察项（Phase 6+ 复核）**：①resize 保留旧元素语义（Phase 3 不依赖，Phase 6+ 接入真实 STL 时补 ptr::copy_nonoverlapping）②MsvcVector Drop impl（Phase 6+ 改用 Unique<[T]> 或补 Drop）
+
+Task P3-T2: complete (commits 63304c2..e4153d0, review clean — 完美通过)
+- 产物：`simDLL_RS/src/sim_events.rs` 完全替换 Phase 1 占位（45 行 → 84 行，+83/-39，含 SimFrameInfo 空占位 + SimEvents 20 个 MsvcVector 字段）+ `simDLL_RS/src/game_data_update.rs` 新建 259 行（GameDataUpdate 48 字段 + Default impl + 2 测试）+ `simDLL_RS/src/lib.rs`（+1 行 `pub mod game_data_update;` 按字母序插入 game_data 与 logger 之间）
+- 测试：cargo test 全量 133/133 通过（lib 115 + abi_smoke 11 + elements_smoke 7），0 error，1 遗留 warning（crate SimDLL snake_case，不可改）
+- TDD 证据：RED 阶段 sim_events_size 断言 640 失败（空 struct size=0）→ GREEN 阶段 sim_events 1 passed + game_data_update 2 passed
+- 审查结论：规格 ✅，任务质量通过，0 关键/重要，2 次要（均不阻塞——default_all_null 测试覆盖面较窄 / glob import `use crate::game_data::*` 掩盖具体依赖）
+- **审查者独立源码核实**：①SimEvents 20 字段对照 `00_types_reference.c` L9363-9383 逐字一致 ②GameDataUpdate 12 个 SOA 指针对照 `02_save_load.c` L705-766 逐字一致（elementIdx L705 / temperature L710 / radiation L715 / mass L720 / properties L725 / insulation L730 / strengthInfo L735 / diseaseIdx L740 / diseaseCount L745 / backwallElementIdx L751 / backwallMasses L756 / backwallTemperatures L761）③size 计算 8+96+464+48=616 与实际一致
+- **4 项偏离简报字面之处（全部与控制者预判一致，审查者独立核实正确）**：
+  1. GameDataUpdate size = 616B（非简报注释 624B）—— 简报注释说"13 个 SOA 指针"实际字面字段定义只有 12 个，按 plan L38 字段偏移验证协议第 4 步更新断言为 616
+  2. 删除 Vector4f import —— 简报字面写了 `use crate::vector_math::{Vector2f, Vector4f};` 但实际字段只用 Vector2f（property_texture_flow: *const Vector2f），触发 unused import warning，按"输出干净"原则删除
+  3. lib.rs 模块插入位置按字母序（在 `pub mod game_data;` 之后、`pub mod logger;` 之前）—— 简报 step 3c 措辞"在 `pub mod element;` 之后"错误（`g` > `e`），按字母序修正
+  4. 删除 sim_frame_info_size 测试 —— 简报 step 1 措辞说"改 sim_events_size 测试"，但 step 3a 完全替换文件后只有 sim_events_size 测试（无 sim_frame_info_size）。按 step 3a 字面完全替换（SimFrameInfo 仍为空占位 `reserved: [u8; 0]`，size=0）
+- **简报措辞偏差 = 0 项**（4 项偏离简报字面之处全部由控制者派发前预判并告知实现者，实现者按预判执行，无自创偏差）
+- **简报 step 5 预期测试数 135 是错的**（按"+3"算忽略了删除 sim_frame_info_size 的 -1），实际预期 133（132-1+2=133），实现者报告 133 正确
+
+Task P3-T3: complete (commits e4153d0..e8a6ee5, review passed — 0 critical/major, 4 minor all plan-forced/self-disclosed)
+- 产物：5 个文件改动（+103 行）—— `sim_data.rs`（+SimData::new_zeroed mem::zeroed + CellSOA::new 11×MsvcVector::new + 2 测试）+ `disease.rs`（+Disease::new 2×MsvcVector::new + 1 测试）+ `frame_sync.rs`（+FrameSync::new_zeroed mem::zeroed + 1 测试）+ `sim.rs`（+Sim::new_zeroed mem::zeroed + 1 测试）+ `stl_shim.rs`（+MsvcString `#[derive(Clone, Copy, Default)]` 1 行 + 5 行 doc 注释，授权修复）
+- 测试：cargo test 全量 138/138 通过（lib 120 + abi_smoke 11 + elements_smoke 7），0 error，0 warning（仅遗留不可改的 crate SimDLL snake_case）
+- TDD 证据：RED 阶段 5 个 E0599 编译错误（no function named `new_zeroed`/`new`）→ GREEN 阶段 5 个新测试全通过
+- 审查结论：规格 ✅，任务质量通过，0 关键/重要，4 次要
+- **授权修复（简报疏漏）**：简报步骤 3b 字面 `MsvcVector<MsvcString>::new()` 因 `MsvcVector<T>` 的 `impl<T: Default + Copy>` bound + `MsvcString` 未 derive 这些 trait 无法编译。控制者授权在 `stl_shim.rs:144` 的 `MsvcString` 上加 `#[derive(Clone, Copy, Default)]`。原理正确：`MsvcString` 是纯 POD（`[u8;16]+u64+u64`，32B），`Default`（全零=空 SSO string）与 MSVC `std::string` 默认构造语义一致（注：capacity=0 vs MSVC SSO capacity=15，Phase 3 不读 capacity 不阻塞，Phase 6+ 接入真实 string 方法时需重新审视）。审查者独立核实 `DiseaseInfo`（disease.rs:17）在 T3 之前就已 derive 了 `Clone/Copy/Default`，所以 `MsvcVector<DiseaseInfo>::new()` 本就编译通过；本次编译失败唯一根因确实是 `MsvcString` 缺 derive，授权修复打在正确位置，未扩大化
+- **4 项次要发现（全部计划强制或已自标，不阻塞）**：
+  1. 授权偏差超出"1 行"严格范围 —— 实际 +6 行（1 derive + 5 doc 注释），注释合理不改行为，保留
+  2. `MsvcString` 的 `Default` 产生 `capacity=0` vs MSVC SSO `capacity=15` —— 计划强制（简报要求 derive Default），Phase 6+ 重新审视
+  3. `FrameSync::new_zeroed()` 对含 `MsvcMutex`/`MsvcCondVar` 的结构用 `mem::zeroed()` —— 零初始化 mutex 非有效 MSVC 同步原语，但 Phase 3 仅占布局不实际加锁，计划强制，Phase 6+ 接入真实同步逻辑时需重新审视
+  4. `cell_soa_new_empty` 测试仅验证 11 个 MsvcVector 中的 3 个（element_idx/temperature/mass）—— 计划强制（简报测试字面如此）
+- **简报内部不一致（已澄清）**：简报步骤 5 文字写"141 测试"基于"T2=135 + 新增 6"两个错误假设（T2 实际 133，新增实际 5），实际预期 138，实现者报告 138 正确
+- **遗留观察项（Phase 6+ 复核）**：①MsvcString Default capacity=0 vs MSVC 15（Phase 6+ 接入真实 string 方法时重新审视）②FrameSync mem::zeroed 的 mutex/cond_var 非有效同步原语（Phase 6+ 接入真实同步逻辑时重新审视）
+
+Task P3-T4: complete (commits e8a6ee5..523b37d, review passed — 0 critical/major, 2 minor all plan-forced/pre-existing)
+- 产物：3 个文件改动（+146 行）—— `sim_data.rs`（+SimData 4 stub + CellSOA 1 stub + 5 测试）+ `frame_sync.rs`（+FrameSync 3 stub + 3 测试）+ `sim.rs`（+Sim 3 stub + 3 测试）
+- 测试：cargo test 全量 149/149 通过（lib 131 + abi_smoke 11 + elements_smoke 7），2 warning（unused_variables，计划强制）
+- TDD 证据：RED 阶段 11 个 E0599 编译错误（no method named `apply_save_settings`/`init_game_data`/`start` 等）→ GREEN 阶段 11 个新 stub 测试全通过
+- 审查结论：规格 ✅，任务质量通过，0 关键/重要，2 次要
+- **11 个 stub 函数**（简报标题说"12"是笔误，实际代码块定义 11 个）：
+  - SimData: apply_save_settings(u8) / do_load_time_state_transition(i32) / settle_thermal_boundaries() / initialize_boundary()
+  - CellSOA: copy_from(&CellSOA)
+  - FrameSync: init_game_data(i32,i32,i32,i32,*mut CellSOA) / game_sync() / clear()
+  - Sim(Thread): start() / join() / joinable() -> bool (返回 false)
+- **2 项次要发现（均计划强制/预先存在，不阻塞）**：
+  1. 2 个 unused_variables warning（`updated_cells` at frame_sync.rs:55 / `other` at sim_data.rs:372）—— 简报 step 3 字面代码的 `tracing::debug!` 未消费这两个参数，简报 step 5 预期"0 warning"与此矛盾。按红线"不要给参数加 unused 标注"保留字面参数名。Phase 6+ 真实实现时参数会被消费，warning 自然消失
+  2. flaky 并行测试（elements_table::tests 全局锁毒化）—— Phase 2 T4/T7 遗留，非本任务引入
+- **简报内部不一致（已澄清）**：①简报标题/commit message 说"12 个 stub"，实际 11 个（代码块字面为准）②简报 step 5 预期 152 测试基于 T3=141 错误假设，实际 149（138+11）
+- **遗留观察项（Phase 6+ 复核）**：①init_game_data 的 updated_cells 参数未使用（Phase 6+ 真实实现时消费）②copy_from 的 other 参数未使用（Phase 6+ 真实实现时消费）
+
+Task P3-T5: complete (commits 523b37d..3d898e6, review passed with notes — 通过但有备注)
+- 产物：3 文件改动（+345 行）—— `save_load.rs` 新建 334 行（5 全局单例 + 5 pub fn + 6 测试）+ `lib.rs` +1 行 `pub mod save_load;`（按字母序在 logger 之后、sim 之前，简报字面"after game_data_update"措辞错误）+ `elements_table.rs` +10 行（get_element_index_pub / destroy_elements_table_pub 2 个公开包装）
+- 测试：cargo test 全量 155/155 通过（lib 137 + abi_smoke 11 + elements_smoke 7），0 error；release build exit 0，SimDLL.dll=1017344 字节（≈994 KB）
+- TDD 证据：RED 阶段 E0425 5 个函数未定义编译错误 → GREEN 阶段 6 个新测试全通过
+- 审查结论：规格 ✅，任务质量通过，0 关键/重要，6 次要（均不阻塞）
+- **4 项预判偏差全部命中**：①lib.rs 字母序插入（简报字面措辞错误已替实现者修订）②测试基线 137/155（简报字面 158 基于错误假设，已修正）③elements_table.rs 插入位置在 L113 之后、L115 之前 ④T4 的 2 项 unused_variables 保留不修
+- **4 项简报未预判编译错误适配（全部按预授权"按实际 API 签名适配"修复，审查者独立核实合理）**：
+  1. E0277×33：`GameDataUpdate` 含 `*const T` 字段（game_data_update.rs L24-44 确认）未实现 Send → save_load.rs 加 `unsafe impl Send/Sync for GameDataUpdate`（与 stl_shim.rs L188-191 / sim.rs T3 模式一致）
+  2. E0277×1：`SimData` 含 `MsvcVector<*mut SimComponent>` 字段（sim_data.rs L293 确认）未实现 Send → 推理链 `*mut: !Send → MsvcVector<*mut>: !Send (因 stl_shim.rs bound T: Send) → SimData: !Send` 成立 → save_load.rs 加 `unsafe impl Send/Sync for SimData`
+  3. E0252：简报 step 1 已 `use crate::sim_data::SimData;`，step 4 又 `use crate::sim_data::{SimData, CellSOA};` 重复 → 删除 step 4 重复 SimData，改为 `use crate::sim_data::CellSOA;`
+  4. E0308：`*g = new_data` 类型不匹配（g 是 `MutexGuard<Box<SimData>>`，*g 是 `Box<SimData>`，new_data 是 `SimData`）→ 改为 `*g = Box::new(new_data)`，内存安全（旧 Box<SimData> drop 时其 UniquePtr 字段无 Drop impl = no-op，代码已手动 Box::from_raw 释放 cells/updated_cells/backwall 3 个 SOA）
+- **5 个全局单例**（决策 #1 `Lazy<Mutex<Box<T>>>` 模式）：G_SIM_DATA / G_FRAME_SYNC / G_SIM / G_DISEASE / G_GAME_DATA_UPDATE（最后一项简报字面用 `Lazy<Mutex<GameDataUpdate>>` 不带 Box，因 GameDataUpdate 不需 Box 间接层；其他 4 项带 Box 模拟原版裸指针/栈对象语义）
+- **5 个简单函数**（对照源码 02_save_load.c）：allocate_cells (L259-293) / define_world_offsets (L297-342) / set_saved_options (L466-481) / create_disease_table (L494-515) / clear_unoccupied_cells (L405-462)
+- **2 个 Phase 3 简化（简报授权，非实现者偏差）**：①define_world_offsets 读 4×int/entry 后丢弃数据，resize 填默认值（源码先 resize 后填实际 offset 数据）②create_disease_table stub 不读 reader（源码 Disease::Disease 从 reader 读数据）。两者 reader 推进正确，worlds.len() 正确；Phase 6+ 需填实际数据 / 实现真实 Disease 反序列化
+- **Warning 终态 = 5 项**：①T4 引入 unused_variables `updated_cells` at frame_sync.rs:55 ②T4 引入 unused_variables `other` at sim_data.rs:372 ③不可改 non_snake_case crate SimDLL ④T5 简报字面测试代码 unused_mut `w` at save_load.rs:306 ⑤T5 简报字面测试代码 unused_mut `w2` at save_load.rs:329
+- **6 项次要发现**（均不阻塞）：①测试隔离隐患（allocate_cells_* 与 clear_unoccupied_cells_* 共享 G_SIM_DATA，简报字面测试设计，非实现者偏差）②define_world_offsets 丢弃实际偏移数据（简报授权简化）③create_disease_table stub 不读 reader（简报授权简化）④unsafe impl Send/Sync 放在 save_load.rs 而非类型定义文件（Phase 3 不修改 T4 源码约束下合理）⑤报告行数小误差（345 vs 实际 334）⑥progress.md 未纳入 commit（进程性事项，控制者确认）
+- **遗留观察项（Phase 6+ 复核）**：①define_world_offsets 需填实际 worlds 数据 ②create_disease_table 需实现真实 Disease 反序列化 ③unsafe impl Send/Sync 建议移至各自类型定义文件 ④UniquePtr Drop impl 需在 Phase 6+ 接入真实 STL 时补全（与 T4 遗留 #2 合并）
+
+Task P3-T6: complete (commits 3d898e6..a18c5b4, review passed with notes — 3 critical 简报-vs-源码偏差)
+- 产物：`simDLL_RS/src/save_load.rs`（+370 行：cell_read 私有 fn + load pub fn + 6 新测试 + register_element 辅助 + 2 use 语句）
+- 测试：cargo test 全量 161/161 通过（lib 143 + abi_smoke 11 + elements_smoke 7），0 error
+- TDD 证据：RED 阶段 6 个 E0425 编译错误（cell_read/load 未定义）→ GREEN 阶段 12 save_load tests passed
+- 审查结论：规格 ✅，实现 100% 忠实简报字面代码，4 项偏差全部合理。3 项 CRITICAL 为**简报-vs-源码偏差**（非实现者引入），T6 测试不触发，Phase 6+ 必须修复
+- **4 项实现者偏差（全部合理）**：
+  1. 魔数读取失败转 InvalidMagic（简报字面 `read_bytes?` 在空 buffer 返回 EndOfBuffer，测试期望 InvalidMagic，改为 `if read_bytes.is_err() { return Err(InvalidMagic) }`，按预授权"实际 API 签名适配"）
+  2. use 语句放文件顶部合并（简报预授权两种放置方式均可）
+  3. commit 命令格式（PowerShell 不支持 bash heredoc，改用 `git commit -F`，message 内容与简报字面一致）
+  4. warning 数量 7 vs 简报预期 5（新增 2 项简报字面必然产生的 warning：`unused_mut element_idx` + `unused_assignments save_settings_byte`，按预授权接受）
+- **3 项 CRITICAL 发现（简报-vs-源码偏差，T6 测试不触发）**：
+  1. 阶段 1 外层循环缺少 `ivar14 -= width` 更新 — 源码 L113 `iVar14 = iVar14 - iVar2` 在外层循环末尾，简报将 `let ivar14 = -local_60` 放在外层循环内每次重置，导致后续外层迭代内层循环次数递减，reader 偏移错位
+  2. 内层循环边界用 `inner_h` 而非 `inner_w` — 源码用 `local_res18[0]`（= inner_w）作边界，简报/实现用 inner_h；且"Ghidra 遗漏 read_int"断言需对照汇编/真实存档验证
+  3. 阶段 2/3 stub 不实际 `reader.skip()` — 简报注释"避免数据错位"实际相反，不 skip 会导致 reader 偏移错位
+- **2 项 MAJOR 发现（简报未包含的源码逻辑）**：
+  1. 源码 L80-103 elementIdx 特殊值检查（gSimData->field_0x1a/0x1c 匹配时归零 mass/temp/radiation）
+  2. 源码 L104 `DoLoadTimeStateTransition` 调用
+- **2 项 MINOR 发现**：
+  1. `cell_read` 检查局部变量 `element_idx` vs 源码从 SOA 重读（写入成功且无并发下等价）
+  2. `inner_w` 仅用于 tracing（若 Critical #2 修复后应参与循环逻辑）
+- **Warning 终态 = 7 项**：①T4 unused_variables `updated_cells` at frame_sync.rs:55 ②T6 简报字面 unused_mut `element_idx` at save_load.rs:268 ③T6 简报字面 unused_assignments `save_settings_byte` at save_load.rs:377 ④T5 遗留 unused_mut `w` at save_load.rs:550（行号迁移） ⑤T5 遗留 unused_mut `w2` at save_load.rs:573（行号迁移） ⑥T4 unused_variables `other` at sim_data.rs:372 ⑦不可改 non_snake_case crate SimDLL
+- **遗留观察项（Phase 6+ 复核 — 必须在真实 Load 调用前修复）**：
+  1. 阶段 1 外层循环 `ivar14 -= width` 缺失（Critical #1）
+  2. 内层循环边界变量 inner_w vs inner_h（Critical #2，需对照汇编/真实存档验证 header 布局）
+  3. 阶段 2/3 stub 不 skip 导致 reader 偏移错位（Critical #3）
+  4. elementIdx 特殊值检查（Major #1）
+  5. DoLoadTimeStateTransition 调用（Major #2）
+  6. load 函数锁粒度（updated_cells_ptr 悬垂风险，T5 遗留 #3）
+  7. 测试隔离隐患（T5 遗留 #1 同模式延续）
+
+Task P3-T7: complete (commits a18c5b4..16517ea, review passed with notes — 0 critical / 0 major / 2 minor 描述偏差)
+- 产物：`simDLL_RS/src/save_load.rs`（+567 行：6 pub fn + 4 内部辅助 fn + 2 use 语句 + 6 新测试）
+- 测试：cargo test 全量 167/167 通过（lib 149 + abi_smoke 11 + elements_smoke 7），0 error
+- TDD 证据：RED 阶段 6 个 E0425 编译错误（resize_and_initialize_vacuum_cells/start/cleanup/prepare_game_data/game_sync_function/prepare_game_data_update 未定义）→ GREEN 阶段 18 save_load tests passed
+- 审查结论：规格 ✅，实现 100% 忠实简报字面（含 2 处简报修正：fill_cell_vacuum 6 字段版本 + local_30/local_2c 注释反转）。0 关键/重要，2 项次要描述偏差（不阻塞）
+- **2 项编译适配（全部合理，简报预授权范围内）**：
+  1. E0308 at save_load.rs:763（cleanup）：`*g = SimData::new_zeroed()` → `*g = Box::new(SimData::new_zeroed())`（G_SIM_DATA 是 `Mutex<Box<SimData>>`，与 T5 allocate_cells L120 `*g = Box::new(new_data);` 同模式）
+  2. E0596 at save_load.rs:711（start）：`let g` → `let mut g`（后续 `&mut *g.cells.ptr` 需可变借用）
+- **简报 2 处修正全部正确实现**（审查者独立核实对照源码 L24462-24488 + L24536-24550 + L24514-24520）：
+  1. fill_cell_vacuum 6 字段版本（element_idx/mass/temperature/disease_count/disease_idx=0xff/radiation）—— 删除简报字面 11 字段中多写的 properties/insulation/strength_info/disease_infestation_tick_count/disease_growth_accumulated_error 共 5 字段
+  2. local_30=inner_width(X 方向) / local_2c=inner_height(Y 方向) 注释修正（代码逻辑不变，仅修注释）
+- **审查者独立验证全部 PASS**：
+  - A1-A11（实现忠实度）全 PASS
+  - B1-B2（编译适配合理性）全 PASS
+  - C1-C3（warning 终态）全 PASS
+  - D1-D5（对照源码）全 PASS（含 CellSOA 11 字段偏移 + 三阶段循环边界 + 填充公式 lVar9 = (local_24+1+ivar7)*width + local_28 + ivar8 匹配源码 L24464）
+  - E1-E2（测试结果）全 PASS（167/167 通过，6 新测试覆盖 6 新函数）
+  - F1-F2（报告卫生）全 PASS
+- **Warning 终态 = 9 项**（cargo build 6 + cargo test --lib 额外 3）：
+  1. T7 新增 `unused import: WorldOffsetData` at save_load.rs:484（简报字面必然产生，简报要求 `use crate::sim_data::{BackwallSOA, WorldOffsetData};` 但 WorldOffsetData 未在 6 个函数中使用）
+  2. T4 unused_variables `updated_cells` at frame_sync.rs:55
+  3. T6 unused_mut `element_idx` at save_load.rs:268
+  4. T6 unused_assignments `save_settings_byte` at save_load.rs:377
+  5. T4 unused_variables `other` at sim_data.rs:372
+  6. 不可改 non_snake_case crate SimDLL
+  7. T5 unused_mut `w` at save_load.rs:~1002（T7 加入 567 行导致行号迁移）
+  8. T5 unused_mut `w2` at save_load.rs:~1025（同上）
+  9. T7 新增 3 项 unused_mut at save_load.rs:~1238/1253/1261（start/prepare_game_data/game_sync_function 测试 `let mut w = BinaryBufferWriter::new();` 简报字面必然产生）
+- **2 项 MINOR 描述偏差**（不阻塞 T8）：
+  1. 实现者报告 §4 T5 w/w2 行号 550/573 是简报旧行号，HEAD 实际 1002/1025
+  2. 实现者报告 §4 末尾 cargo test --lib 额外 warning 写"3 项新增"，实际 5 项（T5 2 项 + T7 3 项）
+- **遗留观察项（Phase 6+ 复核）**：
+  1. SimEvents 重置不完整（start 仅对 substance_change_info/spawn_liquid_info/spawn_ore_info 3 个 MsvcVector 调用 resize(0,...)，其余 17 个未处理，简报字面注释授权 Phase 6+ 接入真实 clear）
+  2. WorldOffsetData unused import（如果后续 T8+ 不需要，可考虑从 import 中移除）
+  3. cleanup 的 `*g = Box::new(SimData::new_zeroed())`（与 allocate_cells L120 一致，但源码 CleanUp 是直接析构 + 重置 gSimData 指针，Phase 6+ 接入真实 SimData 析构时复核）
+  4. prepare_game_data_update 的 29 对 num+ptr（当前 GameData MsvcVector 全部为空，len() 返回 0、begin 为 null，Phase 6+ GameData 实际填充数据后需验证指针提取正确性）
+  5. T7 测试均为 smoke test（does_not_panic / fills_internal），未验证填充值精确正确性（Phase 6+ 接入真实数据后补充精确值断言测试）
+  6. T6 遗留 7 项（Phase 3 Load 真实调用前必须修复）继续延续
+- **对照源码全部匹配**：02_save_load.c L211-1059（Start/CleanUp/PrepareGameData/GameSyncFunction/PrepareGameDataUpdate）+ 11_msvcrt_ignored.c L24427-24700（ResizeAndInitializeVacuumCells + 4 填充辅助）
+
+Task P3-T8: complete (commit <this commit>, 控制者直接执行，无独立审查)
+- 产物：`simDLL_RS/tests/save_load_smoke.rs` 新建 127 行（13 集成测试，字面照搬计划 L2578-2705）+ `.superpowers/sdd/progress.md` 追加 Phase 3 完成段落 + T8 完成记录（注：T1-T7 记录此前未单独 commit，本次随 T8 一并提交）
+- 测试：cargo test --test save_load_smoke 13/13 通过；cargo test 全量 180/180 通过（lib 149 + abi_smoke 11 + elements_smoke 7 + save_load_smoke 13）；cargo build --release --target x86_64-pc-windows-msvc exit 0，6 warning（cargo build 终态，与 T7 一致）
+- 审查：控制者直接执行，无独立审查（计划 T8 简报预授权）
+- **计划字面 vs 实际偏差**：计划 step 3 预期"206 测试通过（lib 170 + abi_smoke 16 + elements_smoke 7 + save_load_smoke 13）"，实际 180（lib 149 + abi_smoke 11 + elements_smoke 7 + save_load_smoke 13）。差异根因：Phase 3 lib 实际新增 40 测试（非计划预估的 43），abi_smoke Phase 2 收官 11（非计划假设的 16）。按实际数字记入 progress
+- **Warning 终态 = 9 项**（cargo build 6 + cargo test --lib 额外 3，与 T7 一致，T8 未引入新 warning）
+
+## Phase 3: 存档加载（已完成）
+
+**Commit range:** 1b5d1c9..16517ea（T1-T7 代码）+ T8 commit（本文档 + 集成测试）
+**基线:** Phase 2 (commit 1b5d1c9, 127 测试通过)
+**终态:** 180 测试通过（lib 149 + abi_smoke 11 + elements_smoke 7 + save_load_smoke 13），release build exit 0
+
+### 实现
+- 14 个存档加载函数（02_save_load.c 13 个 + 11_msvcrt_ignored.c 1 个）：
+  Load / Start / AllocateCells / DefineWorldOffsets / PrepareGameData /
+  ClearUnoccupiedCells / SetSavedOptions / Disease_CreateTable /
+  ResizeAndInitializeVacuumCells / CleanUp / GameSyncFunction /
+  PrepareGameDataUpdate + CellRead 内部辅助
+- 1 个新 struct: GameDataUpdate（48 字段，616B）
+- 1 个补全 struct: SimEvents（20 个 MsvcVector，640B）
+- 5 个全局单例: G_SIM_DATA / G_FRAME_SYNC / G_SIM / G_DISEASE / G_GAME_DATA_UPDATE
+- 11 个 stub 函数（Phase 6+ 接入真实实现）
+- MsvcVector 补充 7 个方法（new/is_empty/len/get/get_mut/set/resize）
+- BufferError 新增 InvalidMagic 变体
+
+### 测试
+- lib 测试：149 通过（Phase 2 基线 109 + Phase 3 新增 40）
+- 集成测试 save_load_smoke：13 通过
+- 总计：180 测试通过（含 abi_smoke 11 + elements_smoke 7）
+
+### 设计 spec 与源码不一致（已修订，按源码字面实现）
+1. CellRead hash 重映射：源码无条件检查（非 spec 说的 version < 0xa）
+2. GameDataUpdate 字段：源码用 12 个 SOA 裸指针（非 spec §4.1 的 13 个 SOA 数组指针；spec 注释的 624B 亦修正为实际 616B）
+
+### 已知遗留
+- Load 阶段 2/3（disease/backwall 读取）Phase 3 stub 跳过，Phase 6+ 接入
+- 11 个 stub 函数（apply_save_settings / do_load_time_state_transition / settle_thermal_boundaries /
+  initialize_boundary / copy_from / init_game_data / game_sync / clear / start / join / joinable）
+  Phase 6+ 替换为真实实现
+- 模拟线程未启动（Thread::Start 是 stub），游戏会卡在加载界面
