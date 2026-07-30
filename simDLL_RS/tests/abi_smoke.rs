@@ -33,8 +33,11 @@ fn sim_begin_save_smoke() {
     // 模拟 C# 触发存档
     let mut size: c_int = 0xDEAD; // 初始化为哨兵值
     let result = SIM_BeginSave(&mut size as *mut c_int, 0, 0);
-    assert!(result.is_null());
-    assert_eq!(size, 0, "out_size should be set to 0 by stub");
+    // Phase 4: begin_save 成功返回非空指针 + size>0（empty world → 29 字节头部）
+    assert!(!result.is_null(), "SIM_BeginSave should return non-null pointer");
+    assert!(size > 0, "size should be positive, got {}", size);
+    // 清理 save buffer（避免泄漏影响后续测试）
+    SIM_EndSave();
 }
 
 #[test]

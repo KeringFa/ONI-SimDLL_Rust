@@ -228,23 +228,42 @@ pub extern "C" fn SIM_HandleMessages(
     })
 }
 
-/// 对应原版 `SIM_BeginSave(int *out_size, int p2, int p3)` (L98220)。
+/// 对应原版 `SIM_BeginSave(int *out_size, int p2, int p3)` (L98220 / 01_sim_api.c L7-171)。
 ///
 /// 原版流程：分配 SaveBuffer，写入 "SIMSAVE" 头 + 元数据 + 所有 cell。
-/// Phase 0 桩：返回 null，*out_size = 0。
-/// 运行时影响：游戏"保存"按钮点击后 C# 收到 null，应弹"无法保存"提示或静默忽略。
+/// Phase 4 实现：调用 save_load::begin_save，成功时 *out_size = buffer.len() 返回指针，
+/// 失败时 *out_size = 0 返回 null。
+///
+/// **运行时影响**：游戏"保存"按钮点击后 C# 收到非空指针 + size，
+/// 拷贝字节写入存档文件 → 保存成功（Phase 0 桩时返回 null 导致保存失败）。
 #[no_mangle]
 pub extern "C" fn SIM_BeginSave(
     out_size: *mut c_int,
-    _p2: c_int,
-    _p3: c_int,
+    p2: c_int,
+    p3: c_int,
 ) -> *mut c_schar {
     catch_unwind(AssertUnwindSafe(|| {
-        tracing::warn!("SIM_BeginSave (Phase 0 stub) — save not implemented, returning null");
-        if !out_size.is_null() {
-            unsafe { *out_size = 0 };
+        match save_load::begin_save(p2, p3) {
+            Ok(ptr) => {
+                // 写入 out_size（buffer 长度从 G_SAVE_BUFFER 读取）
+                let size = {
+                    let g = save_load::G_SAVE_BUFFER.lock().unwrap();
+                    g.as_ref().map(|b| b.len() as c_int).unwrap_or(0)
+                };
+                if !out_size.is_null() {
+                    unsafe { *out_size = size };
+                }
+                tracing::info!(size, "SIM_BeginSave: save buffer ready");
+                ptr as *mut c_schar
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "SIM_BeginSave failed, returning null");
+                if !out_size.is_null() {
+                    unsafe { *out_size = 0 };
+                }
+                std::ptr::null_mut()
+            }
         }
-        std::ptr::null_mut()
     }))
     .unwrap_or_else(|_| {
         tracing::error!("SIM_BeginSave panicked, returning null");
@@ -255,14 +274,14 @@ pub extern "C" fn SIM_BeginSave(
     })
 }
 
-/// 对应原版 `SIM_EndSave(void)` (L98408)。
+/// 对应原版 `SIM_EndSave(void)` (L98408 / 01_sim_api.c L195-204)。
 ///
 /// 原版流程：若 SaveBuffer != null，调用其析构并置 null。
-/// Phase 0 桩：SaveBuffer 永远 null，no-op。
+/// Phase 4 实现：调用 save_load::end_save 释放全局 SaveBuffer。
 #[no_mangle]
 pub extern "C" fn SIM_EndSave() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        tracing::info!("SIM_EndSave (Phase 0 stub) — no-op (SaveBuffer not allocated)");
+        save_load::end_save();
     }));
 }
 
@@ -372,17 +391,25 @@ mod tests {
     }
 
     #[test]
-    fn sim_begin_save_returns_null_and_zero_size() {
+    fn sim_begin_save_returns_non_null_and_correct_size() {
+        // empty SimData (width=0/height=0) → 29 字节头部
+        // 注意：此测试依赖 G_SIM_DATA 的 width/height=0（由其他测试并行设置，
+        // Mutex 提供同步；即使其他测试设置非零 width/height，begin_save 仍应
+        // 返回非空指针，只是 size 不同。这里只断言非空 + size>0）
         let mut size: c_int = -1;
         let result = SIM_BeginSave(&mut size as *mut _, 0, 0);
-        assert!(result.is_null());
-        assert_eq!(size, 0);
+        assert!(!result.is_null(), "SIM_BeginSave should return non-null pointer");
+        assert!(size > 0, "size should be positive, got {}", size);
+        // 清理 save buffer（避免泄漏影响后续测试）
+        SIM_EndSave();
     }
 
     #[test]
     fn sim_begin_save_with_null_out_size_does_not_panic() {
+        // null out_size 仍应返回非空指针（begin_save 不依赖 out_size）
         let result = SIM_BeginSave(std::ptr::null_mut(), 0, 0);
-        assert!(result.is_null());
+        assert!(!result.is_null(), "SIM_BeginSave should return non-null even with null out_size");
+        SIM_EndSave();
     }
 
     #[test]
