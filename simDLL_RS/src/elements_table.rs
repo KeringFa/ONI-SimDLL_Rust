@@ -10,6 +10,8 @@
 //! Phase 2 T3：仅定义 struct + 全局单例，5 个函数实现见 T4-T6。
 
 use std::collections::HashMap;
+use std::os::raw::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
@@ -346,6 +348,112 @@ fn create_element_interactions(reader: &mut BinaryBufferReader) -> Result<(), Bu
     }
 
     Ok(())
+}
+
+/// C ABI: CreateElementsTable。
+///
+/// 对照源码 03_elements.c L27（导出符号）。
+/// 返回 (void*)(longlong)count，错误时返回 null。
+#[no_mangle]
+pub extern "C" fn CreateElementsTable(reader: *mut BinaryBufferReader) -> *mut c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        match unsafe { reader.as_mut() } {
+            Some(reader) => match create_elements_table(reader) {
+                Ok(count) => count as *mut c_void,  // 源码返回 (void*)(longlong)count
+                Err(e) => {
+                    tracing::error!(?e, offset = reader.offset(), "CreateElementsTable failed");
+                    std::ptr::null_mut()
+                }
+            },
+            None => {
+                tracing::warn!("CreateElementsTable called with null reader");
+                std::ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("CreateElementsTable panicked");
+        std::ptr::null_mut()
+    })
+}
+
+/// C ABI: DestroyElementsTable。
+///
+/// 对照源码 03_elements.c L430（导出符号）。
+#[no_mangle]
+pub extern "C" fn DestroyElementsTable() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        destroy_elements_table();
+    }));
+}
+
+/// C ABI: GetElementIndex。
+///
+/// 对照源码 03_elements.c L456（导出符号）。
+/// 找不到时返回 INVALID_ELEMENT_INDEX (0xffff)。
+#[no_mangle]
+pub extern "C" fn GetElementIndex(hash: u32) -> u16 {
+    catch_unwind(AssertUnwindSafe(|| {
+        get_element_index(hash)
+    }))
+    .unwrap_or(INVALID_ELEMENT_INDEX)
+}
+
+/// C ABI: CreateElementInteractions。
+///
+/// 对照源码 03_elements.c L517（导出符号）。
+/// 返回 null（源码 L569: return null）。
+#[no_mangle]
+pub extern "C" fn CreateElementInteractions(reader: *mut BinaryBufferReader) -> *mut c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        match unsafe { reader.as_mut() } {
+            Some(reader) => match create_element_interactions(reader) {
+                Ok(()) => std::ptr::null_mut(),  // 源码返回 null
+                Err(e) => {
+                    tracing::error!(?e, offset = reader.offset(), "CreateElementInteractions failed, partial data may remain");
+                    std::ptr::null_mut()
+                }
+            },
+            None => {
+                tracing::warn!("CreateElementInteractions called with null reader");
+                std::ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("CreateElementInteractions panicked");
+        std::ptr::null_mut()
+    })
+}
+
+/// C ABI: CreateElementInteractionsLocked。
+///
+/// 对照源码 03_elements.c L7-23（导出符号）。
+/// 用 G_INTERACTIONS_LOCK（parking_lot::Mutex 独立锁，决策 #2）
+/// 替代原版 gFrameSync.mSimMutex，Phase 3+ 替换 MsvcMutex 时无需回头改。
+#[no_mangle]
+pub extern "C" fn CreateElementInteractionsLocked(reader: *mut BinaryBufferReader) -> *mut c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        // 决策 #2：用 parking_lot::Mutex 独立锁
+        let _guard = G_INTERACTIONS_LOCK.lock();
+        match unsafe { reader.as_mut() } {
+            Some(reader) => match create_element_interactions(reader) {
+                Ok(()) => std::ptr::null_mut(),
+                Err(e) => {
+                    tracing::error!(?e, offset = reader.offset(), "CreateElementInteractionsLocked failed");
+                    std::ptr::null_mut()
+                }
+            },
+            None => {
+                tracing::warn!("CreateElementInteractionsLocked called with null reader");
+                std::ptr::null_mut()
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("CreateElementInteractionsLocked panicked");
+        std::ptr::null_mut()
+    })
 }
 
 #[cfg(test)]
