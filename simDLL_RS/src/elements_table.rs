@@ -122,6 +122,33 @@ pub fn destroy_elements_table_pub() {
     destroy_elements_table()
 }
 
+/// 公开包装：按 element_idx 查询元素状态（供 process_messages.rs 跨模块调用）。
+///
+/// 对照源码 elements.c 中 `gElementStateData[idx].state` 字段查询。
+/// state 字段是位域：`state & 3` 决定状态：
+/// - 0 → Vacuum
+/// - 1 → Gas
+/// - 2 → Liquid
+/// - 3 → Solid
+///
+/// 返回 `ElementState` 枚举（与 process_messages 模块共享）。
+/// 若元素表未初始化或 idx 越界，返回 `None`（调用方默认 Solid）。
+pub fn get_element_state_by_idx(elem_idx: u16) -> Option<crate::process_messages::ElementState> {
+    let table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let idx = elem_idx as usize;
+    if idx >= table.state_data.len() {
+        return None;
+    }
+    let state = table.state_data[idx].state;
+    Some(match state & 3 {
+        0 => crate::process_messages::ElementState::Vacuum,
+        1 => crate::process_messages::ElementState::Gas,
+        2 => crate::process_messages::ElementState::Liquid,
+        3 => crate::process_messages::ElementState::Solid,
+        _ => unreachable!(),  // state & 3 只会产生 0..=3
+    })
+}
+
 /// 反序列化元素表——4 阶段 + 后处理。
 ///
 /// 对照源码 03_elements.c L27-429（CreateElementsTable）。
