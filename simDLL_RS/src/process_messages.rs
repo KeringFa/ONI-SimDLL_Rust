@@ -379,9 +379,76 @@ pub fn displace_liquid(_sim_data: &mut SimData, _idx: usize, _new_elem: u16, _ne
 /// `ProcessMassEmission` — 排放质量（间歇泉等）。
 ///
 /// 对照源码 06_process_messages.c L1042-1248。
-/// T10 实现，当前桩。
-pub fn process_mass_emission(_frame: &SimFrameInfo, _sim_data: &mut SimData) {
-    // T10 实现
+/// 遍历 frame.mass_emission_messages（每条 24B），game_cell → cell_idx，
+/// 若目标格子是真空或同元素 → 叠加 mass + 加权平均温度；
+/// 若不同元素 → DisplaceGas/DisplaceLiquid（桩）或固体排放失败。
+/// 病菌：Disease::AddDiseaseToCell（桩 no-op）。
+///
+/// **运行时影响**：C# 间歇泉排放、玩家放生物等会向格子添加物质。
+/// 真空格子或同元素格子叠加质量 + 加权温度；不同元素 Phase 7 直接覆盖。
+pub fn process_mass_emission(frame: &SimFrameInfo, sim_data: &mut SimData) {
+    let width = sim_data.width;
+    let height_minus_2 = sim_data.height - 2;
+    if width <= 2 || height_minus_2 <= 0 {
+        return;
+    }
+    if sim_data.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    let elem_idx_arr = updated_cells.element_idx.as_mut_slice();
+    let temp_arr = updated_cells.temperature.as_mut_slice();
+    let mass_arr = updated_cells.mass.as_mut_slice();
+
+    for me in frame.mass_emission_messages.as_slice() {
+        let idx = match crate::sim_frame_manager::game_cell_to_idx(
+            me.game_cell,
+            width,
+            height_minus_2,
+        ) {
+            Some(i) => i as usize,
+            None => continue,
+        };
+        let temp = me.temperature.clamp(0.0, 10000.0);
+        let mass = if me.mass < 0.0 { 0.0 } else { me.mass };
+
+        if idx >= elem_idx_arr.len() {
+            continue;
+        }
+
+        let current_elem = elem_idx_arr[idx];
+        let current_mass = mass_arr[idx];
+
+        if current_elem == me.element_idx || current_mass <= 0.0 {
+            // 真空或同元素：叠加 mass + 加权平均温度
+            let new_mass = current_mass + mass;
+            let new_temp = if new_mass > 0.0 {
+                calculate_combined_temperatures(current_mass, temp_arr[idx], mass, temp)
+            } else {
+                temp
+            };
+            mass_arr[idx] = new_mass;
+            temp_arr[idx] = new_temp;
+            elem_idx_arr[idx] = me.element_idx;
+            // 病菌：Disease::AddDiseaseToCell（桩 no-op）
+            // 元素变更：emplace SubstanceChangeInfo 到 simEvents（Phase 7：暂不写）
+        } else {
+            // 不同元素：气体/液体置换（桩返回 false）→ fallback 直接覆盖
+            let elem_state = get_element_state(current_elem);
+            let displaced = match elem_state {
+                ElementState::Gas => displace_gas(sim_data, idx, me.element_idx, mass, temp),
+                ElementState::Liquid => displace_liquid(sim_data, idx, me.element_idx, mass, temp),
+                _ => false,  // 固体排放失败
+            };
+            if !displaced {
+                // Phase 7：直接覆盖（fallback）
+                elem_idx_arr[idx] = me.element_idx;
+                mass_arr[idx] = mass;
+                temp_arr[idx] = temp;
+            }
+        }
+        // 回调：emplace MassEmittedCallback 到 simEvents（Phase 7：暂不写）
+    }
 }
 
 #[cfg(test)]
@@ -742,5 +809,106 @@ mod tests {
         let mut sd = make_test_sim_data();
         assert!(!displace_liquid(&mut sd, 0, 1, 100.0, 300.0));
         free_test_sim_data(&mut sd);
+    }
+
+    // ===== Phase 7 T10：process_mass_emission 测试 =====
+
+    #[test]
+    fn process_mass_emission_emits_to_vacuum() {
+        // 目标格 mass=0（真空）→ 叠加 + 设元素
+        use crate::sim_events::MassEmission;
+        let mut frame = SimFrameInfo::default();
+        frame.mass_emission_messages.push(MassEmission {
+            game_cell: 0,            // → idx=7
+            callback_idx_or_temp: 0.0,
+            mass: 100.0,
+            temperature: 300.0,
+            disease_count: 0,
+            element_idx: 1,
+            disease_idx: 0,
+            emitted: 0,
+            _pad: [0; 2],
+        });
+        let mut sd = make_test_sim_data();
+        process_mass_emission(&frame, &mut sd);
+        unsafe {
+            let cells = &*sd.updated_cells.ptr;
+            assert_eq!(cells.element_idx.get(7), 1);
+            assert!((cells.mass.get(7) - 100.0).abs() < 0.01);
+            assert!((cells.temperature.get(7) - 300.0).abs() < 0.01);
+        }
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn process_mass_emission_stacks_when_same_element() {
+        // 同元素叠加 + 加权平均温度
+        use crate::sim_events::MassEmission;
+        let mut frame = SimFrameInfo::default();
+        frame.mass_emission_messages.push(MassEmission {
+            game_cell: 0,
+            callback_idx_or_temp: 0.0,
+            mass: 50.0,
+            temperature: 200.0,
+            disease_count: 0,
+            element_idx: 1,         // 与目标同元素
+            disease_idx: 0,
+            emitted: 0,
+            _pad: [0; 2],
+        });
+        let mut sd = make_test_sim_data();
+        unsafe {
+            (*sd.updated_cells.ptr).element_idx.set(7, 1);
+            (*sd.updated_cells.ptr).mass.set(7, 50.0);
+            (*sd.updated_cells.ptr).temperature.set(7, 100.0);
+        }
+        process_mass_emission(&frame, &mut sd);
+        unsafe {
+            let cells = &*sd.updated_cells.ptr;
+            assert!((cells.mass.get(7) - 100.0).abs() < 0.01);
+            assert!((cells.temperature.get(7) - 150.0).abs() < 0.01);
+        }
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn process_mass_emission_overwrites_when_different_element() {
+        // 不同元素：DisplaceGas/DisplaceLiquid 桩返回 false → fallback 覆盖
+        use crate::sim_events::MassEmission;
+        let mut frame = SimFrameInfo::default();
+        frame.mass_emission_messages.push(MassEmission {
+            game_cell: 0,
+            callback_idx_or_temp: 0.0,
+            mass: 30.0,
+            temperature: 250.0,
+            disease_count: 0,
+            element_idx: 2,         // 与目标 element=1 不同
+            disease_idx: 0,
+            emitted: 0,
+            _pad: [0; 2],
+        });
+        let mut sd = make_test_sim_data();
+        unsafe {
+            (*sd.updated_cells.ptr).element_idx.set(7, 1);
+            (*sd.updated_cells.ptr).mass.set(7, 100.0);  // mass>0
+            (*sd.updated_cells.ptr).temperature.set(7, 50.0);
+        }
+        process_mass_emission(&frame, &mut sd);
+        unsafe {
+            let cells = &*sd.updated_cells.ptr;
+            assert_eq!(cells.element_idx.get(7), 2);
+            assert!((cells.mass.get(7) - 30.0).abs() < 0.01);
+            assert!((cells.temperature.get(7) - 250.0).abs() < 0.01);
+        }
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn process_mass_emission_skips_invalid_width() {
+        let mut sd = SimData::new_zeroed();
+        sd.width = 0;
+        let frame = SimFrameInfo::default();
+        process_mass_emission(&frame, &mut sd);
+        // 不 panic
     }
 }
