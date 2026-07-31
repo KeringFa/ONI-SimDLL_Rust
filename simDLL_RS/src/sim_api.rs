@@ -176,6 +176,11 @@ pub extern "C" fn SIM_Shutdown() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         tracing::info!("SIM_Shutdown (Phase 0 stub) — start");
         // CleanUp 桩跳过
+        // Phase 7：停止 Sim::Main 后台线程（若仍在运行）
+        {
+            let mut sim = save_load::G_SIM.lock().unwrap_or_else(|e| e.into_inner());
+            sim.stop_main_thread();
+        }
         logger::flush();
         // SymCleanup 桩跳过
         tracing::info!("SIM_Shutdown (Phase 0 stub) — done");

@@ -908,6 +908,8 @@ pub fn start(_reader: &mut BinaryBufferReader) -> Result<(), BufferError> {
     {
         let mut sim = G_SIM.lock().unwrap();
         sim.start();
+        // Phase 7：启动 Sim::Main 后台线程（对照源码 Thread::Start 持久化线程）
+        sim.start_main_thread();
     }
 
     // PrepareGameDataUpdate（源码 L253）
@@ -931,6 +933,9 @@ pub fn cleanup() {
             drop(fs);
             sim.join();
         }
+        // Phase 7：停止 Sim::Main 后台线程（对照源码 Thread::Stop + Thread::Join）
+        // 即使 joinable() 返回 false（Phase 3 stub），也要确保后台线程已停止
+        sim.stop_main_thread();
     }
 
     // 2. 释放 gSimData（源码 L646-652）
@@ -1450,6 +1455,9 @@ mod tests {
         let mut reader = BinaryBufferReader::new(&buf);
         // 不应 panic
         let _ = start(&mut reader);
+        // Phase 7：start() 现在会启动 Sim::Main 后台线程，需调 cleanup() 停止线程
+        // 避免线程泄漏到其他测试
+        cleanup();
     }
 
     #[test]
