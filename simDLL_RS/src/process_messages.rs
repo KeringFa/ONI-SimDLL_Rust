@@ -282,9 +282,98 @@ fn calculate_combined_temperatures(m1: f32, t1: f32, m2: f32, t2: f32) -> f32 {
 /// `ProcessMassConsumption` — 消耗质量（挖掘等）。
 ///
 /// 对照源码 06_process_messages.c L920-1038。
-/// T9 实现，当前桩。
-pub fn process_mass_consumption(_frame: &SimFrameInfo, _sim_data: &mut SimData) {
-    // T9 实现
+/// 遍历 frame.mass_consumption_messages（每条 16B），按 use_rectangle 分派：
+/// - 0 → flood_removed_stub（退化为 rectangular_removed 用 loop_radius 作半径）
+/// - 1 → rectangular_removed（矩形区域内清零 mass + 设置为 vacuum 元素）
+///
+/// **运行时影响**：C# 挖掘命令（如复制人挖矿）会清空指定矩形区域内格子的质量，
+/// 游戏画面上对应格子变为真空（黑色）。Phase 7 简化：FloodRemoved 退化为 RectangularRemoved。
+pub fn process_mass_consumption(frame: &SimFrameInfo, sim_data: &mut SimData) {
+    let width = sim_data.width;
+    let height_minus_2 = sim_data.height - 2;
+    if width <= 2 || height_minus_2 <= 0 {
+        return;
+    }
+    for mc in frame.mass_consumption_messages.as_slice() {
+        let center_idx = match crate::sim_frame_manager::game_cell_to_idx(
+            mc.game_cell,
+            width,
+            height_minus_2,
+        ) {
+            Some(i) => i,
+            None => continue,
+        };
+        let radius = mc.loop_radius as i32;
+        if mc.use_rectangle != 0 {
+            rectangular_removed(sim_data, center_idx, radius, mc.removed_elem_idx);
+        } else {
+            // Phase 7：FloodRemoved 退化为 RectangularRemoved
+            flood_removed_stub(sim_data, center_idx, radius, mc.removed_elem_idx);
+        }
+        // 回调：emplace MassConsumedCallback 到 simEvents（Phase 7：暂不写）
+    }
+}
+
+/// 辅助：RectangularRemoved — 矩形区域内清零 mass 并设为 vacuum 元素。
+///
+/// 对照源码 06_process_messages.c RectangularRemoved。
+/// 区域计算：以 center_idx 为中心，radius 为半径的矩形（含边界保护）。
+fn rectangular_removed(sim_data: &mut SimData, center_idx: i32, radius: i32, _removed_elem_idx: u16) {
+    if sim_data.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim_data.width;
+    let height = sim_data.height;
+    let center_x = center_idx % width;
+    let center_y = center_idx / width;
+    let min_x = (center_x - radius).max(0);
+    let max_x = (center_x + radius).min(width - 1);
+    let min_y = (center_y - radius).max(0);
+    let max_y = (center_y + radius).min(height - 1);
+
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    let mass_arr = updated_cells.mass.as_mut_slice();
+    let elem_idx_arr = updated_cells.element_idx.as_mut_slice();
+    let temp_arr = updated_cells.temperature.as_mut_slice();
+    let vacuum_idx = sim_data.vacuum_element_idx;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let idx = (y * width + x) as usize;
+            if idx < mass_arr.len() {
+                mass_arr[idx] = 0.0;
+                // 设置为真空元素（与原版一致：清空后是 vacuum）
+                elem_idx_arr[idx] = vacuum_idx;
+                temp_arr[idx] = 0.0;
+                // 触发 ConsumedMassInfo 事件（Phase 7：暂不写）
+            }
+        }
+    }
+}
+
+/// 辅助：FloodRemoved 桩 — 退化为 RectangularRemoved。
+///
+/// Phase 7：FloodRemoved（泛洪移除）退化为 RectangularRemoved（矩形移除）。
+/// Phase 8/9 补全泛洪算法。
+fn flood_removed_stub(sim_data: &mut SimData, center_idx: i32, radius: i32, removed_elem_idx: u16) {
+    tracing::trace!(
+        center_idx,
+        radius,
+        "FloodRemoved: degraded to RectangularRemoved (Phase 7)"
+    );
+    rectangular_removed(sim_data, center_idx, radius, removed_elem_idx);
+}
+
+/// 辅助：DisplaceGas 桩 — 返回 false。
+///
+/// Phase 8 补全真实流体置换。当前返回 false 让调用方走 fallback（直接覆盖）。
+pub fn displace_gas(_sim_data: &mut SimData, _idx: usize, _new_elem: u16, _new_mass: f32, _new_temp: f32) -> bool {
+    false
+}
+
+/// 辅助：DisplaceLiquid 桩 — 返回 false。
+pub fn displace_liquid(_sim_data: &mut SimData, _idx: usize, _new_elem: u16, _new_mass: f32, _new_temp: f32) -> bool {
+    false
 }
 
 /// `ProcessMassEmission` — 排放质量（间歇泉等）。
@@ -578,6 +667,80 @@ mod tests {
             assert!((cells.mass.get(7) - 0.0).abs() < 0.01, "负 mass 应 clamp 到 0");
             assert!((cells.temperature.get(7) - 10000.0).abs() < 0.01, "超高温应 clamp 到 10000");
         }
+        free_test_sim_data(&mut sd);
+    }
+
+    // ===== Phase 7 T9：process_mass_consumption + 辅助函数测试 =====
+
+    #[test]
+    fn process_mass_consumption_rectangular_removed_clears_mass() {
+        // use_rectangle=1，半径 1：以 idx=7 (x=1,y=1) 为中心，覆盖 0..=2 × 0..=2 的 9 格
+        use crate::sim_events::MassConsumption;
+        let mut frame = SimFrameInfo::default();
+        frame.mass_consumption_messages.push(MassConsumption {
+            game_cell: 0,
+            callback_idx: 0,
+            removed_elem_idx: 0,
+            loop_radius: 1,
+            use_rectangle: 1,
+        });
+        let mut sd = make_test_sim_data();
+        // 预置所有格子 mass=100, element=5
+        unsafe {
+            for i in 0..36 {
+                (*sd.updated_cells.ptr).mass.set(i, 100.0);
+                (*sd.updated_cells.ptr).element_idx.set(i, 5);
+                (*sd.updated_cells.ptr).temperature.set(i, 300.0);
+            }
+        }
+        process_mass_consumption(&frame, &mut sd);
+        unsafe {
+            let cells = &*sd.updated_cells.ptr;
+            // 中心 (1,1)=7 应被清空
+            assert!((cells.mass.get(7) - 0.0).abs() < 0.01);
+            assert_eq!(cells.element_idx.get(7), 0);  // vacuum_element_idx=0 (默认)
+            // 角落 (0,0)=0 也应被清空（在 radius=1 范围内）
+            assert!((cells.mass.get(0) - 0.0).abs() < 0.01);
+            // 边界外 (5,5)=35 应保持不变
+            assert!((cells.mass.get(35) - 100.0).abs() < 0.01);
+            assert_eq!(cells.element_idx.get(35), 5);
+        }
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn process_mass_consumption_flood_degraded_to_rectangular() {
+        // use_rectangle=0 (FloodRemoved)，应退化为 RectangularRemoved 不 panic
+        use crate::sim_events::MassConsumption;
+        let mut frame = SimFrameInfo::default();
+        frame.mass_consumption_messages.push(MassConsumption {
+            game_cell: 0,
+            callback_idx: 0,
+            removed_elem_idx: 0,
+            loop_radius: 1,
+            use_rectangle: 0,
+        });
+        let mut sd = make_test_sim_data();
+        process_mass_consumption(&frame, &mut sd);
+        // 中心 idx=7 应被清空（与 rectangular 一致）
+        unsafe {
+            let cells = &*sd.updated_cells.ptr;
+            assert!((cells.mass.get(7) - 0.0).abs() < 0.01);
+        }
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn displace_gas_stub_returns_false() {
+        let mut sd = make_test_sim_data();
+        assert!(!displace_gas(&mut sd, 0, 1, 100.0, 300.0));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn displace_liquid_stub_returns_false() {
+        let mut sd = make_test_sim_data();
+        assert!(!displace_liquid(&mut sd, 0, 1, 100.0, 300.0));
         free_test_sim_data(&mut sd);
     }
 }
