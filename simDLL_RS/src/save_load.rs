@@ -1126,11 +1126,13 @@ mod tests {
     use super::*;
     use crate::buffer::{BinaryBufferReader, BinaryBufferWriter};
 
-    /// save_load 模块测试序列化锁：避免共享全局状态（G_SIM_DATA /
-    /// G_SAVE_BUFFER / G_ELEMENTS_TABLE / G_DISEASE 等）的测试并行执行导致
-    /// setup 互相覆盖。所有 save_load::tests 中的测试开头获取此锁，串行执行。
+    /// 跨模块共享的测试序列化锁（定义在 crate::LIB_TESTS_LOCK）：
+    /// 串行化 elements_table::tests / save_load::tests / sim_api::tests
+    /// 中所有操作全局状态（G_SIM_DATA / G_SAVE_BUFFER / G_ELEMENTS_TABLE /
+    /// G_DISEASE 等）的测试，避免并行执行导致 setup 互相覆盖。
+    /// 所有 save_load::tests 中的测试开头获取此锁，串行执行。
     /// 不获取此锁的测试不存在（global_singletons_lockable 也获取）。
-    static PHASE4_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::LIB_TESTS_LOCK as PHASE4_TEST_LOCK;
 
     #[test]
     fn global_singletons_lockable() {

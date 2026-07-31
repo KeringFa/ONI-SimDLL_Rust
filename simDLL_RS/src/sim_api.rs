@@ -332,10 +332,16 @@ pub extern "C" fn SYSINFO_Release() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 跨模块共享的测试序列化锁（定义在 crate::LIB_TESTS_LOCK）：
+    /// 串行化 elements_table::tests / save_load::tests / sim_api::tests
+    /// 中所有操作全局状态的测试，避免并行执行导致 setup 互相覆盖。
+    use crate::LIB_TESTS_LOCK as PHASE4_TEST_LOCK;
     use crate::abi::SYSINFO_STUB_JSON;
 
     #[test]
     fn sim_initialize_with_null_handler_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 多次调用安全（Logger/CrashDump 都是幂等）
         SIM_Initialize(None);
         SIM_Initialize(None);
@@ -343,6 +349,7 @@ mod tests {
 
     #[test]
     fn sim_handle_message_returns_null() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // id=0 不在 save_load 集合中，dispatch_save_load_message 走 `_` 分支返回 null
         let result = SIM_HandleMessage(0, 0, std::ptr::null_mut());
         assert!(result.is_null());
@@ -350,6 +357,7 @@ mod tests {
 
     #[test]
     fn sim_handle_messages_returns_null() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // count=0，循环不执行，直接返回 null
         let result = SIM_HandleMessages(0, 0, 0, std::ptr::null_mut());
         assert!(result.is_null());
@@ -357,6 +365,7 @@ mod tests {
 
     #[test]
     fn sim_handle_message_dispatches_load_with_empty_buffer() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 验证 Load 消息能正确路由到 save_load::load
         // id=Load=3622429126 超过 i32::MAX，需用 `MessageType::Load as u32 as c_int`
         // 保位转换（u32 → i32 bit-pattern preserving）
@@ -370,6 +379,7 @@ mod tests {
 
     #[test]
     fn sim_handle_message_dispatches_load_with_valid_magic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 验证 Load 消息通过魔数检查后的完整 dispatch 路径
         // 构造 magic + version=0x10（高版本跳过 header 读取，start_offset=0 跳过所有循环）
         // 此路径仅读取 G_SIM_DATA（read-only，width/updated_cells_ptr），不修改任何全局状态
@@ -383,6 +393,7 @@ mod tests {
 
     #[test]
     fn sim_handle_messages_loops_count_times() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // count=2, 每次调用 Load with empty buffer（不修改全局状态，并行安全）
         // 验证循环不 panic，返回 null（最后一次调用的结果）
         let id: c_int = MessageType::Load as u32 as c_int;
@@ -392,6 +403,7 @@ mod tests {
 
     #[test]
     fn sim_begin_save_returns_non_null_and_correct_size() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // empty SimData (width=0/height=0) → 29 字节头部
         // 注意：此测试依赖 G_SIM_DATA 的 width/height=0（由其他测试并行设置，
         // Mutex 提供同步；即使其他测试设置非零 width/height，begin_save 仍应
@@ -406,6 +418,7 @@ mod tests {
 
     #[test]
     fn sim_begin_save_with_null_out_size_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // null out_size 仍应返回非空指针（begin_save 不依赖 out_size）
         let result = SIM_BeginSave(std::ptr::null_mut(), 0, 0);
         assert!(!result.is_null(), "SIM_BeginSave should return non-null even with null out_size");
@@ -414,22 +427,26 @@ mod tests {
 
     #[test]
     fn sim_end_save_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SIM_EndSave();
     }
 
     #[test]
     fn sim_shutdown_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SIM_Shutdown();
     }
 
     #[test]
     fn sim_debug_crash_does_not_actually_crash() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 桩模式：不应 panic，不应触发 abort
         SIM_DebugCrash();
     }
 
     #[test]
     fn sysinfo_acquire_returns_non_null_terminated_string() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let ptr = SYSINFO_Acquire();
             assert!(!ptr.is_null());
@@ -443,6 +460,7 @@ mod tests {
 
     #[test]
     fn sysinfo_release_does_not_panic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SYSINFO_Release();
     }
 }

@@ -36,3 +36,10 @@ pub mod globals {
     /// C# 注册的消息回调。对应原版 `gGameMessageHandler`。
     pub static G_GAME_MESSAGE_HANDLER: OnceCell<GameMessageHandler> = OnceCell::new();
 }
+
+/// 跨模块共享的测试序列化锁：串行化所有操作全局状态
+/// （G_SIM_DATA / G_SAVE_BUFFER / G_ELEMENTS_TABLE / G_DISEASE 等）
+/// 的 lib 单元测试，避免并行执行导致 setup 互相覆盖。
+/// elements_table::tests / save_load::tests / sim_api::tests 均获取此锁。
+#[cfg(test)]
+pub(crate) static LIB_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

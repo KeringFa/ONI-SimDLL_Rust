@@ -469,11 +469,17 @@ pub extern "C" fn CreateElementInteractionsLocked(reader: *mut BinaryBufferReade
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 跨模块共享的测试序列化锁（定义在 crate::LIB_TESTS_LOCK）：
+    /// 串行化 elements_table::tests / save_load::tests / sim_api::tests
+    /// 中所有操作全局状态的测试，避免并行执行导致 setup 互相覆盖。
+    use crate::LIB_TESTS_LOCK as PHASE4_TEST_LOCK;
     use crate::buffer::{BinaryBufferReader, BinaryBufferWriter};
     use crate::element::{Element, INVALID_ELEMENT_HASH, INVALID_ELEMENT_INDEX};
 
     #[test]
     fn elements_table_default_all_empty() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let table = ElementsTable::default();
         assert!(table.elements.is_empty());
         assert!(table.element_names.is_empty());
@@ -494,18 +500,21 @@ mod tests {
 
     #[test]
     fn g_elements_table_lock_acquirable() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = G_ELEMENTS_TABLE.lock().unwrap();
         // 锁可获取即通过
     }
 
     #[test]
     fn g_interactions_lock_acquirable() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = G_INTERACTIONS_LOCK.lock();
         // parking_lot::Mutex::lock() 直接返回 guard（非 Result）
     }
 
     #[test]
     fn destroy_clears_12_vectors_keeps_3_interaction_vectors() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 先在 table 中塞入数据
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -550,6 +559,7 @@ mod tests {
 
     #[test]
     fn get_element_index_returns_invalid_for_missing() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 先清空 table 确保 element_indices 为空
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -560,6 +570,7 @@ mod tests {
 
     #[test]
     fn get_element_index_returns_inserted() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
             table.element_indices.clear();
@@ -570,6 +581,7 @@ mod tests {
 
     #[test]
     fn get_element_index_inner_does_not_lock() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 验证 get_element_index_inner 接受 &ElementsTable 引用，避免死锁
         let table = G_ELEMENTS_TABLE.lock().unwrap();
         // 持锁状态下调用 inner 函数（不应死锁）
@@ -643,6 +655,7 @@ mod tests {
 
     #[test]
     fn create_elements_table_round_trip_single() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let buf = build_single_element_buffer();
         let mut reader = BinaryBufferReader::new(&buf);
 
@@ -716,6 +729,7 @@ mod tests {
 
     #[test]
     fn create_elements_table_mass_scale_solid_state_infinity() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 构造 state & 3 == 3 的元素，验证 mass_scale == INFINITY
         let mut w = BinaryBufferWriter::new();
         w.write_int(1).unwrap();
@@ -740,6 +754,7 @@ mod tests {
 
     #[test]
     fn create_elements_table_mass_area_scale_non_gas_state() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // state & 3 != 1 → mass_area_scale = 0.001
         let mut w = BinaryBufferWriter::new();
         w.write_int(1).unwrap();
@@ -794,6 +809,7 @@ mod tests {
 
     #[test]
     fn create_element_interactions_pushes_only_matching_signature() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 清空交互 vector（创建初始状态）
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -845,6 +861,7 @@ mod tests {
 
     #[test]
     fn create_element_interactions_clears_before_push() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 先塞入旧数据
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -866,6 +883,7 @@ mod tests {
 
     #[test]
     fn create_element_interactions_negative_count_returns_early() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut w = BinaryBufferWriter::new();
         w.write_int(-1).unwrap();  // 负 count
         let buf = w.into_bytes();
