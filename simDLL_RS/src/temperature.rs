@@ -20,6 +20,7 @@ use crate::element::ElementTemperatureData;
 use crate::game_data::{
     CellMeltedInfo, SpawnFallingLiquidInfo, SpawnOreInfo, SubstanceChangeInfo,
 };
+use crate::stl_shim::MsvcVector;
 
 /// 1.53787e-5 常量（源码 04_temperature.c L542, L546, 11_msvcrt_ignored.c L33226）。
 ///
@@ -1821,6 +1822,56 @@ pub fn do_partial_melt(
     }
     change_substance(sim_events, sim_data, cell_src);
     true
+}
+
+/// `ConsolidateEvents` — 合并 per-thread SimEvents 到主 SimEvents。
+///
+/// 严格对照源码 11_msvcrt_ignored.c L40799-40950+（ConsolidateEvents）。
+/// 多线程温度派发完成后，把每个 worker 线程独立 SimEvents 的 20 个 vector 字段
+/// 全部 append 到主 sim_events，供后续 GameDataUpdate 收集同步给 C#。
+///
+/// # 参数
+/// - `main`：主 SimEvents（`sim_data.sim_events` 指向的对象），追加目标
+/// - `per_thread`：slice，每个元素是一个 worker 线程的 SimEvents
+///
+/// # 运行时影响
+/// 与原版完全等价。原版用 `vector::insert(end, src.begin, src.end)` 批量追加；
+/// Rust 简化为逐元素 push（MpscVector 无 extend/append 方法）。运行时差异：
+/// 分配次数略多（每次 push 检查 capacity），但事件数量少（每帧最多几十个），
+/// 总开销可忽略。
+pub fn consolidate_events(main: &mut SimEvents, per_thread: &[SimEvents]) {
+    for events in per_thread {
+        append_vector(&mut main.substance_change_info, &events.substance_change_info);
+        append_vector(&mut main.spawn_liquid_info, &events.spawn_liquid_info);
+        append_vector(&mut main.spawn_ore_info, &events.spawn_ore_info);
+        append_vector(&mut main.unstable_cell_info, &events.unstable_cell_info);
+        append_vector(&mut main.element_chunk_melted_info, &events.element_chunk_melted_info);
+        append_vector(&mut main.building_melted_info, &events.building_melted_info);
+        append_vector(&mut main.building_overheat_info, &events.building_overheat_info);
+        append_vector(&mut main.building_no_longer_overheated_info, &events.building_no_longer_overheated_info);
+        append_vector(&mut main.cell_melted_info, &events.cell_melted_info);
+        append_vector(&mut main.callback_info, &events.callback_info);
+        append_vector(&mut main.world_damage_info, &events.world_damage_info);
+        append_vector(&mut main.mass_consumed_callbacks, &events.mass_consumed_callbacks);
+        append_vector(&mut main.radiation_consumed_callbacks, &events.radiation_consumed_callbacks);
+        append_vector(&mut main.mass_emitted_callbacks, &events.mass_emitted_callbacks);
+        append_vector(&mut main.disease_consumed_callbacks, &events.disease_consumed_callbacks);
+        append_vector(&mut main.spawn_fx_info, &events.spawn_fx_info);
+        append_vector(&mut main.component_state_changed_messages, &events.component_state_changed_messages);
+        append_vector(&mut main.dig_info, &events.dig_info);
+        append_vector(&mut main.backwall_element_changed_info, &events.backwall_element_changed_info);
+        append_vector(&mut main.backwall_should_transition_info, &events.backwall_should_transition_info);
+    }
+}
+
+/// 辅助：把 `src` MpscVector 的元素逐个 push 到 `dst`。
+///
+/// 对照源码 `vector::insert(dst.end, src.begin(), src.end())` 模式。
+/// MpscVector 无 extend/append，只能逐元素 push。
+fn append_vector<T: Default + Copy>(dst: &mut MsvcVector<T>, src: &MsvcVector<T>) {
+    for elem in src.as_slice() {
+        dst.push(*elem);
+    }
 }
 
 #[cfg(test)]

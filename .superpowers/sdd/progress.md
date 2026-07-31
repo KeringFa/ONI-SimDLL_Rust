@@ -966,4 +966,21 @@ Task P6-T4: complete (commits 189cae6..2862c3c, review clean — 完美通过)
 - Release build 成功（5 个遗留 warning，无新增）
 - 运行时影响：与原版完全等价（相变能量/质量/disease 调整公式相同）。stub 函数（displace_*/evaporate/spawn_falling_liquid）为 no-op/表记录，Phase 8+ 接入真实位移逻辑后才有画面差异
 
+### T14: complete (pending commit)
+- 产物：
+  - `temperature.rs` 新增 `consolidate_events` + `append_vector` 辅助函数：把 per-thread SimEvents 的 20 个 MsvcVector 字段逐一 append 到主 SimEvents
+  - `sim.rs` 新增 `sim_base_update_data`（L202-321）+ 接入 `sim_main_loop`（L152-163）
+- `sim_base_update_data` 严格对照源码 11_msvcrt_ignored.c L41811-42036 + L42393（SimBase::UpdateData）：
+  1. `iterate_direction = -iterate_direction`（L41901）
+  2. `cells = updated_cells`（L41903：copy_from 同步状态）
+  3. 每个 active_region：`std::thread::scope` 派发 num_threads 个 worker，各处理 y-strip
+     - Phase 1 温度交换：`update_temperature_for_backwall_exchange` + `update_temperature(cell, cell+1)` + `update_temperature(cell, cell+width)`
+     - Phase 2 状态转换：查 element_idx → ElementTemperatureData → `do_state_transition`
+  4. scope 后：`cells = updated_cells`（L42036）+ `consolidate_events`（L42393）
+- 接入 `sim_main_loop`：`process_next_frame` 后锁 `G_SIM_DATA` 调 `sim_base_update_data(&mut **g)`
+- **改造说明（运行时差异）**：原版用 taskQueue 派发到固定数量持久 worker 线程；Rust 用 `std::thread::scope` 按可用并行度派发到 scope 内临时线程。语义等价——每帧创建/销毁 scope 线程，无持久 worker。性能差异可忽略（scope 线程创建开销 << 温度计算）
+- **多线程 `&mut SimData` 难题解决**：`*mut SimData` 默认 `!Send`。Rust 2021 disjoint capture 会穿透 newtype wrapper 直接捕获裸指针字段。最终方案：`sim_data as *mut SimData as usize`（usize 是 Copy + Send），闭包内 `*(sd_addr as *mut SimData)` cast 回。Safety 由 disjoint y-strips + benign vertical 边界 race（与原版一致）保证
+- 测试：cargo test --lib 307/307 通过（含 6 个新增 T14 集成测试：zeroed_no_panic / flips_iterate_direction / skips_degenerate_regions / syncs_cells_from_updated_cells / with_active_region_no_panic / multiple_regions_no_panic）；cargo build --release 成功，SimDLL.dll 产出
+- 遗留 warning（非本任务引入）：`[profile.test] panic`（Task 1）+ `crate SimDLL should have a snake case name`（Task 2，lib 名必须 "SimDLL" 匹配原版）+ 3 个 save_load.rs/sim_frame_manager.rs unused 变量
+
 
