@@ -698,7 +698,7 @@ fn drain_message(reader: &mut BinaryBufferReader, n: usize, id: u32, field: &'st
 ///
 /// 游戏内部坐标 (0..inner_w, 0..inner_h) 转换为含边界的 SOA 索引
 /// （边界 1 格用于 unobtanium 墙）。
-fn game_cell_to_idx(game_cell: i32, width: i32, height_minus_2: i32) -> Option<i32> {
+pub fn game_cell_to_idx(game_cell: i32, width: i32, height_minus_2: i32) -> Option<i32> {
     if width <= 2 || height_minus_2 <= 0 || game_cell < 0 {
         return None;
     }
