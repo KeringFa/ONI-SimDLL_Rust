@@ -149,6 +149,55 @@ pub fn get_element_state_by_idx(elem_idx: u16) -> Option<crate::process_messages
     })
 }
 
+/// 公开包装：按 element_idx 查询元素的 thermal_conductivity（T11 新增）。
+///
+/// 对照源码 04_temperature.c 中对 `gElementTemperatureData[idx].thermalConductivity`
+/// 字段的访问（pbVar13 + 0x10 / pbVar15 + 0x10 偏移）。
+/// thermal_conductivity 在 ElementTemperatureData 中位于 @0x10（见 element.rs L100）。
+///
+/// 返回 `Option<f32>`：
+/// - `Some(value)`：元素表已初始化且 idx 在范围内
+/// - `None`：元素表未初始化或 idx 越界（调用方应跳过热交换）
+pub fn get_element_conductivity(elem_idx: u16) -> Option<f32> {
+    let table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let idx = elem_idx as usize;
+    if idx >= table.temperature_data.len() {
+        return None;
+    }
+    Some(table.temperature_data[idx].thermal_conductivity)
+}
+
+/// 公开包装：按 element_idx 查询元素的 specific_heat_capacity（T11 新增）。
+///
+/// 对照源码 04_temperature.c 中对 `gElementTemperatureData[idx].specificHeatCapacity`
+/// 字段的访问（pbVar13 + 0xc / pbVar15 + 0xc 偏移）。
+/// specific_heat_capacity 在 ElementTemperatureData 中位于 @0xc（见 element.rs L99）。
+///
+/// 返回 `Option<f32>`：None 表示元素表未初始化或 idx 越界。
+pub fn get_element_specific_heat_capacity(elem_idx: u16) -> Option<f32> {
+    let table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let idx = elem_idx as usize;
+    if idx >= table.temperature_data.len() {
+        return None;
+    }
+    Some(table.temperature_data[idx].specific_heat_capacity)
+}
+
+/// 公开包装：按 element_idx 查询 ElementTemperatureData 全部字段（T11 新增）。
+///
+/// 返回 `Option<ElementTemperatureData>`（Copy）：None 表示元素表未初始化或 idx 越界。
+/// 供 temperature.rs 一次性读取 thermal_conductivity / specific_heat_capacity /
+/// gas/liquid/solid_surface_area_multiplier / low_temp / high_temp 等多个字段，
+/// 避免多次加锁。
+pub fn get_element_temperature_data(elem_idx: u16) -> Option<crate::element::ElementTemperatureData> {
+    let table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let idx = elem_idx as usize;
+    if idx >= table.temperature_data.len() {
+        return None;
+    }
+    Some(table.temperature_data[idx])
+}
+
 /// 反序列化元素表——4 阶段 + 后处理。
 ///
 /// 对照源码 03_elements.c L27-429（CreateElementsTable）。
@@ -918,5 +967,93 @@ mod tests {
         // 不应 panic，应正常返回 Ok(())
         let result = create_element_interactions(&mut reader);
         assert!(result.is_ok());
+    }
+
+    // ===== T11 新增：get_element_conductivity / specific_heat_capacity / temperature_data 测试 =====
+
+    #[test]
+    fn get_element_conductivity_returns_none_for_empty_table() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 先清空表
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+        }
+        assert_eq!(get_element_conductivity(0), None);
+        assert_eq!(get_element_conductivity(100), None);
+    }
+
+    #[test]
+    fn get_element_conductivity_returns_value_for_valid_idx() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 直接塞入 1 个 ElementTemperatureData，thermal_conductivity = 0.7
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+            let mut td = crate::element::ElementTemperatureData::default();
+            td.thermal_conductivity = 0.7;
+            td.specific_heat_capacity = 0.5;
+            table.temperature_data.push(td);
+        }
+        assert_eq!(get_element_conductivity(0), Some(0.7));
+        // 越界
+        assert_eq!(get_element_conductivity(1), None);
+        // 清理
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+        }
+    }
+
+    #[test]
+    fn get_element_specific_heat_capacity_returns_value_for_valid_idx() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+            let mut td = crate::element::ElementTemperatureData::default();
+            td.specific_heat_capacity = 0.42;
+            table.temperature_data.push(td);
+        }
+        assert_eq!(get_element_specific_heat_capacity(0), Some(0.42));
+        assert_eq!(get_element_specific_heat_capacity(1), None);
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+        }
+    }
+
+    #[test]
+    fn get_element_temperature_data_returns_all_fields() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+            let mut td = crate::element::ElementTemperatureData::default();
+            td.thermal_conductivity = 0.8;
+            td.specific_heat_capacity = 0.3;
+            td.gas_surface_area_multiplier = 1.5;
+            td.liquid_surface_area_multiplier = 2.5;
+            td.solid_surface_area_multiplier = 3.5;
+            td.low_temp = 100.0;
+            td.high_temp = 500.0;
+            td.state = 2;  // Liquid
+            table.temperature_data.push(td);
+        }
+        let td = get_element_temperature_data(0).expect("should exist");
+        assert_eq!(td.thermal_conductivity, 0.8);
+        assert_eq!(td.specific_heat_capacity, 0.3);
+        assert_eq!(td.gas_surface_area_multiplier, 1.5);
+        assert_eq!(td.liquid_surface_area_multiplier, 2.5);
+        assert_eq!(td.solid_surface_area_multiplier, 3.5);
+        assert_eq!(td.low_temp, 100.0);
+        assert_eq!(td.high_temp, 500.0);
+        assert_eq!(td.state, 2);
+        // 越界
+        assert!(get_element_temperature_data(1).is_none());
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+        }
     }
 }

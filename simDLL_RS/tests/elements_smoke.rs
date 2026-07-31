@@ -8,14 +8,21 @@ use SimDLL::elements_table::*;
 use SimDLL::buffer::{BinaryBufferReader, BinaryBufferWriter};
 use SimDLL::element::{INVALID_ELEMENT_INDEX, GAS_OBLITERATION_SIGNATURE};
 
+/// 串行锁：所有 elements_smoke 测试共享 G_ELEMENTS_TABLE 全局单例，
+/// 并行运行会触发 race condition（CreateElementsTable / DestroyElementsTable
+/// 互相干扰）。参考 save_load_smoke.rs 的 SAVE_LOAD_SMOKE_LOCK 模式。
+static ELEMENTS_SMOKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn create_elements_table_with_null_reader_does_not_panic() {
+    let _lock = ELEMENTS_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let result = CreateElementsTable(std::ptr::null_mut());
     assert!(result.is_null(), "null reader 应返回 null");
 }
 
 #[test]
 fn destroy_elements_table_does_not_panic() {
+    let _lock = ELEMENTS_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 多次调用应幂等
     DestroyElementsTable();
     DestroyElementsTable();
@@ -23,6 +30,7 @@ fn destroy_elements_table_does_not_panic() {
 
 #[test]
 fn get_element_index_returns_invalid_for_empty_table() {
+    let _lock = ELEMENTS_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 确保 table 为空
     DestroyElementsTable();
     let result = GetElementIndex(0);
@@ -31,18 +39,21 @@ fn get_element_index_returns_invalid_for_empty_table() {
 
 #[test]
 fn create_element_interactions_with_null_reader_does_not_panic() {
+    let _lock = ELEMENTS_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let result = CreateElementInteractions(std::ptr::null_mut());
     assert!(result.is_null());
 }
 
 #[test]
 fn create_element_interactions_locked_with_null_reader_does_not_panic() {
+    let _lock = ELEMENTS_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let result = CreateElementInteractionsLocked(std::ptr::null_mut());
     assert!(result.is_null());
 }
 
 #[test]
 fn create_elements_table_full_round_trip_via_ffi() {
+    let _lock = ELEMENTS_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 构造最小 buffer：1 个元素
     let mut w = BinaryBufferWriter::new();
     w.write_int(1).unwrap();
@@ -72,6 +83,7 @@ fn create_elements_table_full_round_trip_via_ffi() {
 
 #[test]
 fn create_element_interactions_locked_full_round_trip_via_ffi() {
+    let _lock = ELEMENTS_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 构造 interactions buffer：1 个匹配签名的 entry
     // 每 entry 32 字节布局（与源码 03_elements.c L565 `lVar3 = lVar3 + 0x20` stride 一致）：
     //   @0  i32 signature (4)

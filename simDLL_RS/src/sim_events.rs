@@ -158,6 +158,16 @@ pub struct SimEvents {
     pub backwall_should_transition_info: MsvcVector<BackwallShouldTransitionInfo>, // L9383 @0x260
 }
 
+impl Default for SimEvents {
+    /// 构造空 SimEvents（20 个 MsvcVector 全空，对应 MSVC std::vector 默认构造）。
+    ///
+    /// 与 `SimFrameInfo::default` 一致：用 `unsafe { std::mem::zeroed() }`。
+    /// 全零的 MsvcVector 是空 vector（first/last/end 指针全 null）。
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

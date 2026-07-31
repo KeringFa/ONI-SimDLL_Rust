@@ -219,6 +219,27 @@ pub struct BackwallSOA {
     pub temperature: MsvcVector<f32>,   // L9463
 }
 
+impl BackwallSOA {
+    /// 构造空 BackwallSOA（3 个 MsvcVector 全空 + vacuum_element_idx=0）。
+    ///
+    /// 对照源码 BackwallSOA 默认构造（MSVC std::vector 默认构造为空）。
+    pub fn new() -> Self {
+        Self {
+            vacuum_element_idx: 0,
+            padding: 0,
+            element_idx: MsvcVector::new(),
+            mass: MsvcVector::new(),
+            temperature: MsvcVector::new(),
+        }
+    }
+}
+
+impl Default for BackwallSOA {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===== CellSOA — 主格子 SOA 数组 =====
 
 /// CellSOA — 单元格 Structure-of-Arrays。
