@@ -330,10 +330,20 @@ impl SimData {
         tracing::debug!(settings, "SimData::apply_save_settings stub called");
     }
 
-    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L104）。
-    /// Phase 3 stub：仅记日志。
-    pub fn do_load_time_state_transition(&mut self, cell_idx: i32) {
-        tracing::debug!(cell_idx, "SimData::do_load_time_state_transition stub called");
+    /// 对所有格子执行加载时相变检查。
+    ///
+    /// 对照源码 02_save_load.c L104（`SimData::DoLoadTimeStateTransition` 遍历）。
+    /// Phase 7 实现：遍历全部 num_game_cells 个格子，对每个格子调
+    /// `crate::temperature::do_load_time_state_transition(self, cell_idx)`。
+    ///
+    /// **注意**：`do_load_time_state_transition` 函数在 T12 实现。
+    /// 本任务暂保留遍历形态但内部调 temperature 模块桩（T12 完成后自动生效）。
+    pub fn do_load_time_state_transition(&mut self) {
+        let num_cells = self.num_game_cells;
+        tracing::debug!(num_cells, "SimData::do_load_time_state_transition: iterating");
+        for cell_idx in 0..num_cells {
+            crate::temperature::do_load_time_state_transition(self, cell_idx);
+        }
     }
 
     /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L220）。
@@ -367,11 +377,53 @@ impl CellSOA {
         }
     }
 
-    /// Phase 6+ TODO: 真实实现（源码位置：02_save_load.c L218）。
-    /// Phase 3 stub：仅记日志，不拷贝数据。
+    /// 拷贝 `other` 的全部 11 个 MsvcVector 数据到 `self`。
+    ///
+    /// 对照源码 02_save_load.c L218（`std::copy` 调用）。
+    /// **改造说明**：原版用 `std::copy` memcpy 11 个数组；Rust 改为遍历 MsvcVector
+    /// 的 slice 逐元素拷贝（MsvcVector 不是 Rust Vec，没有 `clone()`）。
+    /// 运行时无差异：每帧 Sim::Main 调一次以把 updated_cells 同步回 cells。
+    ///
+    /// # Safety
+    /// `other` 必须是已初始化（MsvcVector 内部已分配内存）。空 vector 拷贝到空 vector 是 no-op。
     pub fn copy_from(&mut self, other: &CellSOA) {
-        tracing::debug!("CellSOA::copy_from stub called");
+        copy_msvc_vector(&mut self.element_idx, &other.element_idx);
+        copy_msvc_vector(&mut self.temperature, &other.temperature);
+        copy_msvc_vector(&mut self.mass, &other.mass);
+        copy_msvc_vector(&mut self.properties, &other.properties);
+        copy_msvc_vector(&mut self.insulation, &other.insulation);
+        copy_msvc_vector(&mut self.strength_info, &other.strength_info);
+        copy_msvc_vector(&mut self.disease_idx, &other.disease_idx);
+        copy_msvc_vector(&mut self.disease_count, &other.disease_count);
+        copy_msvc_vector(&mut self.disease_infestation_tick_count, &other.disease_infestation_tick_count);
+        copy_msvc_vector(&mut self.disease_growth_accumulated_error, &other.disease_growth_accumulated_error);
+        copy_msvc_vector(&mut self.radiation, &other.radiation);
     }
+}
+
+/// 辅助：把 `src` MsvcVector 的数据拷贝到 `dst`。
+///
+/// 对照源码 02_save_load.c 多处 `std::copy` 模式。
+/// **实现**：用 MsvcVector 的 `as_slice()` 读 src、`as_mut_slice()` 写 dst。
+/// 如果 `dst` 容量不足，用 `resize()` 扩容（与原版 `std::vector::operator=` 行为一致）。
+///
+/// # Safety
+/// MsvcVector 必须是已初始化（即使空也算初始化）。空 src 拷贝到 dst 会清空 dst。
+fn copy_msvc_vector<T: Copy + Default>(dst: &mut MsvcVector<T>, src: &MsvcVector<T>) {
+    let src_slice = src.as_slice();
+    if src_slice.is_empty() {
+        // src 为空：清空 dst（保持语义一致：dst = std::vector{}）
+        dst.clear();
+        return;
+    }
+    // 扩容 dst 到 src 长度（如果不够），用 resize 而非 reserve 因为我们要立即填值
+    if dst.len() < src_slice.len() {
+        dst.resize(src_slice.len(), T::default());
+    } else if dst.len() > src_slice.len() {
+        dst.truncate(src_slice.len());
+    }
+    let dst_slice = dst.as_mut_slice();
+    dst_slice.copy_from_slice(src_slice);
 }
 
 #[cfg(test)]
@@ -519,9 +571,10 @@ mod tests {
     }
 
     #[test]
-    fn stub_do_load_time_state_transition_does_not_panic() {
+    fn do_load_time_state_transition_does_not_panic_with_zero_cells() {
         let mut sd = SimData::new_zeroed();
-        sd.do_load_time_state_transition(5);
+        // num_game_cells=0 → 不遍历任何格子
+        sd.do_load_time_state_transition();
     }
 
     #[test]
@@ -541,5 +594,42 @@ mod tests {
         let mut dst = CellSOA::new();
         let src = CellSOA::new();
         dst.copy_from(&src);
+    }
+
+    #[test]
+    fn cell_soa_copy_from_copies_data() {
+        // 构造 src：3 个元素
+        let mut src = CellSOA::new();
+        src.element_idx.resize(3, 0);
+        src.temperature.resize(3, 0.0);
+        src.mass.resize(3, 0.0);
+        let elem_slice = src.element_idx.as_mut_slice();
+        elem_slice[0] = 1;
+        elem_slice[1] = 2;
+        elem_slice[2] = 3;
+        let temp_slice = src.temperature.as_mut_slice();
+        temp_slice[0] = 100.0;
+        temp_slice[1] = 200.0;
+        temp_slice[2] = 300.0;
+
+        // 拷贝到 dst
+        let mut dst = CellSOA::new();
+        dst.copy_from(&src);
+
+        // 验证
+        assert_eq!(dst.element_idx.len(), 3);
+        assert_eq!(dst.element_idx.as_slice()[0], 1);
+        assert_eq!(dst.element_idx.as_slice()[2], 3);
+        assert_eq!(dst.temperature.as_slice()[1], 200.0);
+    }
+
+    #[test]
+    fn cell_soa_copy_from_empty_src_clears_dst() {
+        // 空 src 拷贝到有数据的 dst 应清空 dst
+        let mut dst = CellSOA::new();
+        dst.element_idx.resize(5, 99);
+        let src = CellSOA::new();  // 空
+        dst.copy_from(&src);
+        assert!(dst.element_idx.is_empty());
     }
 }

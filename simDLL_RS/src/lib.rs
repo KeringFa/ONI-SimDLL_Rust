@@ -24,6 +24,7 @@ pub mod sim_events;
 pub mod sim_frame_manager;
 pub mod sysinfo;
 pub mod stl_shim;
+pub mod temperature;
 pub mod vector_math;
 
 pub mod globals {
