@@ -264,6 +264,7 @@ mod save_load_shim {
         f: fn(&mut BinaryBufferReader) -> Result<(), BufferError>,
         name: &'static str,
     ) -> *mut c_void {
+        tracing::trace!(handler = name, "save_load shim: calling handler");
         let result = catch_unwind(AssertUnwindSafe(|| {
             if reader.is_null() {
                 tracing::error!(handler = name, "save_load handler: null reader");

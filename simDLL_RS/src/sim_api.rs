@@ -67,6 +67,7 @@ fn dispatch_handler_table(id: c_int, reader: &mut BinaryBufferReader) -> *mut c_
             if let Some(handler) = entry.handler {
                 // SAFETY: handler 函数指针在编译期注册，签名匹配 MessageHandlerFn。
                 // handler 内部已有 catch_unwind 隔离 panic。
+                tracing::trace!(id, "dispatch_handler_table: hit, calling handler");
                 return unsafe { handler(reader as *mut BinaryBufferReader) };
             } else {
                 // 不应到达（注册时已验证 handler 非 null），防御性记 error
