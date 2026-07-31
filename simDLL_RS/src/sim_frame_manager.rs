@@ -291,22 +291,58 @@ impl SimFrameManager {
     /// - 调 4 个 Process* 函数（T7-T10 实现，本任务先用桩）
     /// Phase 9 的内联循环全部省略（消息已被 drain-only 消费）。
     ///
-    /// **运行时影响**：本桩只输出 tracing log，不修改 SimData；
-    /// 游戏画面此时不会因本方法产生任何变化。T6-T10 接入真实处理后才有效果。
-    pub fn process_frame(&mut self, _sim_data: *mut crate::sim_data::SimData) {
-        if self.current_frame.is_null() {
+    /// **运行时影响**：本方法把 C# 发来的格子隔热值/强度值写入 `updated_cells` SOA。
+    /// 游戏画面上对应的格子隔热/强度属性会随 C# 请求变化（如建墙后隔热值上升）。
+    /// 4 个 Process* 函数为桩，相关功能（属性标志、物质置换等）暂未生效。
+    pub fn process_frame(&mut self, sim_data: *mut crate::sim_data::SimData) {
+        if self.current_frame.is_null() || sim_data.is_null() {
             return;
         }
         let frame = unsafe { &*self.current_frame };
-        // 内联循环 set_insulation_values：gameCell → cellIdx，写 updated_cells.insulation[idx] = value * 255
-        // T6 完整实现，本任务先 tracing log
+        let sd = unsafe { &mut *sim_data };
+
+        // === 内联循环 set_insulation_values / set_strength_values ===
+        // 对照源码 08_sim_frame_manager.c L1180-?:
+        // gameCell → cellIdx 转换公式（02_save_load.c 多处使用）：
+        // idx = (game_cell / (height-2) + 1) * width + game_cell % (height-2) + 1
+        let width = sd.width;
+        let height_minus_2 = sd.height - 2;
+        if width > 2 && height_minus_2 > 0 && !sd.updated_cells.ptr.is_null() {
+            let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+            // set_insulation_values: value (0.0..1.0) × 255 → u8
+            let insulation = updated_cells.insulation.as_mut_slice();
+            for v in frame.set_insulation_values.as_slice() {
+                if let Some(idx) = game_cell_to_idx(v.game_cell, width, height_minus_2) {
+                    let val = (v.value * 255.0).clamp(0.0, 255.0) as u8;
+                    if (idx as usize) < insulation.len() {
+                        insulation[idx as usize] = val;
+                    }
+                }
+            }
+            // set_strength_values: value 直接写 u8
+            let strength = updated_cells.strength_info.as_mut_slice();
+            for v in frame.set_strength_values.as_slice() {
+                if let Some(idx) = game_cell_to_idx(v.game_cell, width, height_minus_2) {
+                    let val = v.value.clamp(0.0, 255.0) as u8;
+                    if (idx as usize) < strength.len() {
+                        strength[idx as usize] = val;
+                    }
+                }
+            }
+        }
+
+        // === 调 4 个 Process* 函数（T7-T10 实现，本任务用桩）===
+        crate::process_messages::process_cell_properties(frame, sd);
+        crate::process_messages::process_cell_modifications(frame, sd);
+        crate::process_messages::process_mass_consumption(frame, sd);
+        crate::process_messages::process_mass_emission(frame, sd);
+
         tracing::trace!(
             insulation_count = frame.set_insulation_values.len(),
             strength_count = frame.set_strength_values.len(),
             cell_mod_count = frame.cell_modifications.len(),
-            "ProcessFrame: Phase 7 simplified"
+            "ProcessFrame: Phase 7 simplified (real inline loops + Process* stubs)"
         );
-        // T6-T10 接入真实 Process* 调用
     }
 
     /// `SimFrameManager::HandleMessage`（Phase 7 升级版）。
@@ -655,6 +691,25 @@ fn drain_message(reader: &mut BinaryBufferReader, n: usize, id: u32, field: &'st
     tracing::trace!(id, field, n, "HandleMessage: drain-only (Phase 7)");
 }
 
+/// 辅助：game_cell → cell_idx 转换。
+///
+/// 对照源码 02_save_load.c 多处使用：
+/// idx = (game_cell / (height-2) + 1) * width + game_cell % (height-2) + 1
+///
+/// 游戏内部坐标 (0..inner_w, 0..inner_h) 转换为含边界的 SOA 索引
+/// （边界 1 格用于 unobtanium 墙）。
+fn game_cell_to_idx(game_cell: i32, width: i32, height_minus_2: i32) -> Option<i32> {
+    if width <= 2 || height_minus_2 <= 0 || game_cell < 0 {
+        return None;
+    }
+    let row = game_cell / height_minus_2;
+    let col = game_cell % height_minus_2;
+    if row < 0 || col < 0 {
+        return None;
+    }
+    Some((row + 1) * width + col + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +967,87 @@ mod tests {
         let mut mgr = SimFrameManager::new_zeroed();
         let elapsed = mgr.process_next_frame(std::ptr::null_mut());
         assert_eq!(elapsed, 0.0);
+    }
+
+    // ===== Phase 7 T6：process_frame + game_cell_to_idx 测试 =====
+
+    #[test]
+    fn process_frame_handles_null_sim_data() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut frame = Box::new(SimFrameInfo::default());
+        mgr.current_frame = frame.as_mut() as *mut _;
+        // sim_data 为 null 应不 panic
+        mgr.process_frame(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn process_frame_handles_null_current_frame() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        // current_frame 为 null 应不 panic（即使 sim_data 也为 null）
+        mgr.process_frame(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn game_cell_to_idx_converts_correctly() {
+        // width=6, height-2=4（对应 SimData 6×6，内部 4×4）
+        // game_cell=0 → row=0, col=0 → idx = (0+1)*6 + 0+1 = 7
+        assert_eq!(game_cell_to_idx(0, 6, 4), Some(7));
+        // game_cell=1 → row=0, col=1 → idx = (0+1)*6 + 1+1 = 8
+        assert_eq!(game_cell_to_idx(1, 6, 4), Some(8));
+        // game_cell=4 → row=1, col=0 → idx = (1+1)*6 + 0+1 = 13
+        assert_eq!(game_cell_to_idx(4, 6, 4), Some(13));
+        // game_cell=15 → row=3, col=3 → idx = (3+1)*6 + 3+1 = 28
+        assert_eq!(game_cell_to_idx(15, 6, 4), Some(28));
+    }
+
+    #[test]
+    fn game_cell_to_idx_returns_none_for_invalid_inputs() {
+        assert_eq!(game_cell_to_idx(-1, 6, 4), None);  // 负 game_cell
+        assert_eq!(game_cell_to_idx(0, 2, 4), None);   // width <= 2
+        assert_eq!(game_cell_to_idx(0, 6, 0), None);   // height_minus_2 <= 0
+        assert_eq!(game_cell_to_idx(0, 6, -1), None);  // height_minus_2 < 0
+    }
+
+    #[test]
+    fn process_frame_writes_insulation_and_strength_values() {
+        // 构造一个 4×4 SimData（width=6, height=6, 含边界）
+        // game_cell=0 → idx=7
+        use crate::sim_data::{CellSOA, SimData};
+        use crate::sim_events::SetCellFloatValue;
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut frame = Box::new(SimFrameInfo::default());
+        // 添加一条 set_insulation_values: game_cell=0, value=1.0 → 255
+        frame.set_insulation_values.push(SetCellFloatValue {
+            game_cell: 0,
+            value: 1.0,
+        });
+        // 添加一条 set_strength_values: game_cell=1, value=128.0
+        frame.set_strength_values.push(SetCellFloatValue {
+            game_cell: 1,
+            value: 128.0,
+        });
+        mgr.current_frame = frame.as_mut() as *mut _;
+
+        // 构造 SimData
+        let mut sd = SimData::new_zeroed();
+        sd.width = 6;
+        sd.height = 6;
+        let mut cells = Box::new(CellSOA::new());
+        cells.insulation.resize(36, 0);
+        cells.strength_info.resize(36, 0);
+        sd.updated_cells.ptr = Box::into_raw(cells);
+
+        mgr.process_frame(&mut sd as *mut _);
+
+        // 验证写入
+        unsafe {
+            let cells = &*sd.updated_cells.ptr;
+            // game_cell=0 → idx=7, value=1.0*255=255
+            assert_eq!(cells.insulation.get(7), 255);
+            // game_cell=1 → idx=8, value=128
+            assert_eq!(cells.strength_info.get(8), 128);
+            // 清理
+            drop(Box::from_raw(sd.updated_cells.ptr));
+        }
     }
 }
