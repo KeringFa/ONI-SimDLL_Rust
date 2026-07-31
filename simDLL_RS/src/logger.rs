@@ -54,21 +54,26 @@ pub fn init() -> bool {
     let file_appender = tracing_appender::rolling::daily(logs_dir, "simdll.log");
     let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
 
-    // 文件层：info 及以上（避免 trace 刷爆）
+    // 文件层：info 及以上（避免 trace 刷爆）；Phase 6 为 sim_frame_manager / message_handler / sim_api
+    // 三个模块额外开 trace，验证消息路由（部署后日志可见 HandleMessage 命中与 handler 表查找）
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
         .with_ansi(false) // 文件不要 ANSI 颜色码
         .with_target(true)
         .with_thread_ids(false)
         .with_thread_names(false)
-        .with_filter(tracing_subscriber::EnvFilter::new("info"));
+        .with_filter(tracing_subscriber::EnvFilter::new(
+            "info,SimDLL::sim_frame_manager=trace,SimDLL::message_handler=trace,SimDLL::sim_api=trace",
+        ));
 
-    // stderr 层：info 及以上，带 ANSI 颜色
+    // stderr 层：info 及以上，带 ANSI 颜色（与文件层同 filter，保证 stderr 与文件一致）
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(true)
         .with_target(true)
-        .with_filter(tracing_subscriber::EnvFilter::new("info"));
+        .with_filter(tracing_subscriber::EnvFilter::new(
+            "info,SimDLL::sim_frame_manager=trace,SimDLL::message_handler=trace,SimDLL::sim_api=trace",
+        ));
 
     let result = tracing_subscriber::registry()
         .with(file_layer)
