@@ -14,8 +14,9 @@ use crate::buffer::{BinaryBufferReader, BufferError};
 use crate::crashdump;
 use crate::globals::G_GAME_MESSAGE_HANDLER;
 use crate::logger;
-use crate::message_handler::MessageType;
+use crate::message_handler::{MessageType, G_SIM_MESSAGE_HANDLERS};
 use crate::save_load;
+use crate::sim_frame_manager::G_SIM_FRAME_MANAGER;
 use crate::sysinfo;
 
 /// 9 个 save_load 消息 ID（对照源码 00_types_reference.c L9157-9220 enum Type 的 save_load 子集）。
@@ -50,17 +51,43 @@ fn make_slice<'a>(data: *mut c_schar, size: c_int) -> &'a [u8] {
     }
 }
 
-/// 分发单条消息到 save_load handler。
+/// Phase 6：两阶段分派的第二阶段——查 `gSimMessageHandlers` 表。
 ///
-/// 对照原版 `gSimMessageHandlers` 表查找 (01_sim_api.c L230-238)。
-/// 原版表有 14 个条目（Ghidra 未反编译出静态初始化代码），其中 9 个是 save_load handler（已知），
-/// 另外 5 个是非 save_load handler（Phase 6+ 实现）。
+/// 对照原版 `01_sim_api.c` L230-238 的表查找逻辑。
+/// 线性遍历 14 项 `MessageHandlerEntry`，找到匹配 ID 后调用 handler 函数指针。
+/// 未找到返回 null（与原版 `local_res20` 保持初始 null 值一致）。
+///
+/// # 安全
+/// handler 函数指针由 `MessageHandlerEntry.handler: Option<MessageHandlerFn>` 提供，
+/// 已在 `message_handler.rs` 静态注册时验证非 null（`handlers_table_all_handlers_are_non_null` 测试）。
+fn dispatch_handler_table(id: c_int, reader: &mut BinaryBufferReader) -> *mut c_void {
+    let id_u32 = id as u32;
+    for entry in G_SIM_MESSAGE_HANDLERS {
+        if entry.id as u32 == id_u32 {
+            if let Some(handler) = entry.handler {
+                // SAFETY: handler 函数指针在编译期注册，签名匹配 MessageHandlerFn。
+                // handler 内部已有 catch_unwind 隔离 panic。
+                return unsafe { handler(reader as *mut BinaryBufferReader) };
+            } else {
+                // 不应到达（注册时已验证 handler 非 null），防御性记 error
+                tracing::error!(id, "handler table entry has null handler (should not happen)");
+                return std::ptr::null_mut();
+            }
+        }
+    }
+    tracing::trace!(id, "SIM_HandleMessage: no handler in table for id");
+    std::ptr::null_mut()
+}
+
+/// 分发单条 save_load 消息到对应 `save_load::*` 函数（Phase 3 保留）。
+///
+/// **Phase 6 注意**：此函数现在已不再被调用，仅作历史参考保留。Phase 6 改由
+/// `dispatch_handler_table` 通过 `G_SIM_MESSAGE_HANDLERS` 表中的 `save_load_shim::*`
+/// 函数指针间接调用 `save_load::*`（路径等价但走表查找，与原版 `gSimMessageHandlers`
+/// 表查找行为一致）。函数体保持不变以便对照 Phase 3 实现。
 ///
 /// # 返回值
-/// 始终返回 null。原版 save_load handler 签名是 `void * (*handler)(BinaryBufferReader *)`，
-/// 但 Phase 3 的 Rust 实现返回 `Result<(), BufferError>`（无指针 payload）——因为 save_load 是
-/// "command"消息（修改全局状态，无返回数据给 C#）。"Query" 消息由 SimFrameManager::HandleMessage
-/// 处理（Phase 6+ 实现，当前跳过）。
+/// 始终返回 null（save_load 是 "command" 消息，无返回数据给 C#）。
 ///
 /// # 错误处理
 /// save_load handler 返回 `Err(BufferError)` 时记录 error 日志并返回 null（不 panic，不中断调用方）。
@@ -163,11 +190,12 @@ pub extern "C" fn SIM_Shutdown() {
 ///   4. 若返回 false（未处理），遍历 gSimMessageHandlers[14] 表查 handler
 ///   5. 析构 BinaryBufferReader，返回 result
 ///
-/// Phase 3 实现：
+/// Phase 6 实现：
 ///   - gSim 检查跳过（G_SIM 是 Lazy<Mutex<Box<Sim>>> 永远非 null）
-///   - SimFrameManager::HandleMessage 未实现（Phase 6+），直接查表
-///   - gSimMessageHandlers 表的 9 个 save_load 条目已实现（dispatch_save_load_message）
-///   - 其余 5 个非 save_load 条目未实现，非匹配返回 null
+///   - SimFrameManager::HandleMessage 已实现（Phase 6 骨架：45 个 match arms
+///     ——3 特殊 + 42 emplace——log + return true）
+///   - gSimMessageHandlers 表 14 项已注册（9 save_load 真实 + 5 非 save_load 桩）
+///   - 两阶段分派：先 HandleMessage，未命中再查表
 #[no_mangle]
 pub extern "C" fn SIM_HandleMessage(
     id: c_int,
@@ -178,8 +206,19 @@ pub extern "C" fn SIM_HandleMessage(
         // 对照原版 L225: BinaryBufferReader::BinaryBufferReader(&local_30, (longlong)param_2, param_3)
         let slice = make_slice(data, size);
         let mut reader = BinaryBufferReader::new(slice);
-        // 对照原版 L226-238: SimFrameManager::HandleMessage + gSimMessageHandlers 表查找
-        dispatch_save_load_message(id, &mut reader)
+        // 对照原版 L226-238: 两阶段分派
+        // 阶段 1: SimFrameManager::HandleMessage —— 命中 45 个路由之一返回 true
+        {
+            let mut mgr = G_SIM_FRAME_MANAGER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if mgr.handle_message(id) {
+                // HandleMessage 已处理（Phase 6 骨架：log only），返回 null
+                return std::ptr::null_mut();
+            }
+        }
+        // 阶段 2: gSimMessageHandlers 表查找（14 项：9 save_load + 5 非 save_load 桩）
+        dispatch_handler_table(id, &mut reader)
     }))
     .unwrap_or_else(|_| {
         tracing::error!(id, size, "SIM_HandleMessage panicked, returning null");
@@ -192,8 +231,9 @@ pub extern "C" fn SIM_HandleMessage(
 /// 原版流程：循环 count 次调用单条 HandleMessage，每次推进 data 指针 size 字节，
 /// 返回最后一次调用的结果。
 ///
-/// Phase 3 实现：与 SIM_HandleMessage 一致，循环 count 次调用 dispatch_save_load_message。
+/// Phase 6 实现：与 SIM_HandleMessage 一致的两阶段分派，循环 count 次。
 /// count <= 0 时直接返回 null（与原版 `if (0 < param_3)` 等价）。
+/// 阶段 1 命中后用 `continue` 跳过阶段 2，但仍推进 `current_data` 指针。
 #[no_mangle]
 pub extern "C" fn SIM_HandleMessages(
     id: c_int,
@@ -212,8 +252,22 @@ pub extern "C" fn SIM_HandleMessages(
             // 对照原版 L272: 每次循环重新构造 BinaryBufferReader
             let slice = make_slice(current_data, size);
             let mut reader = BinaryBufferReader::new(slice);
-            // 对照原版 L273-289: SimFrameManager::HandleMessage + gSimMessageHandlers 表查找
-            last_result = dispatch_save_load_message(id, &mut reader);
+            // 对照原版 L273-289: 两阶段分派（同 SIM_HandleMessage）
+            {
+                let mut mgr = G_SIM_FRAME_MANAGER
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if mgr.handle_message(id) {
+                    last_result = std::ptr::null_mut();
+                    // 推进到下一条（阶段 1 命中也要推进指针）
+                    if size > 0 && !current_data.is_null() {
+                        current_data = unsafe { current_data.add(size as usize) };
+                    }
+                    continue;
+                }
+            }
+            // 阶段 2: gSimMessageHandlers 表查找
+            last_result = dispatch_handler_table(id, &mut reader);
             // 对照原版 L293: param_4 = param_4 + param_2（推进到下一条同 size 消息）
             // 防御：data 初始为 null 时不推进（避免 null.add(n) UB）
             if size > 0 && !current_data.is_null() {
@@ -338,6 +392,7 @@ mod tests {
     /// 中所有操作全局状态的测试，避免并行执行导致 setup 互相覆盖。
     use crate::LIB_TESTS_LOCK as PHASE4_TEST_LOCK;
     use crate::abi::SYSINFO_STUB_JSON;
+    use crate::message_handler::MessageType;
 
     #[test]
     fn sim_initialize_with_null_handler_does_not_panic() {
@@ -462,5 +517,66 @@ mod tests {
     fn sysinfo_release_does_not_panic() {
         let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SYSINFO_Release();
+    }
+
+    // === Phase 6 测试：两阶段分派 ===
+
+    #[test]
+    fn sim_handle_message_routes_handle_message_special_id_returns_null() {
+        // Phase 6：SimFrameManager_NewGameFrame 命中 HandleMessage 路由（log + return true）
+        // → SIM_HandleMessage 返回 null（HandleMessage 不返回数据）
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id: c_int = MessageType::SimFrameManager_NewGameFrame as u32 as c_int;
+        let result = SIM_HandleMessage(id, 0, std::ptr::null_mut());
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn sim_handle_message_routes_handle_message_emplace_id_returns_null() {
+        // Phase 6：ChangeCellProperties 命中 HandleMessage 路由（log + return true）
+        // → SIM_HandleMessage 返回 null
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id: c_int = MessageType::ChangeCellProperties as u32 as c_int;
+        let result = SIM_HandleMessage(id, 0, std::ptr::null_mut());
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn sim_handle_message_falls_through_to_save_load_handler() {
+        // Phase 6：Load 不在 HandleMessage 路由表，回退到 gSimMessageHandlers 表
+        // → 命中 save_load shim → 调 save_load::load(reader) → empty buffer Err(InvalidMagic)
+        // → log error + return null（行为与 Phase 3 一致，验证升级不破坏 save_load 路径）
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id: c_int = MessageType::Load as u32 as c_int;
+        let result = SIM_HandleMessage(id, 0, std::ptr::null_mut());
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn sim_handle_message_falls_through_to_non_save_load_stub() {
+        // Phase 6：SimData_InitializeFromCells 不在 HandleMessage 路由表，回退到
+        // gSimMessageHandlers 表 → 命中 non_save_load stub → log + return null
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id: c_int = MessageType::SimData_InitializeFromCells as u32 as c_int;
+        let result = SIM_HandleMessage(id, 0, std::ptr::null_mut());
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn sim_handle_message_unknown_id_returns_null() {
+        // Phase 6：id=0 不在 HandleMessage 路由表也不在 handler 表 → return null
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let result = SIM_HandleMessage(0, 0, std::ptr::null_mut());
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn sim_handle_messages_routes_handle_message_for_batch() {
+        // Phase 6：批量消息也走两阶段分派
+        // count=2, id=SimFrameManager_NewGameFrame → 两次都命中 HandleMessage → return null
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id: c_int = MessageType::SimFrameManager_NewGameFrame as u32 as c_int;
+        let result = SIM_HandleMessages(id, 0, 2, std::ptr::null_mut());
+        assert!(result.is_null());
     }
 }
