@@ -184,6 +184,131 @@ impl SimFrameManager {
         unsafe { std::mem::zeroed() }
     }
 
+    /// `SimFrameManager::NewFrame` — 从帧池取/建帧，置为 current_frame。
+    ///
+    /// 对照源码 08_sim_frame_manager.c L1116-1176。
+    /// **改造**：源码从 `frame_pool` 取 `SimFrameInfo*`（若空则 `operator new`）；
+    /// Rust 用 `Box<SimFrameInfo>` + `Box::into_raw`，`frame_pool` 改为存 `*mut SimFrameInfo`。
+    /// 取出后清空 frame 内部 vectors（reset 到空），置为 `current_frame`。
+    ///
+    /// **运行时影响**：游戏每帧开始时会调用此方法获取一个空白 `SimFrameInfo`。
+    /// 第一次调用会分配新帧；后续若已有回收帧则从池中复用（减少分配开销）。
+    /// 与原版 `operator new` 行为一致，对游戏画面无可见差异。
+    pub fn new_frame(&mut self) {
+        // 从 frame_pool 取一个可复用帧
+        let frame_ptr = if self.frame_pool.is_empty() {
+            // 新建
+            let boxed = Box::new(SimFrameInfo::default());
+            Box::into_raw(boxed)
+        } else {
+            let ptr = self.frame_pool.as_slice()[0];
+            self.frame_pool.erase(0);
+            ptr
+        };
+        // 清空 frame 内部 vectors（reset 到空）
+        if !frame_ptr.is_null() {
+            unsafe {
+                let frame = &mut *frame_ptr;
+                frame.cell_modifications.clear();
+                frame.set_insulation_values.clear();
+                frame.set_strength_values.clear();
+                frame.set_cell_properties.clear();
+                frame.mass_consumption_messages.clear();
+                frame.mass_emission_messages.clear();
+                frame.elapsed_seconds = 0.0;
+                frame.debug_properties = crate::sim_data::DebugProperties::default();
+            }
+        }
+        self.current_frame = frame_ptr;
+    }
+
+    /// `SimFrameManager::BeginFrameProcessing` — 锁 mutex，queued → active。
+    ///
+    /// 对照源码 08_sim_frame_manager.c L182-246。
+    /// 返回 active_frames 长度（待处理帧数）。
+    ///
+    /// **改造**：源码用 `std::lock_guard` 锁 `frame_mutex`，Rust 由外部
+    /// `Mutex<Box<SimFrameManager>>` 提供同步（G_SIM_FRAME_MANAGER 单例），
+    /// 此方法内部不再二次加锁——避免 deadlock。
+    ///
+    /// **运行时影响**：游戏主循环每帧开始时调用，把上一帧排队的消息帧
+    /// 移入"待处理"队列。无可见差异。
+    pub fn begin_frame_processing(&mut self) -> i32 {
+        // 移空 queued_frames 到 active_frames
+        while !self.queued_frames.is_empty() {
+            let ptr = self.queued_frames.as_slice()[0];
+            self.queued_frames.erase(0);
+            self.active_frames.push(ptr);
+        }
+        self.active_frames.len() as i32
+    }
+
+    /// `SimFrameManager::ProcessNextFrame` — 处理 active_frames 下一帧。
+    ///
+    /// 对照源码 08_sim_frame_manager.c L1903-1929。
+    /// 取 `active_frames[num_frames_processed]`，调 `ProcessFrame`，
+    /// `num_frames_processed += 1`，返回 elapsed_seconds。
+    ///
+    /// **运行时影响**：游戏主循环逐帧处理消息（如格子温度变化、物质排放）。
+    /// Phase 7 简化版只调 `process_frame` 桩（tracing log），不实际修改游戏状态，
+    /// 因此画面上还看不到温度/物质变化（T6-T10 接入真实处理后才有差异）。
+    pub fn process_next_frame(&mut self, sim_data: *mut crate::sim_data::SimData) -> f32 {
+        let idx = self.num_frames_processed as usize;
+        if idx >= self.active_frames.len() {
+            return 0.0;
+        }
+        let frame_ptr = self.active_frames.as_slice()[idx];
+        self.current_frame = frame_ptr;
+        self.num_frames_processed += 1;
+        // 调 ProcessFrame（T6 实现，本任务先用桩）
+        self.process_frame(sim_data);
+        // 返回 elapsed_seconds（从 active_region 或 frame）
+        let elapsed = unsafe { (*frame_ptr).elapsed_seconds };
+        elapsed
+    }
+
+    /// `SimFrameManager::EndFrameProcessing` — active → processed，清空 active。
+    ///
+    /// 对照源码 08_sim_frame_manager.c L247-635。
+    ///
+    /// **运行时影响**：游戏主循环一帧处理完毕后调用，把已处理帧移入
+    /// `processed_frames` 队列（供后续回收复用），并重置 `num_frames_processed`
+    /// 计数器。无可见差异。
+    pub fn end_frame_processing(&mut self) {
+        while !self.active_frames.is_empty() {
+            let ptr = self.active_frames.as_slice()[0];
+            self.active_frames.erase(0);
+            self.processed_frames.push(ptr);
+        }
+        self.num_frames_processed = 0;
+    }
+
+    /// `SimFrameManager::ProcessFrame` — 处理当前帧（Phase 7 简化版）。
+    ///
+    /// 对照源码 08_sim_frame_manager.c L1178-1902。
+    /// Phase 7 实现：
+    /// - 内联循环 set_insulation_values / set_strength_values
+    /// - 调 4 个 Process* 函数（T7-T10 实现，本任务先用桩）
+    /// Phase 9 的内联循环全部省略（消息已被 drain-only 消费）。
+    ///
+    /// **运行时影响**：本桩只输出 tracing log，不修改 SimData；
+    /// 游戏画面此时不会因本方法产生任何变化。T6-T10 接入真实处理后才有效果。
+    pub fn process_frame(&mut self, _sim_data: *mut crate::sim_data::SimData) {
+        if self.current_frame.is_null() {
+            return;
+        }
+        let frame = unsafe { &*self.current_frame };
+        // 内联循环 set_insulation_values：gameCell → cellIdx，写 updated_cells.insulation[idx] = value * 255
+        // T6 完整实现，本任务先 tracing log
+        tracing::trace!(
+            insulation_count = frame.set_insulation_values.len(),
+            strength_count = frame.set_strength_values.len(),
+            cell_mod_count = frame.cell_modifications.len(),
+            "ProcessFrame: Phase 7 simplified"
+        );
+        // T6-T10 接入真实 Process* 调用
+    }
+
     /// `SimFrameManager::HandleMessage`（Phase 7 升级版）。
     ///
     /// 对照源码 `08_sim_frame_manager.c` L352-1112。
@@ -734,5 +859,58 @@ mod tests {
         );
         let mut reader = make_test_reader(&[]);
         assert!(!mgr.handle_message(0, &mut reader), "unknown id should return false");
+    }
+
+    // ===== Phase 7 T4：帧池方法 4 项测试 =====
+
+    #[test]
+    fn new_frame_creates_current_frame_nonnull() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        assert!(mgr.current_frame.is_null());
+        mgr.new_frame();
+        assert!(!mgr.current_frame.is_null(), "new_frame should set current_frame");
+        // 清理：释放分配的帧
+        unsafe {
+            let _ = Box::from_raw(mgr.current_frame);
+            mgr.current_frame = std::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn begin_frame_processing_moves_queued_to_active() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        // 准备一个 queued frame
+        let frame = Box::into_raw(Box::new(SimFrameInfo::default()));
+        mgr.queued_frames.push(frame);
+        let count = mgr.begin_frame_processing();
+        assert_eq!(count, 1);
+        assert_eq!(mgr.active_frames.len(), 1);
+        assert_eq!(mgr.queued_frames.len(), 0);
+        // 清理
+        unsafe {
+            let _ = Box::from_raw(mgr.active_frames.as_slice()[0]);
+        }
+    }
+
+    #[test]
+    fn end_frame_processing_moves_active_to_processed() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let frame = Box::into_raw(Box::new(SimFrameInfo::default()));
+        mgr.active_frames.push(frame);
+        mgr.end_frame_processing();
+        assert_eq!(mgr.active_frames.len(), 0);
+        assert_eq!(mgr.processed_frames.len(), 1);
+        assert_eq!(mgr.num_frames_processed, 0);
+        // 清理
+        unsafe {
+            let _ = Box::from_raw(mgr.processed_frames.as_slice()[0]);
+        }
+    }
+
+    #[test]
+    fn process_next_frame_returns_zero_when_empty() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let elapsed = mgr.process_next_frame(std::ptr::null_mut());
+        assert_eq!(elapsed, 0.0);
     }
 }
