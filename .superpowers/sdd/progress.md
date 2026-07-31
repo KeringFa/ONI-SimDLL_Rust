@@ -830,3 +830,109 @@ Task P3-T8: complete (commit <this commit>, 控制者直接执行，无独立审
 4. Task 5: round-trip 测试放宽了字段断言（width/height/saved_options），仅验证 save_bytes.len()==65 + load 返回 Ok，完整 round-trip 验证留待 Phase 6+ load 修复后补充
 5. Phase 2 T4/T7 + Phase 3 T5 并行 flakiness 遗留观察项已由 commit 156bedb 彻底解决
 
+---
+
+## Phase 6: 消息分派骨架
+
+> 计划文件：`docs/superpowers/plans/2026-07-31-simdll-rs-phase6-message-dispatch-plan.md`
+> 设计规格：`docs/superpowers/specs/2026-07-31-simdll-rs-phase6-message-dispatch-spec.md`
+> BASE（T1 分派前）：`156bedb`（Phase 4 收官，193 测试通过）
+> Phase 5 已批准跳过
+
+## 任务进度
+
+- [x] Task P6-T1：sim_frame_manager.rs — G_SIM_FRAME_MANAGER 单例 + handle_message 路由骨架
+- [x] Task P6-T2：message_handler.rs — 14 项 G_SIM_MESSAGE_HANDLERS 表 + save_load_shim + non_save_load_handlers
+- [x] Task P6-T3：sim_api.rs — SIM_HandleMessage / SIM_HandleMessages 两阶段分派
+- [x] Task P6-T4：message_dispatch_smoke.rs 集成测试 + 最终验收
+
+## 完成记录
+
+Task P6-T1: complete (commits 156bedb..2ac866ab, review clean)
+- 产物：`simDLL_RS/src/sim_frame_manager.rs` 新增 `G_SIM_FRAME_MANAGER: Lazy<Mutex<Box<SimFrameManager>>>` 单例 + `handle_message(&mut self, id: c_int) -> bool` 方法（46 match arms：3 特殊 + 42 emplace + 默认 false）
+- 3 个特殊处理 ID：SimFrameManager_NewGameFrame / SetDebugProperties / ModifyBuildingEnergy（log + return true）
+- 42 个普通 emplace 路由 ID（原研究概括为 41，逐项核对源码后确认 42，含原计划遗漏的 ModifyElementChunkEnergy）
+- 每个 arm 仅 tracing::trace! + return true，不反序列化（currentFrame 为 null，SimFrameInfo 仍是空占位）
+
+Task P6-T2: complete (commits 2ac866ab..4f03312, review clean)
+- 产物：`simDLL_RS/src/message_handler.rs` 新增 14 项 `G_SIM_MESSAGE_HANDLERS` 静态表（9 save_load 真实 shim + 5 非 save_load 桩 handler）+ `save_load_shim` 子模块（9 个 unsafe extern "C" fn）+ `non_save_load_handlers` 子模块（5 个桩 fn）
+- MessageType 已 derive Debug（T1 阶段添加，用于测试 {:?} 格式化）
+- 9 个 save_load shim 函数：load / start / allocate_cells / define_world_offsets / prepare_game_data / clear_unoccupied_cells / set_saved_options / create_disease_table / resize_and_initialize_vacuum_cells（调用 save_load::* + catch_unwind + Err→null）
+- 5 个非 save_load 桩 handler：SimData_InitializeFromCells / SimData_FreeCells / SetVisibleCells / SetWorldZones / RadiationSickness（候选 ID 基于 enum 排除法，部署后日志验证）
+
+Task P6-T3: complete (commits 4f03312..189cae6, review clean)
+- 产物：`simDLL_RS/src/sim_api.rs` 的 SIM_HandleMessage / SIM_HandleMessages 升级为两阶段分派
+- 阶段 1：锁 G_SIM_FRAME_MANAGER 调 handle_message(id) → 命中返回 null
+- 阶段 2：调 dispatch_handler_table(id, reader) 线性查找 14 项 G_SIM_MESSAGE_HANDLERS 表
+- SIM_HandleMessages 循环 count 次，每次推进 data 指针 size 字节，count<=0 直接返回 null
+
+Task P6-T4: complete (commits 189cae6..2862c3c, review clean — 完美通过)
+- 产物：`simDLL_RS/tests/message_dispatch_smoke.rs` 新建 204 行（8 个 FFI 集成测试）
+- 测试：cargo test --test message_dispatch_smoke 8/8 通过；cargo test 全量 217/217 通过（lib 174 + abi_smoke 11 + elements_smoke 7 + save_load_smoke 17 + message_dispatch_smoke 8）；cargo build --release exit 0，SimDLL.dll = 1086976 字节（≈1061.5 KiB）
+- 审查结论：规格 ✅，任务质量通过，0 关键/重要/次要（完美通过）
+- **8 个集成测试覆盖场景**：
+  1. `handle_message_special_ids_return_null_via_ffi` — 3 个特殊处理 ID 通过 FFI 返回 null
+  2. `handle_message_emplace_ids_return_null_via_ffi` — 42 个普通 emplace ID 通过 FFI 返回 null（遍历全部 42 个 MessageType 变体）
+  3. `handle_message_save_load_ids_return_null_via_ffi` — 9 个 save_load ID 通过 FFI 返回 null（不回归 Phase 3）
+  4. `handle_message_non_save_load_stub_ids_return_null_via_ffi` — 5 个非 save_load 桩 ID 通过 FFI 返回 null
+  5. `handle_message_unknown_id_returns_null_via_ffi` — id=0 通过 FFI 返回 null
+  6. `handle_messages_count_zero_returns_null_via_ffi` — count=0 返回 null
+  7. `handle_messages_count_two_returns_null_via_ffi` — count=2 + NewGameFrame id 返回 null（阶段 1）
+  8. `handle_messages_count_three_returns_null_via_ffi` — count=3 + Load id 返回 null（阶段 2）
+- **crate 引用方式**：`use SimDLL::message_handler::MessageType;` + `use SimDLL::sim_api::{SIM_HandleMessage, SIM_HandleMessages};`（与现有 abi_smoke.rs / save_load_smoke.rs 模式一致，lib.rs 已有 pub mod 声明，无需额外 pub use）
+- **简报偏差 = 0**：实现者零偏差。简报提到的"41 个 emplace"已按 T1 实际的 42 个实现（brief 明确说明"T1 实际是 42 个，非简报的 41 个"）
+- **Warning 终态 = 6 项**（均 Phase 3/4 遗留，T4 未引入新 warning）：
+  1. unused import: WorldOffsetData at save_load.rs:672（Phase 3 T7 遗留）
+  2. unused variable: updated_cells at frame_sync.rs:55（Phase 3 T4 遗留）
+  3. variable does not need to be mutable: element_idx at save_load.rs:451（Phase 3 T6 遗留）
+  4. value assigned to save_settings_byte is never read at save_load.rs:562（Phase 3 T6 遗留）
+  5. unused variable: other at sim_data.rs:372（Phase 3 T4 遗留）
+  6. crate SimDLL should have a snake case name（Phase 0 Task 2 遗留，不可改）
+
+---
+
+## Phase 6 完成总结（消息分派骨架）
+
+**状态：✅ 全部 4 个任务（T1-T4）完成。待用户部署测试。**
+**Phase 6 起点 commit：** `156bedb`（Phase 4 收官，193 测试通过）
+**Phase 6 终点 HEAD：** `2862c3c test(phase6-t4): add message_dispatch_smoke integration tests (8 FFI tests)`
+
+### 交付物
+- **SimDLL.dll**：`simDLL_RS/target/release/SimDLL.dll`，**1086976 字节（≈1061.5 KiB）**，比 Phase 4（1060352 字节）增加 ~26 KB（新增消息分派代码）
+- **测试基线**：217/217 PASS（lib 174 + abi_smoke 11 + elements_smoke 7 + save_load_smoke 17 + message_dispatch_smoke 8），0 failed
+- **Warning 终态**：6 项（均 Phase 3/4 遗留，Phase 6 未引入新 warning）
+
+### Phase 6 核心设计成果（已落地）
+- **D1**: `G_SIM_FRAME_MANAGER: Lazy<Mutex<Box<SimFrameManager>>>` 全局单例（替代原版 gSim+0x50 内嵌布局，C# 侧无感知）
+- **D2**: `SimFrameManager::handle_message(id) -> bool` 路由骨架（45 个 match arms：3 特殊 + 42 emplace，每个 arm tracing log + return true）
+- **D3**: 14 项 `G_SIM_MESSAGE_HANDLERS` 静态表（9 save_load 真实 shim + 5 非 save_load 桩 handler）
+- **D4**: `SIM_HandleMessage` / `SIM_HandleMessages` 两阶段分派（先 HandleMessage，未命中查表）
+- **D5**: `save_load_shim` 适配层（save_load::* → unsafe extern "C" fn 签名转换 + catch_unwind + Err→null）
+- **D6**: `non_save_load_handlers` 5 个桩 handler（候选 ID，log + return null）
+
+### Phase 6 任务实现成果
+- **T1**（commit 2ac866ab）：G_SIM_FRAME_MANAGER 单例 + handle_message 路由骨架（45 match arms）
+- **T2**（commit 4f03312）：14 项 G_SIM_MESSAGE_HANDLERS 表 + save_load_shim + non_save_load_handlers
+- **T3**（commit 189cae6）：SIM_HandleMessage / SIM_HandleMessages 两阶段分派
+- **T4**（commit 2862c3c）：8 个 FFI 集成测试 + 最终验收
+
+### 关键决策
+1. **SimFrameManager 独立全局单例**（替代 gSim+0x50 内嵌布局）：避免锁嵌套，C# 侧无感知
+2. **HandleMessage 骨架不访问 currentFrame**：currentFrame 为 null，SimFrameInfo 仍是空占位，Phase 7+ 补全
+3. **5 个非 save_load handler 用候选列表**：基于 MessageType enum 排除法，部署后日志验证
+4. **save_load_shim 适配层**：save_load::* 函数签名 → MessageHandlerFn 函数指针签名
+
+### 部署测试预期行为（告知用户）
+- 游戏能进主菜单（与 Phase 4 一致，无回归）
+- 消息分派路径通过 FFI 端到端工作（8 个集成测试已验证）
+- 日志文件应记录每个消息 ID 的路由情况（HandleMessage trace / save_load handler / non_save_load stub）
+- 5 个非 save_load 候选 ID 需部署后日志验证（若候选错误，日志会显示 "no handler in table for id"）
+
+### Phase 6 遗留观察项（Phase 7+ 复核清单）
+1. HandleMessage 路由命中后只 log 不反序列化（Phase 7+ 接入真实 emplace 逻辑，需先补全 SimFrameInfo 33 字段定义）
+2. 5 个非 save_load handler 候选 ID 待部署后日志验证（spec §4，候选可能错误）
+3. SimFrameInfo 仍是空占位（reserved: [u8; 0]，Phase 7+ 补全 33 字段）
+4. SimFrameManager 的 frame_pool / queued_frames / active_frames / processed_frames 4 个 vector 仍空（Phase 7+ 接入帧队列管理）
+5. SimFrameManager::NewFrame 未实现（Phase 7+ 补全，SimFrameManager_NewGameFrame 特殊 arm 真正调用）
+6. dispatch_save_load_message 函数已不再被调用（Phase 6 改由 dispatch_handler_table 通过表查找），仅作历史参考保留
+
