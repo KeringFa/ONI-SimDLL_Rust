@@ -197,6 +197,71 @@ impl<T: Default + Copy> MsvcVector<T> {
             }
         }
     }
+
+    /// 追加元素到末尾（对应 MSVC `vector::push_back`）。
+    ///
+    /// **改造**：MSVC push_back 在 capacity 不足时重新分配（典型 1.5x 增长）；
+    /// Rust 简化为 2x 增长（与 `std::vec::Vec` 一致）。运行时差异：分配次数略少
+    /// （Rust 2x vs MSVC 1.5x），对 simDLL 使用场景无影响（push 频率低，总分配
+    /// 次数差异可忽略）。若 `begin` 为 null（空 vector），首次 push 分配 1 元素容量。
+    ///
+    /// **与 resize 的关键区别**：`resize` 不保留旧元素（重新全填 value），
+    /// `push` 必须保留旧元素并追加新元素到末尾。
+    pub fn push(&mut self, value: T) {
+        use std::alloc::{alloc, dealloc, Layout};
+        let elem_size = std::mem::size_of::<T>();
+        let elem_align = std::mem::align_of::<T>().max(8);
+        let cur_len = self.len();
+        let cur_cap = if !self.begin.is_null() && !self.capacity_end.is_null() {
+            (self.capacity_end as usize).saturating_sub(self.begin as usize) / elem_size
+        } else {
+            0
+        };
+        // 容量不足：重新分配 2x 容量
+        if cur_len >= cur_cap {
+            let new_cap = if cur_cap == 0 { 1 } else { cur_cap * 2 };
+            let new_byte_len = new_cap.checked_mul(elem_size).expect("overflow");
+            let layout = Layout::from_size_align(new_byte_len, elem_align).unwrap();
+            let new_buf = unsafe { alloc(layout) as *mut T };
+            if new_buf.is_null() {
+                return; // 分配失败静默（与 resize 一致的安全降级）
+            }
+            // 复制旧元素到新缓冲（push 必须保留旧元素，与 resize 不同）
+            if !self.begin.is_null() {
+                for i in 0..cur_len {
+                    unsafe { std::ptr::write(new_buf.add(i), self.get(i)) };
+                }
+                let old_byte_len = cur_cap * elem_size;
+                let old_layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
+                unsafe { dealloc(self.begin as *mut u8, old_layout) };
+            }
+            self.begin = new_buf;
+            self.end = unsafe { new_buf.add(cur_len) };
+            self.capacity_end = unsafe { new_buf.add(new_cap) };
+        }
+        // 写入新元素到 end 位置，end 推进 1
+        unsafe { std::ptr::write(self.end, value) };
+        self.end = unsafe { self.end.add(1) };
+    }
+
+    /// 删除指定索引处元素（对应 MSVC `vector::erase`）。
+    ///
+    /// 将 `index+1..end` 的元素左移一格，`end` 退 1（容量不变）。
+    /// 越界时静默忽略（与 `set` 一致的安全降级）。
+    pub fn erase(&mut self, index: usize) {
+        let len = self.len();
+        if index >= len {
+            return;
+        }
+        // 左移：index..len-1 的每个位置写入 index+1..len 的元素
+        // 注：用 read+write 而非 copy_ptr，对 Copy 类型等价且语义清晰
+        unsafe {
+            for i in index..len.saturating_sub(1) {
+                std::ptr::write(self.begin.add(i), std::ptr::read(self.begin.add(i + 1)));
+            }
+        }
+        self.end = unsafe { self.end.sub(1) };
+    }
 }
 
 impl<T: Default + Copy> Default for MsvcVector<T> {
@@ -407,6 +472,91 @@ mod tests {
         let mut v: MsvcVector<i32> = MsvcVector::new();
         v.resize(3, 7);
         v.truncate(0);
+        assert_eq!(v.len(), 0);
+        assert!(v.is_empty());
+    }
+
+    // === Phase 7 T3 新增：push + erase 测试 ===
+
+    #[test]
+    fn msvc_vector_push_appends() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(10);
+        v.push(20);
+        v.push(30);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.as_slice(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn msvc_vector_push_grows_capacity() {
+        // 验证多次 push 触发容量重分配（2x 增长），元素不丢失
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        for i in 0..10 {
+            v.push(i * 10);
+        }
+        assert_eq!(v.len(), 10);
+        assert_eq!(v.as_slice(), &[0, 10, 20, 30, 40, 50, 60, 70, 80, 90]);
+    }
+
+    #[test]
+    fn msvc_vector_push_after_resize_preserves() {
+        // resize 后 push 应保留旧元素
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(2, 0);
+        v.set(0, 100);
+        v.set(1, 200);
+        v.push(300);
+        assert_eq!(v.as_slice(), &[100, 200, 300]);
+    }
+
+    #[test]
+    fn msvc_vector_erase_removes_middle() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(10);
+        v.push(20);
+        v.push(30);
+        v.erase(1); // 删除中间元素 20
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.as_slice(), &[10, 30]);
+    }
+
+    #[test]
+    fn msvc_vector_erase_removes_first() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(10);
+        v.push(20);
+        v.push(30);
+        v.erase(0); // 删除首元素 10
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.as_slice(), &[20, 30]);
+    }
+
+    #[test]
+    fn msvc_vector_erase_removes_last() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(10);
+        v.push(20);
+        v.push(30);
+        v.erase(2); // 删除末元素 30
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.as_slice(), &[10, 20]);
+    }
+
+    #[test]
+    fn msvc_vector_erase_out_of_bounds_noop() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(10);
+        v.erase(5); // 越界，静默忽略
+        assert_eq!(v.len(), 1);
+        assert_eq!(v.as_slice(), &[10]);
+    }
+
+    #[test]
+    fn msvc_vector_erase_single_element_to_empty() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(42);
+        v.erase(0);
         assert_eq!(v.len(), 0);
         assert!(v.is_empty());
     }

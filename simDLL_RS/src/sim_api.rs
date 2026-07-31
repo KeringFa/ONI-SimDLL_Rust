@@ -208,13 +208,13 @@ pub extern "C" fn SIM_HandleMessage(
         let slice = make_slice(data, size);
         let mut reader = BinaryBufferReader::new(slice);
         // 对照原版 L226-238: 两阶段分派
-        // 阶段 1: SimFrameManager::HandleMessage —— 命中 45 个路由之一返回 true
+        // 阶段 1: SimFrameManager::HandleMessage —— 命中消息 ID 之一返回 true
         {
             let mut mgr = G_SIM_FRAME_MANAGER
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if mgr.handle_message(id) {
-                // HandleMessage 已处理（Phase 6 骨架：log only），返回 null
+            if mgr.handle_message(id, &mut reader) {
+                // HandleMessage 已处理（Phase 7 真实 emplace 或 drain-only），返回 null
                 return std::ptr::null_mut();
             }
         }
@@ -258,7 +258,7 @@ pub extern "C" fn SIM_HandleMessages(
                 let mut mgr = G_SIM_FRAME_MANAGER
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if mgr.handle_message(id) {
+                if mgr.handle_message(id, &mut reader) {
                     last_result = std::ptr::null_mut();
                     // 推进到下一条（阶段 1 命中也要推进指针）
                     if size > 0 && !current_data.is_null() {

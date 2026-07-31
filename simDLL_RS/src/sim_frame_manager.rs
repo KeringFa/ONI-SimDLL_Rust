@@ -6,9 +6,13 @@
 //!
 //! Phase 6 新增 `handle_message` 方法（44 路由 match arms 骨架）。
 
+use crate::buffer::BinaryBufferReader;
 use crate::message_handler::MessageType;
 use crate::sim_data::ActiveRegion;
-use crate::sim_events::SimFrameInfo;
+use crate::sim_events::{
+    CellModification, CellPropertiesChange, MassConsumption, MassEmission, SetCellFloatValue,
+    SimFrameInfo,
+};
 use crate::stl_shim::{MsvcMutex, MsvcVector};
 use once_cell::sync::Lazy;
 use std::os::raw::c_int;
@@ -180,225 +184,350 @@ impl SimFrameManager {
         unsafe { std::mem::zeroed() }
     }
 
-    /// `SimFrameManager::HandleMessage` 路由骨架（Phase 6）。
+    /// `SimFrameManager::HandleMessage`（Phase 7 升级版）。
     ///
     /// 对照源码 `08_sim_frame_manager.c` L352-1112。
     ///
-    /// 命中 45 个消息 ID 之一时记录 `tracing::trace!` 日志并返回 `true`（表示已处理）。
-    /// 不实际反序列化填充 `currentFrame` 字段（`currentFrame` 为 null，`SimFrameInfo`
-    /// 仍是空占位，Phase 7+ 补全字段后替换为真实 emplace 逻辑）。
+    /// Phase 7 改造：
+    /// - 8 真实 emplace：NewGameFrame / SetDebugProperties / ModifyCell /
+    ///   ChangeCellProperties / SetInsulationValue / SetStrengthValue /
+    ///   MassConsumption / MassEmission（NewGameFrame + SetDebugProperties 是
+    ///   特殊处理，6 个是普通 emplace——总 8 个 arm 真实写入 currentFrame 字段）
+    /// - 1 ModifyBuildingEnergy drain（Phase 9 实现）
+    /// - 36 drain-only：读消息字节后丢弃（保持 reader 缓冲区同步推进）
+    /// - 0 个未命中：返回 false，调用方回退到 gSimMessageHandlers 表
     ///
     /// # 参数
-    /// - `id`：消息 ID（原版 `param_1`，C# `int` 类型，bit-pattern 保留转为 u32 匹配）
+    /// - `id`：消息 ID
+    /// - `reader`：消息体 reader（包含消息数据，由调用方传入）
     ///
     /// # 返回
-    /// - `true`：消息 ID 命中路由表之一（已记录 log，调用方跳过 `gSimMessageHandlers` 表）
-    /// - `false`：消息 ID 未命中，调用方应回退到 `gSimMessageHandlers` 表查找
+    /// - `true`：消息 ID 命中（已 emplace 或 drain）
+    /// - `false`：未命中，回退到 handler 表
     ///
     /// # 改造说明
-    /// 原版方法是 `__thiscall`（this 指针 + 4 个参数：id / size / data / out_ptr），
-    /// Rust 改造为 `&mut self` + 仅 `id` 参数。`size` / `data` / `out_ptr` 在 Phase 6 骨架
-    /// 不使用（不反序列化）。Phase 7+ 接入真实 emplace 时补回 `data: *mut c_void` 参数
-    /// 读取消息体。**运行时无差异**：调用方 `SIM_HandleMessage` 已经持有 reader，
-    /// 仅在 `handle_message` 返回 false 时才用 reader 走 handler 表，命中时不读 reader。
-    pub fn handle_message(&mut self, id: c_int) -> bool {
+    /// 原版方法是 `__thiscall`（this + id + size + data + out_ptr），
+    /// Rust 改造为 `&mut self` + `id` + `reader: &mut BinaryBufferReader`。
+    /// `current_frame` 必须非 null（NewFrame 之后调用），否则返回 false 不 panic。
+    pub fn handle_message(&mut self, id: c_int, reader: &mut BinaryBufferReader) -> bool {
         let id_u32 = id as u32;
+        // current_frame 为 null 时不能 emplace（防御性）
+        if self.current_frame.is_null() {
+            tracing::error!(id = id_u32, "HandleMessage: current_frame is null, skipping emplace");
+            return false;
+        }
+        let frame: &mut SimFrameInfo = unsafe { &mut *self.current_frame };
         match id_u32 {
-            // === 特殊处理 3 项（源码非 emplace 模式）===
+            // === 特殊处理 2 项 ===
             MSG_NEW_GAME_FRAME => {
-                tracing::trace!(
-                    id = id_u32,
-                    "HandleMessage: SimFrameManager_NewGameFrame (special: NewFrame + fill activeRegions) — skeleton log only"
-                );
+                // 源码 L393-440：调 NewFrame（创建/复用帧）+ 读取 activeRegion 数据
+                // Phase 7：NewFrame 已在 T4 实现，这里读取消息体填充 active_region
+                // 消息体格式：f32 elapsed + 4×i32 region + 2×f32 sunlight/cosmic = 7×4=28B
+                let elapsed = reader.read_float().unwrap_or(0.0);
+                let min_x = reader.read_int().unwrap_or(0);
+                let min_y = reader.read_int().unwrap_or(0);
+                let max_x = reader.read_int().unwrap_or(0);
+                let max_y = reader.read_int().unwrap_or(0);
+                let sunlight = reader.read_float().unwrap_or(0.0);
+                let cosmic = reader.read_float().unwrap_or(0.0);
+                self.active_region = NewGameFrame {
+                    elapsed_seconds: elapsed,
+                    active_region_min_x: min_x,
+                    active_region_min_y: min_y,
+                    active_region_max_x: max_x,
+                    active_region_max_y: max_y,
+                    current_sunlight_intensity: sunlight,
+                    current_cosmic_radiation_intensity: cosmic,
+                };
+                self.elapsed_seconds = elapsed;
+                tracing::trace!(id = id_u32, elapsed, "HandleMessage: NewGameFrame (real)");
                 true
             }
             MSG_SET_DEBUG_PROPERTIES => {
-                tracing::trace!(
-                    id = id_u32,
-                    "HandleMessage: SetDebugProperties (special: direct assign debugProperties 4 fields) — skeleton log only"
-                );
+                // 源码 L441-450：直接赋值 currentFrame->debugProperties 3 字段
+                let bts = reader.read_float().unwrap_or(1.0);
+                let btbts = reader.read_float().unwrap_or(1.0);
+                let is_debug = reader.read_byte().unwrap_or(0);
+                frame.debug_properties.building_temperature_scale = bts;
+                frame.debug_properties.building_to_building_temperature_scale = btbts;
+                frame.debug_properties.is_debug_editing = is_debug != 0;
+                tracing::trace!(id = id_u32, bts, btbts, "HandleMessage: SetDebugProperties (real)");
                 true
             }
-            MSG_MODIFY_BUILDING_ENERGY => {
-                tracing::trace!(
-                    id = id_u32,
-                    "HandleMessage: ModifyBuildingEnergy (special: direct assign modifyBuildingEnergyMessages) — skeleton log only"
-                );
-                true
-            }
-            // === 普通 emplace 路由 42 项（源码模式：currentFrame->X.emplace_back(reader->read<T>())）===
-            MSG_CHANGE_CELL_PROPERTIES => {
-                tracing::trace!(id = id_u32, field = "setCellProperties", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_ADD_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
-                tracing::trace!(id = id_u32, field = "buildingToBuildingHeatExchangeMessages.adds", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_BUILDING_IN_CONTACT_FROM_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
-                tracing::trace!(id = id_u32, field = "buildingToBuildingHeatExchangeMessages.modifies", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_CELL_RADIATION_MODIFICATION => {
-                tracing::trace!(id = id_u32, field = "cellRadiationModifications", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_DISEASE_EMITTER => {
-                tracing::trace!(id = id_u32, field = "diseaseEmitterMessages.modifies", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_CELL_DISEASE_MODIFICATION => {
-                tracing::trace!(id = id_u32, field = "cellDiseaseModifications", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_DISEASE_CONSUMER => {
-                tracing::trace!(id = id_u32, field = "diseaseConsumerMessages.modifies", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_ADD_IN_CONTACT_BUILDING_TO_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
-                tracing::trace!(id = id_u32, field = "addBuildingInContactToBuildingToBuildingHeatExchangeMessages", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_ELEMENT_EMITTER => {
-                tracing::trace!(id = id_u32, field = "elementEmitterMessages.removes", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_ADD_RADIATION_EMITTER => {
-                tracing::trace!(id = id_u32, field = "radiationEmitterMessages.adds", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_CHUNK_TEMPERATURE_ADJUSTER => {
-                tracing::trace!(id = id_u32, field = "modifyElementChunkAdjusterMessages", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
+            // === 普通 emplace 6 项 ===
             MSG_MODIFY_CELL => {
-                tracing::trace!(id = id_u32, field = "cellModifications", "HandleMessage: emplace (skeleton log only)");
+                // 源码：emplace_back 到 currentFrame->cellModifications
+                // 消息体 28B：CellModification
+                let cm = read_cell_modification(reader);
+                frame.cell_modifications.push(cm);
+                tracing::trace!(id = id_u32, count = frame.cell_modifications.len(), "HandleMessage: emplace cellModifications (real)");
                 true
             }
-            MSG_CONSUME_DISEASE => {
-                tracing::trace!(id = id_u32, field = "consumeDisease", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_ELEMENT_CHUNK => {
-                tracing::trace!(id = id_u32, field = "elementChunkMessages.removes", "HandleMessage: emplace (skeleton log only)");
+            MSG_CHANGE_CELL_PROPERTIES => {
+                let cp = read_cell_properties_change(reader);
+                frame.set_cell_properties.push(cp);
+                tracing::trace!(id = id_u32, count = frame.set_cell_properties.len(), "HandleMessage: emplace setCellProperties (real)");
                 true
             }
             MSG_SET_INSULATION_VALUE => {
-                tracing::trace!(id = id_u32, field = "setInsulationValues", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_DISEASE_CONSUMER => {
-                tracing::trace!(id = id_u32, field = "diseaseConsumerMessages.removes", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_RADIATION_EMITTER => {
-                tracing::trace!(id = id_u32, field = "radiationEmitterMessages.removes", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_BACKWALL_DATA => {
-                tracing::trace!(id = id_u32, field = "modifyBackwallDataMessages", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_ADD_ELEMENT_EMITTER => {
-                tracing::trace!(id = id_u32, field = "elementEmitterMessages.adds", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_RADIATION_EMITTER => {
-                tracing::trace!(id = id_u32, field = "radiationEmitterMessages.modifies", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_BUILDING_HEAT_EXCHANGE => {
-                tracing::trace!(id = id_u32, field = "buildingHeatExchangeMessages.removes", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_CELL_WORLD_ZONE => {
-                tracing::trace!(id = id_u32, field = "cellWorldZoneModifications", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_SET_ELEMENT_CHUNK_DATA => {
-                tracing::trace!(id = id_u32, field = "elementChunkMessages.modifies", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MOVE_ELEMENT_CHUNK => {
-                tracing::trace!(id = id_u32, field = "moveElementChunkMessages", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_ADD_DISEASE_CONSUMER => {
-                tracing::trace!(id = id_u32, field = "diseaseConsumerMessages.adds", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_ELEMENT_EMITTER => {
-                tracing::trace!(id = id_u32, field = "elementEmitterMessages.modifies", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_DISEASE_EMITTER => {
-                tracing::trace!(id = id_u32, field = "diseaseEmitterMessages.removes", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_REMOVE_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
-                tracing::trace!(id = id_u32, field = "buildingToBuildingHeatExchangeMessages.removes", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MASS_EMISSION => {
-                tracing::trace!(id = id_u32, field = "massEmissionMessages", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_MODIFY_CELL_ENERGY => {
-                tracing::trace!(id = id_u32, field = "cellEnergyModifications", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_DIG => {
-                tracing::trace!(id = id_u32, field = "digPoints", "HandleMessage: emplace (skeleton log only)");
-                true
-            }
-            MSG_RADIATION_PARAMS_MODIFICATION => {
-                tracing::trace!(id = id_u32, field = "radiationParamsModifications", "HandleMessage: emplace (skeleton log only)");
+                let v = read_set_cell_float_value(reader);
+                frame.set_insulation_values.push(v);
+                tracing::trace!(id = id_u32, count = frame.set_insulation_values.len(), "HandleMessage: emplace setInsulationValues (real)");
                 true
             }
             MSG_SET_STRENGTH_VALUE => {
-                tracing::trace!(id = id_u32, field = "setStrengthValues", "HandleMessage: emplace (skeleton log only)");
+                let v = read_set_cell_float_value(reader);
+                frame.set_strength_values.push(v);
+                tracing::trace!(id = id_u32, count = frame.set_strength_values.len(), "HandleMessage: emplace setStrengthValues (real)");
                 true
             }
             MSG_MASS_CONSUMPTION => {
-                tracing::trace!(id = id_u32, field = "massConsumptionMessages", "HandleMessage: emplace (skeleton log only)");
+                let m = read_mass_consumption(reader);
+                frame.mass_consumption_messages.push(m);
+                tracing::trace!(id = id_u32, count = frame.mass_consumption_messages.len(), "HandleMessage: emplace massConsumptionMessages (real)");
+                true
+            }
+            MSG_MASS_EMISSION => {
+                let m = read_mass_emission(reader);
+                frame.mass_emission_messages.push(m);
+                tracing::trace!(id = id_u32, count = frame.mass_emission_messages.len(), "HandleMessage: emplace massEmissionMessages (real)");
+                true
+            }
+            // === ModifyBuildingEnergy 特殊处理：drain-only（Phase 9 实现）===
+            MSG_MODIFY_BUILDING_ENERGY => {
+                // 源码 L450-?：赋值 currentFrame->modifyBuildingEnergyMessages
+                // Phase 7 未声明此字段，drain-only：读 8B 丢弃
+                drain_message(reader, 8, id_u32, "modifyBuildingEnergyMessages");
+                true
+            }
+            // === drain-only 36 项（消息体大小待源码逐项核对）===
+            // 注：先用 drain_message(reader, 8, ...) 读 8B 丢弃，保持 reader 同步推进。
+            // 若部署后日志显示 reader 错位，再调整 N。
+            MSG_ADD_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
+                drain_message(reader, 8, id_u32, "buildingToBuildingHeatExchangeMessages.adds");
+                true
+            }
+            MSG_REMOVE_BUILDING_IN_CONTACT_FROM_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
+                drain_message(reader, 8, id_u32, "buildingToBuildingHeatExchangeMessages.modifies");
+                true
+            }
+            MSG_CELL_RADIATION_MODIFICATION => {
+                drain_message(reader, 8, id_u32, "cellRadiationModifications");
+                true
+            }
+            MSG_MODIFY_DISEASE_EMITTER => {
+                drain_message(reader, 8, id_u32, "diseaseEmitterMessages.modifies");
+                true
+            }
+            MSG_CELL_DISEASE_MODIFICATION => {
+                drain_message(reader, 8, id_u32, "cellDiseaseModifications");
+                true
+            }
+            MSG_MODIFY_DISEASE_CONSUMER => {
+                drain_message(reader, 8, id_u32, "diseaseConsumerMessages.modifies");
+                true
+            }
+            MSG_ADD_IN_CONTACT_BUILDING_TO_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
+                drain_message(reader, 8, id_u32, "addBuildingInContactToBuildingToBuildingHeatExchangeMessages");
+                true
+            }
+            MSG_REMOVE_ELEMENT_EMITTER => {
+                drain_message(reader, 8, id_u32, "elementEmitterMessages.removes");
+                true
+            }
+            MSG_ADD_RADIATION_EMITTER => {
+                drain_message(reader, 8, id_u32, "radiationEmitterMessages.adds");
+                true
+            }
+            MSG_MODIFY_CHUNK_TEMPERATURE_ADJUSTER => {
+                drain_message(reader, 8, id_u32, "modifyElementChunkAdjusterMessages");
+                true
+            }
+            MSG_CONSUME_DISEASE => {
+                drain_message(reader, 8, id_u32, "consumeDisease");
+                true
+            }
+            MSG_REMOVE_ELEMENT_CHUNK => {
+                drain_message(reader, 8, id_u32, "elementChunkMessages.removes");
+                true
+            }
+            MSG_REMOVE_DISEASE_CONSUMER => {
+                drain_message(reader, 8, id_u32, "diseaseConsumerMessages.removes");
+                true
+            }
+            MSG_REMOVE_RADIATION_EMITTER => {
+                drain_message(reader, 8, id_u32, "radiationEmitterMessages.removes");
+                true
+            }
+            MSG_MODIFY_BACKWALL_DATA => {
+                drain_message(reader, 8, id_u32, "modifyBackwallDataMessages");
+                true
+            }
+            MSG_ADD_ELEMENT_EMITTER => {
+                drain_message(reader, 8, id_u32, "elementEmitterMessages.adds");
+                true
+            }
+            MSG_MODIFY_RADIATION_EMITTER => {
+                drain_message(reader, 8, id_u32, "radiationEmitterMessages.modifies");
+                true
+            }
+            MSG_REMOVE_BUILDING_HEAT_EXCHANGE => {
+                drain_message(reader, 8, id_u32, "buildingHeatExchangeMessages.removes");
+                true
+            }
+            MSG_MODIFY_CELL_WORLD_ZONE => {
+                drain_message(reader, 8, id_u32, "cellWorldZoneModifications");
+                true
+            }
+            MSG_SET_ELEMENT_CHUNK_DATA => {
+                drain_message(reader, 8, id_u32, "elementChunkMessages.modifies");
+                true
+            }
+            MSG_MOVE_ELEMENT_CHUNK => {
+                drain_message(reader, 8, id_u32, "moveElementChunkMessages");
+                true
+            }
+            MSG_ADD_DISEASE_CONSUMER => {
+                drain_message(reader, 8, id_u32, "diseaseConsumerMessages.adds");
+                true
+            }
+            MSG_MODIFY_ELEMENT_EMITTER => {
+                drain_message(reader, 8, id_u32, "elementEmitterMessages.modifies");
+                true
+            }
+            MSG_REMOVE_DISEASE_EMITTER => {
+                drain_message(reader, 8, id_u32, "diseaseEmitterMessages.removes");
+                true
+            }
+            MSG_REMOVE_BUILDING_TO_BUILDING_HEAT_EXCHANGE => {
+                drain_message(reader, 8, id_u32, "buildingToBuildingHeatExchangeMessages.removes");
+                true
+            }
+            MSG_MODIFY_CELL_ENERGY => {
+                drain_message(reader, 8, id_u32, "cellEnergyModifications");
+                true
+            }
+            MSG_DIG => {
+                drain_message(reader, 8, id_u32, "digPoints");
+                true
+            }
+            MSG_RADIATION_PARAMS_MODIFICATION => {
+                drain_message(reader, 8, id_u32, "radiationParamsModifications");
                 true
             }
             MSG_ADD_BUILDING_HEAT_EXCHANGE => {
-                tracing::trace!(id = id_u32, field = "buildingHeatExchangeMessages.adds", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "buildingHeatExchangeMessages.adds");
                 true
             }
             MSG_MODIFY_BUILDING_HEAT_EXCHANGE => {
-                tracing::trace!(id = id_u32, field = "buildingHeatExchangeMessages.modifies", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "buildingHeatExchangeMessages.modifies");
                 true
             }
             MSG_ADD_ELEMENT_CONSUMER => {
-                tracing::trace!(id = id_u32, field = "elementConsumerMessages.adds", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "elementConsumerMessages.adds");
                 true
             }
             MSG_ADD_ELEMENT_CHUNK => {
-                tracing::trace!(id = id_u32, field = "elementChunkMessages.adds", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "elementChunkMessages.adds");
                 true
             }
             MSG_ADD_DISEASE_EMITTER => {
-                tracing::trace!(id = id_u32, field = "diseaseEmitterMessages.adds", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "diseaseEmitterMessages.adds");
                 true
             }
             MSG_SET_ELEMENT_CONSUMER_DATA => {
-                tracing::trace!(id = id_u32, field = "elementConsumerMessages.modifies", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "elementConsumerMessages.modifies");
                 true
             }
             MSG_MODIFY_ELEMENT_CHUNK_ENERGY => {
-                tracing::trace!(id = id_u32, field = "modifyElementChunkEnergyMessages", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "modifyElementChunkEnergyMessages");
                 true
             }
             MSG_REMOVE_ELEMENT_CONSUMER => {
-                tracing::trace!(id = id_u32, field = "elementConsumerMessages.removes", "HandleMessage: emplace (skeleton log only)");
+                drain_message(reader, 8, id_u32, "elementConsumerMessages.removes");
                 true
             }
             // 未命中：返回 false，调用方回退到 gSimMessageHandlers 表
             _ => false,
         }
     }
+}
+
+// === Phase 7 T3：reader 辅助函数（handle_message emplace 用）===
+
+/// 辅助：从 reader 读 CellModification（28B）。
+///
+/// 对照源码 06_process_messages.c L1303-1305 的 `local_c0` 拆包。
+fn read_cell_modification(reader: &mut BinaryBufferReader) -> CellModification {
+    CellModification {
+        game_cell: reader.read_int().unwrap_or(0),
+        callback_idx: reader.read_int().unwrap_or(0),
+        mass: reader.read_float().unwrap_or(0.0),
+        temperature: reader.read_float().unwrap_or(0.0),
+        disease_count: reader.read_int().unwrap_or(0),
+        element_idx: reader.read_ushort().unwrap_or(0),
+        disease_idx: reader.read_byte().unwrap_or(0),
+        replace_mode: reader.read_byte().unwrap_or(0),
+        flags: reader.read_byte().unwrap_or(0),
+        _pad: [0; 3],
+    }
+}
+
+/// 辅助：从 reader 读 CellPropertiesChange（12B）。
+fn read_cell_properties_change(reader: &mut BinaryBufferReader) -> CellPropertiesChange {
+    CellPropertiesChange {
+        game_cell: reader.read_int().unwrap_or(0),
+        callback_idx: reader.read_int().unwrap_or(0),
+        property_flags: reader.read_byte().unwrap_or(0),
+        set_or_clear: reader.read_byte().unwrap_or(0),
+        _pad: [0; 2],
+    }
+}
+
+/// 辅助：从 reader 读 MassConsumption（16B）。
+fn read_mass_consumption(reader: &mut BinaryBufferReader) -> MassConsumption {
+    MassConsumption {
+        game_cell: reader.read_int().unwrap_or(0),
+        callback_idx: reader.read_int().unwrap_or(0),
+        removed_elem_idx: reader.read_ushort().unwrap_or(0),
+        loop_radius: reader.read_byte().unwrap_or(0),
+        use_rectangle: reader.read_byte().unwrap_or(0),
+    }
+}
+
+/// 辅助：从 reader 读 MassEmission（24B）。
+fn read_mass_emission(reader: &mut BinaryBufferReader) -> MassEmission {
+    MassEmission {
+        game_cell: reader.read_int().unwrap_or(0),
+        callback_idx_or_temp: reader.read_float().unwrap_or(0.0),
+        mass: reader.read_float().unwrap_or(0.0),
+        temperature: reader.read_float().unwrap_or(0.0),
+        disease_count: reader.read_int().unwrap_or(0),
+        element_idx: reader.read_ushort().unwrap_or(0),
+        disease_idx: reader.read_byte().unwrap_or(0),
+        emitted: reader.read_byte().unwrap_or(0),
+        _pad: [0; 2],
+    }
+}
+
+/// 辅助：从 reader 读 SetCellFloatValue（8B）。
+fn read_set_cell_float_value(reader: &mut BinaryBufferReader) -> SetCellFloatValue {
+    SetCellFloatValue {
+        game_cell: reader.read_int().unwrap_or(0),
+        value: reader.read_float().unwrap_or(0.0),
+    }
+}
+
+/// 辅助：drain-only 读取 N 字节后丢弃（保持 reader 缓冲区同步推进）。
+///
+/// 对照源码 36 个非 Phase 7 arm 的 `reader->read<T>()` 模式。
+/// Phase 7 不 emplace 这些消息到 currentFrame（字段未声明），
+/// 但必须读 N 字节以保持 reader 位置与原版一致（否则后续消息错位）。
+fn drain_message(reader: &mut BinaryBufferReader, n: usize, id: u32, field: &'static str) {
+    for _ in 0..n {
+        let _ = reader.read_byte();
+    }
+    tracing::trace!(id, field, n, "HandleMessage: drain-only (Phase 7)");
 }
 
 #[cfg(test)]
@@ -428,32 +557,88 @@ mod tests {
         mt as u32 as i32
     }
 
-    #[test]
-    fn handle_message_returns_true_for_new_game_frame() {
-        let mut mgr = SimFrameManager::new_zeroed();
-        assert!(mgr.handle_message(msg_id(MessageType::SimFrameManager_NewGameFrame)));
+    /// 辅助：构造测试用 BinaryBufferReader（从 byte slice）。
+    fn make_test_reader(data: &[u8]) -> BinaryBufferReader {
+        BinaryBufferReader::new(data)
     }
 
     #[test]
-    fn handle_message_returns_true_for_set_debug_properties() {
+    fn handle_message_returns_false_for_new_game_frame_when_current_frame_null() {
+        // current_frame 为 null 时 handle_message 应返回 false（防御性）
         let mut mgr = SimFrameManager::new_zeroed();
-        assert!(mgr.handle_message(msg_id(MessageType::SetDebugProperties)));
+        let mut reader = make_test_reader(&[]);
+        assert!(!mgr.handle_message(msg_id(MessageType::SimFrameManager_NewGameFrame), &mut reader));
     }
 
     #[test]
-    fn handle_message_returns_true_for_modify_building_energy() {
+    fn handle_message_emplaces_set_debug_properties_when_current_frame_nonnull() {
         let mut mgr = SimFrameManager::new_zeroed();
-        assert!(mgr.handle_message(msg_id(MessageType::ModifyBuildingEnergy)));
+        let mut frame = Box::new(SimFrameInfo::default());
+        mgr.current_frame = frame.as_mut() as *mut _;
+        // 消息体：4B f32 (1.0) + 4B f32 (1.0) + 1B u8 (1) = 9B
+        let mut reader = make_test_reader(&[0x3f, 0x80, 0, 0, 0x3f, 0x80, 0, 0, 0x01]);
+        assert!(mgr.handle_message(msg_id(MessageType::SetDebugProperties), &mut reader));
+        assert_eq!(frame.debug_properties.is_debug_editing, true);
     }
 
     #[test]
-    fn handle_message_returns_true_for_all_emplace_routes() {
-        // 验证全部普通 emplace 路由命中（返回 true）。
-        // 数量 = 42（原研究阶段概括为 40/41，逐项核对源码 if-else 树后确认 42 项，
-        // 含原计划遗漏的 ModifyElementChunkEnergy；详见 spec §6.2 注释）。
+    fn handle_message_drains_modify_building_energy() {
         let mut mgr = SimFrameManager::new_zeroed();
-        let routes = [
-            MessageType::ChangeCellProperties,
+        let mut frame = Box::new(SimFrameInfo::default());
+        mgr.current_frame = frame.as_mut() as *mut _;
+        let mut reader = make_test_reader(&[0; 8]);
+        assert!(mgr.handle_message(msg_id(MessageType::ModifyBuildingEnergy), &mut reader));
+    }
+
+    #[test]
+    fn handle_message_emplaces_6_real_arms_when_current_frame_nonnull() {
+        // 6 个真实 emplace：ModifyCell / ChangeCellProperties / SetInsulationValue /
+        // SetStrengthValue / MassConsumption / MassEmission
+        // （NewGameFrame + SetDebugProperties 是特殊处理，另 2 个测试覆盖）
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut frame = Box::new(SimFrameInfo::default());
+        mgr.current_frame = frame.as_mut() as *mut _;
+
+        // 28B for CellModification
+        let modify_cell_data: Vec<u8> = vec![0; 28];
+        let mut reader = make_test_reader(&modify_cell_data);
+        assert!(mgr.handle_message(msg_id(MessageType::ModifyCell), &mut reader));
+        assert_eq!(frame.cell_modifications.len(), 1);
+
+        // 12B for CellPropertiesChange
+        let prop_data: Vec<u8> = vec![0; 12];
+        let mut reader = make_test_reader(&prop_data);
+        assert!(mgr.handle_message(msg_id(MessageType::ChangeCellProperties), &mut reader));
+        assert_eq!(frame.set_cell_properties.len(), 1);
+
+        // 8B for SetCellFloatValue
+        let val_data: Vec<u8> = vec![0; 8];
+        let mut reader = make_test_reader(&val_data);
+        assert!(mgr.handle_message(msg_id(MessageType::SetInsulationValue), &mut reader));
+        assert_eq!(frame.set_insulation_values.len(), 1);
+
+        let mut reader = make_test_reader(&val_data);
+        assert!(mgr.handle_message(msg_id(MessageType::SetStrengthValue), &mut reader));
+        assert_eq!(frame.set_strength_values.len(), 1);
+
+        // 16B for MassConsumption
+        let mc_data: Vec<u8> = vec![0; 16];
+        let mut reader = make_test_reader(&mc_data);
+        assert!(mgr.handle_message(msg_id(MessageType::MassConsumption), &mut reader));
+        assert_eq!(frame.mass_consumption_messages.len(), 1);
+
+        // 24B for MassEmission
+        let me_data: Vec<u8> = vec![0; 24];
+        let mut reader = make_test_reader(&me_data);
+        assert!(mgr.handle_message(msg_id(MessageType::MassEmission), &mut reader));
+        assert_eq!(frame.mass_emission_messages.len(), 1);
+    }
+
+    #[test]
+    fn handle_message_drains_36_non_phase7_arms_when_current_frame_nonnull() {
+        // 36 个 drain-only arm：每个应读 8B 后返回 true
+        // （ModifyBuildingEnergy 单独测试，不在此列）
+        let drain_ids = [
             MessageType::AddBuildingToBuildingHeatExchange,
             MessageType::RemoveBuildingInContactFromBuildingToBuildingHeatExchange,
             MessageType::CellRadiationModification,
@@ -464,10 +649,8 @@ mod tests {
             MessageType::RemoveElementEmitter,
             MessageType::AddRadiationEmitter,
             MessageType::ModifyChunkTemperatureAdjuster,
-            MessageType::ModifyCell,
             MessageType::ConsumeDisease,
             MessageType::RemoveElementChunk,
-            MessageType::SetInsulationValue,
             MessageType::RemoveDiseaseConsumer,
             MessageType::RemoveRadiationEmitter,
             MessageType::ModifyBackwallData,
@@ -481,12 +664,9 @@ mod tests {
             MessageType::ModifyElementEmitter,
             MessageType::RemoveDiseaseEmitter,
             MessageType::RemoveBuildingToBuildingHeatExchange,
-            MessageType::MassEmission,
             MessageType::ModifyCellEnergy,
             MessageType::Dig,
             MessageType::RadiationParamsModification,
-            MessageType::SetStrengthValue,
-            MessageType::MassConsumption,
             MessageType::AddBuildingHeatExchange,
             MessageType::ModifyBuildingHeatExchange,
             MessageType::AddElementConsumer,
@@ -496,23 +676,21 @@ mod tests {
             MessageType::ModifyElementChunkEnergy,
             MessageType::RemoveElementConsumer,
         ];
-        assert_eq!(
-            routes.len(),
-            42,
-            "普通 emplace 实际 42 项（原计划 40，逐项核对源码后补全 ModifyElementChunkEnergy + CellRadiationModification 等，详见 spec §6.2）"
-        );
-        for mt in routes {
-            assert!(
-                mgr.handle_message(msg_id(mt)),
-                "HandleMessage should route id={}",
-                mt as u32
-            );
+        assert_eq!(drain_ids.len(), 36, "drain-only arm 实际数量（8 真实 + 1 ModifyBuildingEnergy drain + 36 drain-only = 45 arms）");
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut frame = Box::new(SimFrameInfo::default());
+        mgr.current_frame = frame.as_mut() as *mut _;
+        for mt in drain_ids {
+            let mut reader = make_test_reader(&[0u8; 8]);
+            assert!(mgr.handle_message(msg_id(mt), &mut reader), "drain id {:?} should return true", mt);
         }
     }
 
     #[test]
     fn handle_message_returns_false_for_save_load_ids() {
         // 9 个 save_load ID 不在 HandleMessage 路由表，应返回 false
+        // 注：current_frame 为 null 时 handle_message 在 null 检查处返回 false，
+        // 不读 reader，所以空 reader 即可
         let mut mgr = SimFrameManager::new_zeroed();
         let save_load_ids = [
             MessageType::Load,
@@ -526,8 +704,9 @@ mod tests {
             MessageType::SimData_ResizeAndInitializeVacuumCells,
         ];
         for mt in save_load_ids {
+            let mut reader = make_test_reader(&[]);
             assert!(
-                !mgr.handle_message(msg_id(mt)),
+                !mgr.handle_message(msg_id(mt), &mut reader),
                 "HandleMessage should NOT route save_load id={}",
                 mt as u32
             );
@@ -537,8 +716,9 @@ mod tests {
     #[test]
     fn handle_message_returns_false_for_unknown_id() {
         let mut mgr = SimFrameManager::new_zeroed();
-        // id=0 不在任何路由表
-        assert!(!mgr.handle_message(0));
+        let mut reader = make_test_reader(&[]);
+        // id=0 不在任何路由表（且 current_frame 为 null）
+        assert!(!mgr.handle_message(0, &mut reader));
     }
 
     #[test]
@@ -552,6 +732,7 @@ mod tests {
             mgr.current_frame.is_null(),
             "current_frame should be null in skeleton"
         );
-        assert!(!mgr.handle_message(0), "unknown id should return false");
+        let mut reader = make_test_reader(&[]);
+        assert!(!mgr.handle_message(0, &mut reader), "unknown id should return false");
     }
 }
