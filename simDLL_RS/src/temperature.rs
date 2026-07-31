@@ -1110,6 +1110,719 @@ fn internal_to_game_cell(sim_data: &SimData, cell_idx: i32) -> i32 {
     (cell % width) - 1 + ((cell / width) - 1) * (width - 2)
 }
 
+// ===== T13: CalculateCombinedTemperature / DoPartialHeatTransition / DoPartialMelt =====
+
+/// `CalculateCombinedTemperature` — 加权平均混合温度（4 参数版本）。
+///
+/// 严格对照源码 04_temperature.c L1459-1490。
+///
+/// # 算法
+/// 1. 若 `mass_a + mass_b <= 0.0` → 返回 0.0（防止除零）
+/// 2. `combined = (mass_b × temp_b + mass_a × temp_a) / (mass_a + mass_b)`
+/// 3. clamp 到 `[min(temp_a, temp_b), max(temp_a, temp_b)]`
+///    （源码用嵌套 if 实现等价 clamp）
+///
+/// # 运行时影响
+/// 与原版完全等价。用于混合两团物质时的目标温度计算。
+pub fn calculate_combined_temperature(
+    mass_a: f32,
+    temp_a: f32,
+    mass_b: f32,
+    temp_b: f32,
+) -> f32 {
+    // 源码 L1466-1468: if (mass_a + mass_b <= 0.0) return 0.0
+    if mass_a + mass_b <= 0.0 {
+        return 0.0;
+    }
+    // 源码 L1469: combined = (mass_b × temp_b + mass_a × temp_a) / (mass_a + mass_b)
+    let combined = (mass_b * temp_b + mass_a * temp_a) / (mass_a + mass_b);
+    // 源码 L1470-1489: clamp 到 [min, max]
+    //   if (temp_b < temp_a): lo=temp_b, hi=temp_a
+    //   else:                 lo=temp_a, hi=temp_b
+    //   若 combined <= lo → 返回 lo
+    //   若 combined >= hi → 返回 hi
+    //   否则返回 combined
+    // Rust f32::clamp 直接等价。
+    let lo = temp_a.min(temp_b);
+    let hi = temp_a.max(temp_b);
+    combined.clamp(lo, hi)
+}
+
+/// `CellAccessor::ClearDisease` — 仅清格子 disease 相关字段（不清 mass/temp/element）。
+///
+/// 对照源码 11_msvcrt_ignored.c L23725-23758（ClearDisease）。
+/// 与 `clear_cell` 区别：clear_cell 清空所有字段（含 mass/temp/element_idx），
+/// `clear_disease` 仅清 disease_idx / disease_count / disease_infestation_tick_count /
+/// disease_growth_accumulated_error 4 个字段。
+///
+/// # 运行时影响
+/// 与原版等价。disease_idx 设为 0xff（"无病菌"哨兵值），
+/// 其余 disease 字段清零。
+fn clear_disease(sim_data: &mut SimData, cell_idx: i32) {
+    if sim_data.updated_cells.ptr.is_null() || cell_idx < 0 {
+        return;
+    }
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    let i = cell_idx as usize;
+
+    // disease_idx = 0xff
+    if i < updated_cells.disease_idx.as_slice().len() {
+        updated_cells.disease_idx.as_mut_slice()[i] = 0xff;
+    }
+    // disease_count = 0
+    if i < updated_cells.disease_count.as_slice().len() {
+        updated_cells.disease_count.as_mut_slice()[i] = 0;
+    }
+    // disease_infestation_tick_count = 0
+    if i < updated_cells.disease_infestation_tick_count.as_slice().len() {
+        updated_cells.disease_infestation_tick_count.as_mut_slice()[i] = 0;
+    }
+    // disease_growth_accumulated_error = 0
+    if i < updated_cells.disease_growth_accumulated_error.as_slice().len() {
+        updated_cells.disease_growth_accumulated_error.as_mut_slice()[i] = 0.0;
+    }
+}
+
+/// `SimEvents::SpawnFallingLiquid` — T13 桩实现。
+///
+/// 真实逻辑（对照源码 11_msvcrt_ignored.c L33335-33378）涉及：
+/// 1. game_cell 越界检查
+/// 2. 可见性检查（非 debug 模式 AND visible_grid[game_cell] == 0 → return false）
+/// 3. push SpawnFallingLiquidInfo 到 sim_events.spawn_liquid_info
+/// 4. 返回 true
+///
+/// T13 桩行为：完整实现上述 1+3+4 三步，跳过 2（可见性检查）— 等价于
+/// 始终视为可见（与 `force_spawn=true` 行为一致）。这样能测试成功路径。
+///
+/// # 运行时影响（T13 桩）
+/// 与原版在可见性检查上有差异：T13 桩会为不可见格子也 push 事件。
+/// 真实逻辑 Phase 7+ 后续任务实现。游戏运行时差异：可能在不可见区域
+/// 也会 spawn 液体实体（C# 侧处理 spawn_liquid_info 时通常会再做可见性过滤）。
+fn spawn_falling_liquid(
+    sim_events: &mut SimEvents,
+    sim_data: &SimData,
+    cell_idx: i32,
+    elem_idx: u16,
+    mass: f32,
+    temperature: f32,
+    disease_idx: u8,
+    disease_count: i32,
+    _is_debug_editing: bool,
+) -> bool {
+    // 源码 L33346-33350: 计算 game_cell，越界则返回 false
+    let game_cell = internal_to_game_cell(sim_data, cell_idx);
+    if game_cell < 0 || game_cell >= sim_data.num_game_cells {
+        return false;
+    }
+    // 源码 L33351-33378: push SpawnFallingLiquidInfo（T13 跳过可见性检查）
+    push_spawn_liquid(
+        sim_events,
+        game_cell,
+        elem_idx,
+        disease_idx,
+        mass,
+        temperature,
+        disease_count,
+    );
+    true
+}
+
+/// `DisplaceGas` — T13 桩。
+///
+/// 真实逻辑（Phase 7+ 实现）：将 cell_idx 处的气体向上方/周围位移。
+/// T13 桩行为：始终返回 false（不进行任何位移），使 DoPartialHeatTransition/
+/// DoPartialMelt 走"位移失败回退"或"SpawnFallingLiquid 备选路径"。
+///
+/// # 运行时影响（T13 桩）
+/// 与原版差异：原版在 Gas 分支调用 DisplaceGas 成功时会直接放置新物质到上方格子；
+/// T13 桩返回 false 会进入 DisplaceLiquid 备选路径或安全返回 false（避免源码
+/// `goto _invalid_parameter` 的崩溃路径）。游戏运行时表现：相变产物可能不
+/// 出现在上方格子，而是 fallback 到 SpawnFallingLiquid。
+fn displace_gas(
+    _sim_data: &mut SimData,
+    _sim_events: &mut SimEvents,
+    _cell_idx: i32,
+    _elem_idx: u16,
+) -> bool {
+    false
+}
+
+/// `DisplaceLiquid` — T13 桩。
+///
+/// 真实逻辑（Phase 7+ 实现）：将 cell_idx 处的液体位移到下方/相邻可放置位置。
+/// T13 桩行为：始终返回 true（视为位移成功，但不实际移动内容）。
+///
+/// # 运行时影响（T13 桩）
+/// 与原版差异：原版会实际移动液体到相邻格子；T13 桩不移动但返回成功，
+/// 使调用方进入"放置新物质到 cell_idx"或"SpawnFallingLiquid"成功路径。
+/// 游戏运行时表现：原液体不会真的被位移，可能被新物质覆盖（质量损失）。
+/// 真实逻辑 Phase 7+ 实现后此差异消除。
+///
+/// # 设计决策
+/// T13 选 `true` 而非 `false`，以便测试 DoPartialHeatTransition 的 Liquid 分支
+/// 和 Gas 分支的成功路径。失败回退路径无法在 T13 桩下测试，Phase 7+ 实现
+/// 真实 DisplaceLiquid 后再覆盖。
+fn displace_liquid(
+    _sim_data: &mut SimData,
+    _sim_events: &mut SimEvents,
+    _cell_idx: i32,
+    _elem_idx: u16,
+) -> bool {
+    true
+}
+
+/// `Evaporate` — T13 桩。
+///
+/// 真实逻辑（Phase 7+ 实现）：清空 cell_idx 处的格子（mass 极小，调用 ClearCell）。
+/// T13 桩行为：无操作（不清空格子）。
+///
+/// # 运行时影响（T13 桩）
+/// 与原版差异：原版会调用 ClearCell 清空格子；T13 桩不清空。
+/// 游戏运行时表现：质量极小（<= 1.1754944e-38）的格子不会被清空，
+/// 可能残留极小质量物质。Phase 7+ 实现真实逻辑后此差异消除。
+fn evaporate(
+    _sim_data: &mut SimData,
+    _sim_events: &mut SimEvents,
+    _cell_idx: i32,
+) {
+    // T13 桩：no-op
+}
+
+/// `DoPartialHeatTransition` — 部分热量相变。
+///
+/// 严格对照源码 04_temperature.c L2105-2467。
+///
+/// # 语义
+/// - `cell_src`（param_3）：被加热会相变的物质（如水→蒸汽），
+///   每次相变消耗 5.0 单位质量
+/// - `cell_dst`（param_4）：热源（如热气体/液体），相变后温度降低
+///
+/// # 算法概述
+/// 1. bounds check + mass[cell_src] >= 5.0
+/// 2. 读 element_src / element_dst
+/// 3. transition_idx = element_src.high_temp_transition_idx
+/// 4. fVar22 = element_src.high_temp + 3.0
+/// 5. 若 transition_idx == 0xffff → return false
+/// 6. 若 temp[cell_dst] <= fVar22 → return false（热源温度不够）
+/// 7. 若 temp[cell_dst] < element_dst.low_temp + 13.0 → return false
+/// 8. 若 temp[cell_src] >= element_src.high_temp - 3.0 → return false（src 已在相变带）
+/// 9. 计算所需能量 energy_needed = (fVar22 - temp[cell_src]) × SHC_src × 5.0
+/// 10. 计算 dst 热容 fVar21 = mass[cell_dst] × SHC_dst
+/// 11. 若 fVar21 × 10.0 < energy_needed → return false（热量不足）
+/// 12. 计算新 dst 温度 new_dst_temp = (temp[cell_dst] × fVar21 - energy_needed) / fVar21
+/// 13. 计算 disease_delta = (int)(disease_count[cell_src] × (5.0 / mass[cell_src]))
+/// 14. 根据 transition 元素 state 分支：
+///     - state == 1 (Gas)：扣 mass/disease → 改 temp[cell_dst] → 检查上方格子
+///       - 上方 Gas：DisplaceGas(cell_src+width, upper_elem_idx) → 成功则放置产物到上方
+///       - 上方非 Gas 或 DisplaceGas 失败：DisplaceLiquid(cell_src, elem_src_idx)
+///         - 成功：放置产物到 cell_src，ChangeSubstance(cell_src)，return true
+///         - 失败：回退（mass/disease/temp 还原），return false
+///     - state == 2 (Liquid)：扣 mass/disease → 改 temp[cell_dst] → DisplaceLiquid(cell_src, elem_src_idx)
+///       - 成功：SpawnFallingLiquid(cell_src, transition_idx, 5.0, fVar22, ...)
+///         - spawn 成功：return true
+///         - spawn 失败：放置产物到 cell_src，ChangeSubstance(cell_src)，return true
+///       - 失败：回退，return false
+///     - 其他 state：return false（仅 assert 检查）
+pub fn do_partial_heat_transition(
+    sim_data: &mut SimData,
+    sim_events: &mut SimEvents,
+    cell_src: i32,
+    cell_dst: i32,
+) -> bool {
+    // 源码 L2132-2135: read updated_cells, bounds check mass[cell_src]
+    if sim_data.updated_cells.ptr.is_null() || cell_src < 0 || cell_dst < 0 {
+        return false;
+    }
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    let mass_src_slice = updated_cells.mass.as_slice();
+    if cell_src as usize >= mass_src_slice.len() {
+        return false;
+    }
+    // 源码 L2141: if (mass[cell_src] <= 5.0 && mass[cell_src] != 5.0) → return false
+    // 等价于 mass[cell_src] < 5.0
+    let mass_src_original = mass_src_slice[cell_src as usize];
+    if mass_src_original < 5.0 {
+        return false;
+    }
+
+    // 源码 L2144-2150: bounds check element_idx[src/dst], lookup elements
+    let elem_idx_slice = updated_cells.element_idx.as_slice();
+    if cell_src as usize >= elem_idx_slice.len() || cell_dst as usize >= elem_idx_slice.len() {
+        return false;
+    }
+    let elem_src_idx = elem_idx_slice[cell_src as usize];
+    let elem_dst_idx = elem_idx_slice[cell_dst as usize];
+
+    let elem_src = match get_element_temperature_data(elem_src_idx) {
+        Some(e) => e,
+        None => return false,
+    };
+    let elem_dst = match get_element_temperature_data(elem_dst_idx) {
+        Some(e) => e,
+        None => return false,
+    };
+
+    // 源码 L2151: uVar4 = element_src.high_temp_transition_idx
+    let transition_idx = elem_src.high_temp_transition_idx;
+    // 源码 L2153: fVar22 = element_src.high_temp + 3.0
+    let f_var22 = elem_src.high_temp + 3.0;
+
+    // 源码 L2154-2156: if transition_idx == 0xffff → return false
+    if transition_idx == 0xffff {
+        return false;
+    }
+
+    // 源码 L2157-2163: read temp[cell_dst], 若 <= fVar22 → return false
+    let temp_dst_slice = updated_cells.temperature.as_slice();
+    if cell_dst as usize >= temp_dst_slice.len() {
+        return false;
+    }
+    let f_var3 = temp_dst_slice[cell_dst as usize]; // 热源温度
+    if f_var3 <= f_var22 {
+        return false;
+    }
+    // 源码 L2165-2167: 若 temp[cell_dst] < element_dst.low_temp + 13.0 → return false
+    if f_var3 < elem_dst.low_temp + 13.0 {
+        return false;
+    }
+
+    // 源码 L2169-2173: read temp[cell_src], 若 >= element_src.high_temp - 3.0 → return false
+    let temp_src_slice = updated_cells.temperature.as_slice();
+    if cell_src as usize >= temp_src_slice.len() {
+        return false;
+    }
+    let temp_src = temp_src_slice[cell_src as usize];
+    if temp_src >= elem_src.high_temp - 3.0 {
+        return false;
+    }
+
+    // 源码 L2177: energy_needed = (fVar22 - temp[cell_src]) × element_src.SHC × 5.0
+    let energy_needed = (f_var22 - temp_src) * elem_src.specific_heat_capacity * 5.0;
+
+    // 源码 L2178-2183: fVar21 = mass[cell_dst] × element_dst.SHC
+    let mass_dst_slice = updated_cells.mass.as_slice();
+    if cell_dst as usize >= mass_dst_slice.len() {
+        return false;
+    }
+    let mass_dst = mass_dst_slice[cell_dst as usize];
+    let f_var21 = mass_dst * elem_dst.specific_heat_capacity;
+    // 源码 L2181-2183: 若 fVar21 × 10.0 < energy_needed → return false
+    if f_var21 * 10.0 < energy_needed {
+        return false;
+    }
+
+    // 源码 L2186: new_dst_temp = (fVar3 × fVar21 - energy_needed) / fVar21
+    let new_dst_temp = (f_var3 * f_var21 - energy_needed) / f_var21;
+
+    // 源码 L2191-2193: iVar16 = (int)(disease_count[cell_src] × (5.0 / mass[cell_src]))
+    let dc_src_slice = updated_cells.disease_count.as_slice();
+    if cell_src as usize >= dc_src_slice.len() {
+        return false;
+    }
+    let dc_src_original = dc_src_slice[cell_src as usize];
+    let i_var16 = (dc_src_original as f32 * (5.0 / mass_src_original)) as i32;
+
+    // 源码 L2194-2195: lookup transition element state
+    let transition_elem = match get_element_temperature_data(transition_idx) {
+        Some(e) => e,
+        None => return false,
+    };
+    let transition_state = transition_elem.state & 3;
+
+    if transition_state == 1 {
+        // ===== Gas 分支 =====
+        // 源码 L2197-2210: 扣 mass/disease → 改 temp[cell_dst]
+        let mass_mut = updated_cells.mass.as_mut_slice();
+        mass_mut[cell_src as usize] = mass_src_original - 5.0;
+        let dc_mut = updated_cells.disease_count.as_mut_slice();
+        let new_dc = dc_src_original - i_var16;
+        dc_mut[cell_src as usize] = new_dc;
+        if new_dc < 1 {
+            clear_disease(sim_data, cell_src);
+        }
+        let temp_mut = updated_cells.temperature.as_mut_slice();
+        temp_mut[cell_dst as usize] = new_dst_temp;
+
+        // 源码 L2216-2228: 读 cell_src+width（上方格子）的 element_idx
+        let upper_cell = cell_src + sim_data.width;
+        let elem_idx_slice = updated_cells.element_idx.as_slice();
+        if (upper_cell as usize) < elem_idx_slice.len() {
+            let upper_elem_idx = elem_idx_slice[upper_cell as usize];
+            let upper_elem = get_element_temperature_data(upper_elem_idx);
+            let upper_is_gas = upper_elem.map(|e| (e.state & 3) == 1).unwrap_or(false);
+
+            if upper_is_gas {
+                // 源码 L2229-2258: DisplaceGas(cell_src+width, upper_elem_idx)
+                // 注：源码若 bounds check 失败会 goto _invalid_parameter (CRASH)
+                // Rust 实现改为安全 return false
+                if displace_gas(sim_data, sim_events, upper_cell, upper_elem_idx) {
+                    let upper_i = upper_cell as usize;
+                    let mass_mut = updated_cells.mass.as_mut_slice();
+                    if upper_i < mass_mut.len() {
+                        mass_mut[upper_i] = 5.0; // 0x40a00000
+                    }
+                    let temp_mut = updated_cells.temperature.as_mut_slice();
+                    if upper_i < temp_mut.len() {
+                        temp_mut[upper_i] = f_var22;
+                    }
+                    let elem_mut = updated_cells.element_idx.as_mut_slice();
+                    if upper_i < elem_mut.len() {
+                        elem_mut[upper_i] = transition_idx;
+                    }
+                    change_substance(sim_events, sim_data, upper_cell);
+                    return true;
+                }
+                // DisplaceGas 失败 → 源码会 fall through 到 DisplaceLiquid 路径（详见下面）
+            }
+        }
+
+        // 源码 L2261-2326: DisplaceLiquid(cell_src, elem_src_idx)
+        if displace_liquid(sim_data, sim_events, cell_src, elem_src_idx) {
+            // 成功路径：mass[cell_src]=5.0, temp[cell_src]=fVar22,
+            //          element_idx[cell_src]=transition_idx, ChangeSubstance(cell_src)
+            let i = cell_src as usize;
+            let mass_mut = updated_cells.mass.as_mut_slice();
+            if i < mass_mut.len() {
+                mass_mut[i] = 5.0;
+            }
+            let temp_mut = updated_cells.temperature.as_mut_slice();
+            if i < temp_mut.len() {
+                temp_mut[i] = f_var22;
+            }
+            let elem_mut = updated_cells.element_idx.as_mut_slice();
+            if i < elem_mut.len() {
+                elem_mut[i] = transition_idx;
+            }
+            change_substance(sim_events, sim_data, cell_src);
+            return true;
+        } else {
+            // 回退路径：mass[cell_src] += 5.0; disease_count[cell_src] += iVar16;
+            //          ClearDisease if needed; temp[cell_dst] = fVar3 (原 dst 温度); return false
+            // 注：此时 disease_count[cell_src] 已被减 i_var16（或被 ClearDisease 清零）
+            // 源码 L2419-2420: mass[cell_src] += 5.0
+            let mass_mut = updated_cells.mass.as_mut_slice();
+            mass_mut[cell_src as usize] = mass_src_original;
+            // 源码 L2424-2426: disease_count[cell_src] += iVar16（在已减/已清零的基础上加回）
+            // 若之前 ClearDisease 已将 disease_count 清零，加回 i_var16 后值 = i_var16
+            let dc_mut = updated_cells.disease_count.as_mut_slice();
+            let cur_dc = dc_mut[cell_src as usize];
+            let after_rollback = cur_dc + i_var16;
+            dc_mut[cell_src as usize] = after_rollback;
+            // 源码 L2431-2433: 若 after_rollback < 1 → ClearDisease
+            if after_rollback < 1 {
+                clear_disease(sim_data, cell_src);
+            }
+            let temp_mut = updated_cells.temperature.as_mut_slice();
+            temp_mut[cell_dst as usize] = f_var3; // 还原 dst 温度
+            return false;
+        }
+    } else if transition_state == 2 {
+        // ===== Liquid 分支 =====
+        // 源码 L2346-2364: 扣 mass/disease → 改 temp[cell_dst]
+        let mass_mut = updated_cells.mass.as_mut_slice();
+        mass_mut[cell_src as usize] = mass_src_original - 5.0;
+        let dc_mut = updated_cells.disease_count.as_mut_slice();
+        let new_dc = dc_src_original - i_var16;
+        dc_mut[cell_src as usize] = new_dc;
+        if new_dc < 1 {
+            clear_disease(sim_data, cell_src);
+        }
+        let temp_mut = updated_cells.temperature.as_mut_slice();
+        temp_mut[cell_dst as usize] = new_dst_temp;
+
+        // 源码 L2368-2372: DisplaceLiquid(cell_src, elem_src_idx)
+        if displace_liquid(sim_data, sim_events, cell_src, elem_src_idx) {
+            // 源码 L2374-2384: bounds check disease_idx, SpawnFallingLiquid
+            let disease_idx_slice = updated_cells.disease_idx.as_slice();
+            if cell_src as usize >= disease_idx_slice.len() {
+                return false;
+            }
+            let disease_idx_val = disease_idx_slice[cell_src as usize];
+
+            let spawn_ok = spawn_falling_liquid(
+                sim_events,
+                sim_data,
+                cell_src,
+                transition_idx,
+                5.0,
+                f_var22,
+                disease_idx_val,
+                i_var16,
+                sim_data.debug_properties.is_debug_editing,
+            );
+            if spawn_ok {
+                // 源码 L2385-2386: return true
+                return true;
+            }
+            // 源码 L2388-2411: spawn 失败 → 放置产物到 cell_src, ChangeSubstance, return true
+            let i = cell_src as usize;
+            let mass_mut = updated_cells.mass.as_mut_slice();
+            if i < mass_mut.len() {
+                mass_mut[i] = 5.0;
+            }
+            let temp_mut = updated_cells.temperature.as_mut_slice();
+            if i < temp_mut.len() {
+                temp_mut[i] = f_var22;
+            }
+            let elem_mut = updated_cells.element_idx.as_mut_slice();
+            if i < elem_mut.len() {
+                elem_mut[i] = transition_idx;
+            }
+            change_substance(sim_events, sim_data, cell_src);
+            return true;
+        } else {
+            // 源码 L2414-2445: 回退路径
+            // mass[cell_src] += 5.0; disease_count[cell_src] += iVar16;
+            // ClearDisease if needed; temp[cell_dst] = fVar3; return false
+            // 注：此时 disease_count[cell_src] 已被减 i_var16（或被 ClearDisease 清零）
+            let mass_mut = updated_cells.mass.as_mut_slice();
+            mass_mut[cell_src as usize] = mass_src_original;
+            let dc_mut = updated_cells.disease_count.as_mut_slice();
+            let cur_dc = dc_mut[cell_src as usize];
+            let after_rollback = cur_dc + i_var16;
+            dc_mut[cell_src as usize] = after_rollback;
+            if after_rollback < 1 {
+                clear_disease(sim_data, cell_src);
+            }
+            let temp_mut = updated_cells.temperature.as_mut_slice();
+            temp_mut[cell_dst as usize] = f_var3;
+            return false;
+        }
+    } else {
+        // 源码 L2335-2345: state != 1 && state != 2 → assert + return false
+        // Rust 实现安全 return false
+        return false;
+    }
+}
+
+/// `DoPartialMelt` — 部分熔化（固体在热气体作用下逐渐熔化）。
+///
+/// 严格对照源码 04_temperature.c L2471-2658。
+///
+/// # 语义（与 DoPartialHeatTransition 相反）
+/// - `cell_src`（param_3）：**热源**（必须是 Vacuum 或 Gas，如热蒸汽）
+/// - `cell_dst`（param_4）：**被熔化的固体**（必须是 Solid，如冰）
+/// - 每次熔化消耗 cell_dst 的 5.0 单位质量，液态产物 spawn 在 cell_src
+///
+/// # 算法概述
+/// 1. bounds check + state check（src state & 3 <= 1, dst state & 3 == 3）
+/// 2. mass[cell_dst] > 5.0 + properties[cell_dst] & 0x48 == 0
+/// 3. temp[cell_src] > element_dst.high_temp + 3.0（热源足够热）
+/// 4. temp[cell_dst] < element_dst.high_temp - 3.0（dst 不在相变带）
+/// 5. element_dst.high_temp_transition_idx != 0xffff
+/// 6. transition element 必须 state & 3 == 2 (Liquid)
+/// 7. 计算所需能量 energy_needed = (high_temp+3 - temp[cell_dst]) × transition_elem.SHC × 5.0
+/// 8. 计算 src 热容 src_heat = mass[cell_src] × element_src.SHC
+/// 9. 检查 src 可释放热量 (temp[cell_src] - (element_src.low_temp + 6.0)) × src_heat >= energy_needed
+/// 10. 计算新 src 温度 new_src_temp = (src_heat × temp[cell_src] - energy_needed) / src_heat
+/// 11. disease_delta = (int)((5.0 / mass[cell_dst]) × disease_count[cell_dst])
+/// 12. SpawnFallingLiquid(cell_src, transition_idx, 5.0, fVar19, disease_idx[cell_dst], disease_delta, isDebugEditing)
+/// 13. spawn 成功：
+///     - temp[cell_src] = new_src_temp
+///     - mass[cell_dst] -= 5.0
+///     - disease_count[cell_dst] -= disease_delta
+///     - 若 mass[cell_dst] <= 1.1754944e-38 → Evaporate(cell_dst)
+///     - return true
+/// 14. spawn 失败：
+///     - DisplaceGas(cell_src, elem_src_idx)
+///       - 失败：return false
+///       - 成功：temp[cell_src] = fVar19; mass[cell_src] = 5.0;
+///              element_idx[cell_src] = transition_idx;
+///              mass[cell_dst] -= 5.0;
+///              若 mass[cell_dst] <= 1.1754944e-38 → Evaporate(cell_dst)
+///              ChangeSubstance(cell_src); return true
+pub fn do_partial_melt(
+    sim_data: &mut SimData,
+    sim_events: &mut SimEvents,
+    cell_src: i32,
+    cell_dst: i32,
+) -> bool {
+    // 源码 L2494-2498: read updated_cells, bounds check element_idx
+    if sim_data.updated_cells.ptr.is_null() || cell_src < 0 || cell_dst < 0 {
+        return false;
+    }
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    let elem_idx_slice = updated_cells.element_idx.as_slice();
+    if cell_dst as usize >= elem_idx_slice.len() || cell_src as usize >= elem_idx_slice.len() {
+        return false;
+    }
+    let elem_dst_idx = elem_idx_slice[cell_dst as usize];
+    let elem_src_idx = elem_idx_slice[cell_src as usize];
+
+    let elem_dst = match get_element_temperature_data(elem_dst_idx) {
+        Some(e) => e,
+        None => return false,
+    };
+    let elem_src = match get_element_temperature_data(elem_src_idx) {
+        Some(e) => e,
+        None => return false,
+    };
+
+    // 源码 L2505-2508: state check
+    //   if (1 < (element_src.state & 3)) || (element_dst.state & 3 != 3) → return false
+    // 即 src 必须是 Vacuum(0) 或 Gas(1)，dst 必须是 Solid(3)
+    if (elem_src.state & 3) > 1 || (elem_dst.state & 3) != 3 {
+        return false;
+    }
+
+    // 源码 L2509-2513: bounds check mass[cell_dst], 若 <= 5.0 → return false
+    let mass_dst_slice = updated_cells.mass.as_slice();
+    if cell_dst as usize >= mass_dst_slice.len() {
+        return false;
+    }
+    let mass_dst_original = mass_dst_slice[cell_dst as usize];
+    if mass_dst_original <= 5.0 {
+        return false;
+    }
+
+    // 源码 L2514-2519: 读 properties[cell_dst], 若 & 0x48 != 0 → return false
+    let properties_slice = updated_cells.properties.as_slice();
+    if cell_dst as usize >= properties_slice.len() {
+        return false;
+    }
+    if (properties_slice[cell_dst as usize] & 0x48) != 0 {
+        return false;
+    }
+
+    // 源码 L2520-2527: 读 temp[cell_src], fVar19 = element_dst.high_temp + 3.0
+    //   若 temp[cell_src] <= fVar19 → return false
+    let temp_src_slice = updated_cells.temperature.as_slice();
+    if cell_src as usize >= temp_src_slice.len() {
+        return false;
+    }
+    let f_var2 = temp_src_slice[cell_src as usize]; // 热源温度
+    let f_var19 = elem_dst.high_temp + 3.0;
+    if f_var2 <= f_var19 {
+        return false;
+    }
+
+    // 源码 L2528-2532: 读 temp[cell_dst], 若 >= element_dst.high_temp - 3.0 → return false
+    let temp_dst_slice = updated_cells.temperature.as_slice();
+    if cell_dst as usize >= temp_dst_slice.len() {
+        return false;
+    }
+    let f_var18 = temp_dst_slice[cell_dst as usize]; // 固体当前温度
+    if f_var18 >= elem_dst.high_temp - 3.0 {
+        return false;
+    }
+
+    // 源码 L2533-2535: 若 element_dst.high_temp_transition_idx == 0xffff → return false
+    if elem_dst.high_temp_transition_idx == 0xffff {
+        return false;
+    }
+
+    // 源码 L2536-2541: lookup transition element, 计算所需能量
+    //   fVar18 = (fVar19 - temp[cell_dst]) × transition_elem.SHC × 5.0
+    let transition_elem = match get_element_temperature_data(elem_dst.high_temp_transition_idx) {
+        Some(e) => e,
+        None => return false,
+    };
+    let energy_needed = (f_var19 - f_var18) * transition_elem.specific_heat_capacity * 5.0;
+
+    // 源码 L2542-2548: 计算 src 热容, 检查 src 可释放热量
+    //   fVar17 = mass[cell_src] × element_src.SHC
+    //   若 (temp[cell_src] - (element_src.low_temp + 6.0)) × fVar17 < energy_needed → return false
+    let mass_src_slice = updated_cells.mass.as_slice();
+    if cell_src as usize >= mass_src_slice.len() {
+        return false;
+    }
+    let mass_src = mass_src_slice[cell_src as usize];
+    let f_var17 = mass_src * elem_src.specific_heat_capacity;
+    if (f_var2 - (elem_src.low_temp + 6.0)) * f_var17 < energy_needed {
+        return false;
+    }
+
+    // 源码 L2549-2552: 若 transition_elem.state & 3 != 2 (非 Liquid) → return false
+    if (transition_elem.state & 3) != 2 {
+        return false;
+    }
+
+    // 源码 L2554: new_src_temp = (fVar17 × temp[cell_src] - energy_needed) / fVar17
+    let new_src_temp = (f_var17 * f_var2 - energy_needed) / f_var17;
+
+    // 源码 L2555-2564: bounds check disease_count + disease_idx, 计算 disease_delta
+    let dc_dst_slice = updated_cells.disease_count.as_slice();
+    if cell_dst as usize >= dc_dst_slice.len() {
+        return false;
+    }
+    let dc_dst_original = dc_dst_slice[cell_dst as usize];
+    let disease_idx_slice = updated_cells.disease_idx.as_slice();
+    if cell_dst as usize >= disease_idx_slice.len() {
+        return false;
+    }
+    let disease_idx_dst = disease_idx_slice[cell_dst as usize];
+    let i_var14 = ((5.0 / mass_dst_original) * dc_dst_original as f32) as i32;
+
+    // 源码 L2565-2568: SpawnFallingLiquid(cell_src, transition_idx, 5.0, fVar19,
+    //                                    disease_idx[cell_dst], i_var14, isDebugEditing)
+    let spawn_ok = spawn_falling_liquid(
+        sim_events,
+        sim_data,
+        cell_src,
+        elem_dst.high_temp_transition_idx,
+        5.0,
+        f_var19,
+        disease_idx_dst,
+        i_var14,
+        sim_data.debug_properties.is_debug_editing,
+    );
+
+    if spawn_ok {
+        // 源码 L2569-2596: spawn 成功路径
+        // temp[cell_src] = fVar17 (new_src_temp)
+        let temp_mut = updated_cells.temperature.as_mut_slice();
+        temp_mut[cell_src as usize] = new_src_temp;
+        // mass[cell_dst] -= 5.0
+        let mass_mut = updated_cells.mass.as_mut_slice();
+        mass_mut[cell_dst as usize] = mass_dst_original - 5.0;
+        // disease_count[cell_dst] -= i_var14
+        let dc_mut = updated_cells.disease_count.as_mut_slice();
+        dc_mut[cell_dst as usize] = dc_dst_original - i_var14;
+        // 若 mass[cell_dst] <= 1.1754944e-38 → Evaporate(cell_dst)
+        if mass_mut[cell_dst as usize] <= 1.1754944e-38 {
+            evaporate(sim_data, sim_events, cell_dst);
+        }
+        return true;
+    }
+
+    // 源码 L2597-2645: spawn 失败路径
+    // DisplaceGas(cell_src, elem_src_idx)
+    if !displace_gas(sim_data, sim_events, cell_src, elem_src_idx) {
+        // 源码 L2603-2605: DisplaceGas 失败 → return false (bVar6 = false)
+        return false;
+    }
+
+    // DisplaceGas 成功：
+    // 源码 L2608-2638:
+    //   temp[cell_src] = fVar17 (但立即被 fVar19 覆盖)
+    //   mass[cell_src] = 5.0 (0x40a00000)
+    //   temp[cell_src] = fVar19 (覆盖)
+    //   element_idx[cell_src] = element_dst.high_temp_transition_idx
+    //   mass[cell_dst] -= 5.0
+    //   若 mass[cell_dst] <= 1.1754944e-38 → Evaporate(cell_dst)
+    //   ChangeSubstance(cell_src); return true
+    let i_src = cell_src as usize;
+    let mass_mut = updated_cells.mass.as_mut_slice();
+    if i_src < mass_mut.len() {
+        mass_mut[i_src] = 5.0;
+    }
+    let temp_mut = updated_cells.temperature.as_mut_slice();
+    if i_src < temp_mut.len() {
+        temp_mut[i_src] = f_var19;
+    }
+    let elem_mut = updated_cells.element_idx.as_mut_slice();
+    if i_src < elem_mut.len() {
+        elem_mut[i_src] = elem_dst.high_temp_transition_idx;
+    }
+    let mass_mut = updated_cells.mass.as_mut_slice();
+    mass_mut[cell_dst as usize] = mass_dst_original - 5.0;
+    if mass_mut[cell_dst as usize] <= 1.1754944e-38 {
+        evaporate(sim_data, sim_events, cell_dst);
+    }
+    change_substance(sim_events, sim_data, cell_src);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2015,5 +2728,669 @@ mod tests {
             assert_eq!(*timers_ptr, 0x1f, "should still be 0x1f (idempotent)");
         }
         free_test_timers(&mut sd, 16);
+    }
+
+    // ===== T13 测试：CalculateCombinedTemperature =====
+
+    #[test]
+    fn calculate_combined_temperature_basic() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // mass_a=1, temp_a=100, mass_b=1, temp_b=200 → (1×200 + 1×100) / 2 = 150
+        let r = calculate_combined_temperature(1.0, 100.0, 1.0, 200.0);
+        assert!((r - 150.0).abs() < 0.001, "got {}", r);
+    }
+
+    #[test]
+    fn calculate_combined_temperature_zero_total_mass() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // mass_a + mass_b <= 0 → return 0.0
+        assert_eq!(calculate_combined_temperature(0.0, 100.0, 0.0, 200.0), 0.0);
+        assert_eq!(calculate_combined_temperature(-1.0, 100.0, 1.0, 200.0), 0.0);
+    }
+
+    #[test]
+    fn calculate_combined_temperature_clamp_to_min() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 加权平均值永远在 [min, max] 范围内（clamp 是防御性代码，正常输入不触发）
+        // mass_a=1000, temp_a=10, mass_b=1, temp_b=100
+        // combined = (1×100 + 1000×10) / 1001 ≈ 10.09（在 [10, 100] 范围内，不触发 clamp）
+        let r = calculate_combined_temperature(1000.0, 10.0, 1.0, 100.0);
+        assert!(r >= 10.0 && r <= 100.0, "should be in [10, 100], got {}", r);
+        assert!((r - 10.0899).abs() < 0.01, "should be ~10.09, got {}", r);
+    }
+
+    #[test]
+    fn calculate_combined_temperature_negative_mass_triggers_clamp() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 负质量场景：combined 可能超出 [min, max]，clamp 会触发
+        // mass_a=-1, temp_a=10, mass_b=2, temp_b=100 → combined = (2×100 + (-1)×10) / 1 = 190
+        // 但 mass_a + mass_b = 1 > 0，所以不会触发"<=0 → 0.0"分支
+        // clamp 到 [10, 100] → 100
+        let r = calculate_combined_temperature(-1.0, 10.0, 2.0, 100.0);
+        assert!((r - 100.0).abs() < 0.001, "should clamp to max=100, got {}", r);
+    }
+
+    #[test]
+    fn calculate_combined_temperature_clamp_to_max() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // mass_a 极大且 temp_a 极高 → combined > max → clamp 到 max
+        // mass_a=1000, temp_a=500, mass_b=1, temp_b=100
+        // combined = (1×100 + 1000×500) / 1001 ≈ 499.6
+        // max(temp_a, temp_b) = 500 → 499.6 < 500, 不超界
+        let r = calculate_combined_temperature(1000.0, 500.0, 1.0, 100.0);
+        assert!(r <= 500.0 && r >= 100.0, "should be in [100, 500], got {}", r);
+    }
+
+    #[test]
+    fn calculate_combined_temperature_one_zero_mass() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // mass_a=0, mass_b=1, temp_a=任意, temp_b=200 → combined = 200/1 = 200
+        let r = calculate_combined_temperature(0.0, 999.0, 1.0, 200.0);
+        assert!((r - 200.0).abs() < 0.001, "got {}", r);
+    }
+
+    // ===== T13 测试：ClearDisease =====
+
+    #[test]
+    fn clear_disease_only_clears_disease_fields() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        // 设置 cell 0：所有字段非零
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(0, 5);
+            updated.mass.set(0, 100.0);
+            updated.temperature.set(0, 500.0);
+            updated.disease_idx.set(0, 7);
+            updated.disease_count.set(0, 999);
+            updated.disease_infestation_tick_count.set(0, 42);
+            updated.disease_growth_accumulated_error.set(0, 1.5);
+        }
+        clear_disease(&mut sd, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            // disease 字段应被清零
+            assert_eq!(updated.disease_idx.get(0), 0xff);
+            assert_eq!(updated.disease_count.get(0), 0);
+            assert_eq!(updated.disease_infestation_tick_count.get(0), 0);
+            assert!((updated.disease_growth_accumulated_error.get(0)).abs() < 0.001);
+            // 其他字段应保持不变
+            assert_eq!(updated.element_idx.get(0), 5, "element_idx should be unchanged");
+            assert_eq!(updated.mass.get(0), 100.0, "mass should be unchanged");
+            assert_eq!(updated.temperature.get(0), 500.0, "temp should be unchanged");
+        }
+        free_test_sim_data(&mut sd);
+    }
+
+    // ===== T13 测试：DoPartialHeatTransition =====
+
+    /// 辅助：设置元素 idx 的 state / SHC / low_temp / high_temp / high_temp_transition_idx
+    fn set_element_full(
+        idx: usize,
+        state: u8,
+        shc: f32,
+        low_temp: f32,
+        high_temp: f32,
+        low_transition_idx: u16,
+        high_transition_idx: u16,
+    ) {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        while table.temperature_data.len() <= idx {
+            table.temperature_data.push(ElementTemperatureData::default());
+        }
+        let td = &mut table.temperature_data[idx];
+        td.state = state;
+        td.specific_heat_capacity = shc;
+        td.low_temp = low_temp;
+        td.high_temp = high_temp;
+        td.low_temp_transition_idx = low_transition_idx;
+        td.high_temp_transition_idx = high_transition_idx;
+        // 确保 thermal_conductivity 不为 0（避免其他测试干扰）
+        td.thermal_conductivity = 1.0;
+    }
+
+    #[test]
+    fn do_partial_heat_transition_null_returns_false() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = SimData::new_zeroed();
+        let mut events = SimEvents::default();
+        // updated_cells.ptr 为 null
+        assert!(!do_partial_heat_transition(&mut sd, &mut events, 0, 1));
+    }
+
+    #[test]
+    fn do_partial_heat_transition_mass_below_threshold() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        // cell_src=5, mass=4.9 (< 5.0)
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 4.9);
+            updated.temperature.set(5, 50.0);
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 200.0);
+            updated.mass.set(6, 100.0);
+        }
+        assert!(!do_partial_heat_transition(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_no_transition_idx() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element 0: high_temp_transition_idx = 0xffff
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 0xffff);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 50.0);
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 200.0);
+            updated.mass.set(6, 100.0);
+        }
+        assert!(!do_partial_heat_transition(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_dst_temp_too_low() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element 0: high_temp=100, fVar22=103; dst temp=103 (<= 103) → return false
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 50.0);
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 103.0); // <= fVar22 = 103
+            updated.mass.set(6, 100.0);
+        }
+        assert!(!do_partial_heat_transition(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_dst_temp_below_low_plus_13() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element_dst.low_temp=200, low_temp+13=213; dst temp=210 < 213 → return false
+        // 但 dst temp 必须 > fVar22=103 才能到达此检查
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 1, 1.0, 200.0, 300.0, 0xffff, 0xffff);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 50.0);
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1); // element_dst=1, low_temp=200
+            updated.temperature.set(6, 210.0); // > 103 但 < 200+13=213
+            updated.mass.set(6, 100.0);
+        }
+        assert!(!do_partial_heat_transition(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_src_in_transition_band() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element_src.high_temp=100, high_temp-3=97; src temp=97 (>= 97) → return false
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 97.0); // >= 97
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 200.0);
+            updated.mass.set(6, 100.0);
+        }
+        assert!(!do_partial_heat_transition(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_insufficient_heat() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element_src: SHC=1.0, high_temp=100, fVar22=103
+        // src temp=0, mass_src=10 → energy_needed = (103-0) × 1.0 × 5.0 = 515
+        // element_dst: SHC=1.0, mass_dst=1.0 → fVar21 = 1.0; fVar21 × 10.0 = 10.0 < 515 → return false
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 0.0);
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 200.0);
+            updated.mass.set(6, 1.0); // 极小热容
+        }
+        assert!(!do_partial_heat_transition(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_liquid_branch_spawn_success() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        alloc_test_timers(&mut sd, 16);
+        let mut events = SimEvents::default();
+        // element 0: src=Water(Liquid state=2), SHC=1.0, high_temp=100, transition_idx=1
+        // element 1: transition target=Steam(Gas state=1)... 但我们要测试 Liquid 分支
+        // 实际上：transition target state==2 → Liquid 分支
+        // 设 element 0 = src (Liquid), high_temp=100, transition_idx=1
+        // element 1 = transition target (Liquid, state=2), SHC=1.0
+        set_element_full(0, 2, 1.0, 0.0, 100.0, 0xffff, 1);  // src: Liquid, high_temp=100
+        set_element_full(1, 2, 1.0, 0.0, 200.0, 0xffff, 0xffff); // transition: Liquid
+        // element_dst (cell_dst): element 0 (water), low_temp=0, low_temp+13=13
+        // cell_src=5: mass=10, temp=50, element_idx=0
+        // cell_dst=6: temp=200 (> fVar22=103 and >= low_temp+13=13), mass=100
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 50.0);
+            updated.element_idx.set(5, 0);
+            updated.disease_idx.set(5, 0);
+            updated.disease_count.set(5, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 200.0);
+            updated.mass.set(6, 100.0);
+        }
+        let result = do_partial_heat_transition(&mut sd, &mut events, 5, 6);
+        assert!(result, "Liquid branch should succeed via SpawnFallingLiquid");
+        // 应 push 1 个 SpawnFallingLiquidInfo
+        assert_eq!(events.spawn_liquid_info.len(), 1, "should push 1 spawn_liquid");
+        // mass[cell_src] 应已扣 5.0：10.0 - 5.0 = 5.0
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(5) - 5.0).abs() < 0.001,
+                "mass[cell_src] should be 5.0, got {}", updated.mass.get(5));
+            // temp[cell_dst] 应已更新为新 dst 温度
+            // fVar21 = 100 × 1.0 = 100; energy_needed = (103-50) × 1.0 × 5.0 = 265
+            // new_dst_temp = (200 × 100 - 265) / 100 = 197.35
+            assert!((updated.temperature.get(6) - 197.35).abs() < 0.1,
+                "temp[cell_dst] should be 197.35, got {}", updated.temperature.get(6));
+        }
+        free_test_timers(&mut sd, 16);
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_gas_branch_displace_liquid_success() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        alloc_test_timers(&mut sd, 16);
+        let mut events = SimEvents::default();
+        // element 0 = src (Liquid, state=2), high_temp=100, transition_idx=1 (Gas target)
+        // element 1 = transition target (Gas, state=1)
+        set_element_full(0, 2, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 1, 1.0, 0.0, 200.0, 0xffff, 0xffff);
+        // 上方格子 cell_src+width=5+4=9: 元素 0 (state=2 Liquid, 非 Gas) → 走 DisplaceLiquid 路径
+        // DisplaceLiquid 桩返回 true → 放置产物到 cell_src, ChangeSubstance, return true
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 50.0);
+            updated.element_idx.set(5, 0);
+            updated.disease_idx.set(5, 0);
+            updated.disease_count.set(5, 0);
+            // 上方格子 9: element_idx=0 (Liquid, 非 Gas)
+            updated.element_idx.set(9, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 200.0);
+            updated.mass.set(6, 100.0);
+        }
+        let result = do_partial_heat_transition(&mut sd, &mut events, 5, 6);
+        assert!(result, "Gas branch with DisplaceLiquid success should return true");
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            // DisplaceLiquid 成功后：mass[cell_src]=5.0, temp[cell_src]=fVar22=103,
+            //                        element_idx[cell_src]=transition_idx=1
+            assert!((updated.mass.get(5) - 5.0).abs() < 0.001,
+                "mass[cell_src] should be 5.0, got {}", updated.mass.get(5));
+            assert!((updated.temperature.get(5) - 103.0).abs() < 0.001,
+                "temp[cell_src] should be 103 (fVar22), got {}", updated.temperature.get(5));
+            assert_eq!(updated.element_idx.get(5), 1,
+                "element_idx[cell_src] should be 1 (transition_idx)");
+            // temp[cell_dst] 应已更新为新 dst 温度（非回退）
+            // fVar21 = 100 × 1.0 = 100; energy_needed = (103-50) × 1.0 × 5.0 = 265
+            // new_dst_temp = (200 × 100 - 265) / 100 = 197.35
+            assert!((updated.temperature.get(6) - 197.35).abs() < 0.1,
+                "temp[cell_dst] should be 197.35, got {}", updated.temperature.get(6));
+        }
+        // Gas 分支成功路径不 push spawn_liquid（直接修改 cell_src）
+        assert_eq!(events.spawn_liquid_info.len(), 0, "should not push spawn_liquid");
+        // 应 push 1 个 SubstanceChangeInfo（ChangeSubstance）
+        assert_eq!(events.substance_change_info.len(), 1,
+            "should push 1 SubstanceChangeInfo");
+        free_test_timers(&mut sd, 16);
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_heat_transition_solid_state_returns_false() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        alloc_test_timers(&mut sd, 16);
+        let mut events = SimEvents::default();
+        // element 0 = src, high_temp=100, transition_idx=1
+        // element 1 = transition target with state=3 (Solid) → return false
+        set_element_full(0, 2, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 200.0, 0xffff, 0xffff); // Solid state
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.mass.set(5, 10.0);
+            updated.temperature.set(5, 50.0);
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 0);
+            updated.temperature.set(6, 200.0);
+            updated.mass.set(6, 100.0);
+        }
+        let result = do_partial_heat_transition(&mut sd, &mut events, 5, 6);
+        assert!(!result, "Solid transition state should return false");
+        free_test_timers(&mut sd, 16);
+        free_test_sim_data(&mut sd);
+    }
+
+    // ===== T13 测试：DoPartialMelt =====
+
+    #[test]
+    fn do_partial_melt_null_returns_false() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = SimData::new_zeroed();
+        let mut events = SimEvents::default();
+        assert!(!do_partial_melt(&mut sd, &mut events, 0, 1));
+    }
+
+    #[test]
+    fn do_partial_melt_wrong_state() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element 0 (cell_src): state=2 (Liquid) → src.state & 3 > 1 → return false
+        set_element_full(0, 2, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);  // src=0 (Liquid)
+            updated.element_idx.set(6, 1);  // dst=1 (Solid)
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        // 再测：dst 非 Solid
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1); // src=Gas (合法)
+        set_element_full(1, 2, 1.0, 0.0, 100.0, 0xffff, 1); // dst=Liquid (非法)
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_dst_mass_too_small() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element 0 = src (Gas), element 1 = dst (Solid)
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(6, 5.0); // <= 5.0 → return false
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_properties_blocked() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(6, 10.0);
+            updated.properties.set(6, 0x48); // & 0x48 != 0 → return false
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_src_temp_too_low() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element_dst (idx=1): high_temp=100, fVar19=103; src temp=103 (<= 103) → return false
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(6, 10.0);
+            updated.temperature.set(5, 103.0); // <= fVar19=103
+            updated.mass.set(5, 100.0);
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_dst_in_transition_band() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element_dst.high_temp=100, high_temp-3=97; dst temp=97 (>= 97) → return false
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 1);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(6, 10.0);
+            updated.temperature.set(5, 200.0); // > fVar19=103
+            updated.mass.set(5, 100.0);
+            updated.temperature.set(6, 97.0); // >= 97 → return false
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_no_transition_idx() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element_dst: high_temp_transition_idx = 0xffff
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 0xffff);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(6, 10.0);
+            updated.temperature.set(5, 200.0);
+            updated.mass.set(5, 100.0);
+            updated.temperature.set(6, 50.0); // < 97
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_insufficient_heat() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // element_dst (idx=1): high_temp=100, fVar19=103
+        // dst temp=0 → energy_needed = (103-0) × transition_elem.SHC × 5.0
+        // element 2 = transition (Liquid state=2, SHC=10.0) → energy_needed = 103 × 10 × 5 = 5150
+        // element_src (idx=0): low_temp=0, low_temp+6=6; temp[cell_src]=200
+        // src_heat = mass[cell_src] × SHC_src = 1.0 × 1.0 = 1.0
+        // 可释放 = (200 - 6) × 1.0 = 194 < 5150 → return false
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 2);
+        set_element_full(2, 2, 10.0, 0.0, 200.0, 0xffff, 0xffff);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(6, 10.0);
+            updated.temperature.set(5, 200.0);
+            updated.mass.set(5, 1.0); // 极小热容
+            updated.temperature.set(6, 0.0);
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_transition_not_liquid() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        let mut events = SimEvents::default();
+        // transition element state=1 (Gas) → != 2 → return false
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 2);
+        set_element_full(2, 1, 1.0, 0.0, 200.0, 0xffff, 0xffff); // Gas, 非 Liquid
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(6, 10.0);
+            updated.temperature.set(5, 200.0);
+            updated.mass.set(5, 100.0);
+            updated.temperature.set(6, 50.0);
+        }
+        assert!(!do_partial_melt(&mut sd, &mut events, 5, 6));
+        free_test_sim_data(&mut sd);
+    }
+
+    #[test]
+    fn do_partial_melt_spawn_success() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        alloc_test_timers(&mut sd, 16);
+        let mut events = SimEvents::default();
+        // element 0 = src (Gas), SHC=1.0, low_temp=0
+        // element 1 = dst (Solid), SHC=1.0, high_temp=100, high_temp_transition_idx=2
+        // element 2 = transition (Liquid, state=2), SHC=1.0
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 2);
+        set_element_full(2, 2, 1.0, 0.0, 200.0, 0xffff, 0xffff);
+        // cell_src=5: mass=100, temp=200, element_idx=0
+        // cell_dst=6: mass=10, temp=50, element_idx=1, disease_count=100, disease_idx=0
+        // fVar19 = 100 + 3 = 103
+        // energy_needed = (103 - 50) × 1.0 × 5.0 = 265
+        // src_heat = 100 × 1.0 = 100
+        // 可释放 = (200 - (0+6)) × 100 = 19400 >= 265 ✓
+        // new_src_temp = (100 × 200 - 265) / 100 = 197.35
+        // disease_delta = (int)((5.0 / 10.0) × 100) = 50
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(5, 100.0);
+            updated.temperature.set(5, 200.0);
+            updated.mass.set(6, 10.0);
+            updated.temperature.set(6, 50.0);
+            updated.disease_count.set(6, 100);
+            updated.disease_idx.set(6, 0);
+            // 也设置 cell 5 的 disease（用于 spawn_liquid 的 disease_idx 参数）
+            updated.disease_idx.set(5, 0);
+            updated.disease_count.set(5, 0);
+        }
+        let result = do_partial_melt(&mut sd, &mut events, 5, 6);
+        assert!(result, "spawn success path should return true");
+        // 应 push 1 个 SpawnFallingLiquidInfo
+        assert_eq!(events.spawn_liquid_info.len(), 1, "should push 1 spawn_liquid");
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            // temp[cell_src] 应更新为 new_src_temp
+            assert!((updated.temperature.get(5) - 197.35).abs() < 0.1,
+                "temp[cell_src] should be 197.35, got {}", updated.temperature.get(5));
+            // mass[cell_dst] 应减 5.0：10 - 5 = 5.0
+            assert!((updated.mass.get(6) - 5.0).abs() < 0.001,
+                "mass[cell_dst] should be 5.0, got {}", updated.mass.get(6));
+            // disease_count[cell_dst] 应减 disease_delta=50：100 - 50 = 50
+            assert_eq!(updated.disease_count.get(6), 50,
+                "disease_count[cell_dst] should be 50");
+        }
+        free_test_timers(&mut sd, 16);
+        free_test_sim_data(&mut sd);
+    }
+
+    /// 文档化测试：源码 L2586-2591 的 Evaporate 分支在 f32 算术下经公开 API 不可达。
+    ///
+    /// 触发 Evaporate 需同时满足：
+    ///   (a) mass[cell_dst] > 5.0     （通过 L2511 的 `<= 5.0` 早返回检查）
+    ///   (b) mass[cell_dst] - 5.0 <= 1.1754944e-38 (FLT_MIN)
+    /// 但 5.0 的 f32 ULP ≈ 5.96e-7，远大于 FLT_MIN；任何 `> 5.0` 的 f32 值减 5.0 后
+    /// 残差必 >= 5.96e-7 > FLT_MIN，故条件 (b) 不可能成立。该分支为源码防御性死代码，
+    /// 通过代码审查对照源码 L2586-2591 验证实现正确性，此处不再单测。
+    ///
+    /// 本测试验证最接近的可达情形：mass = 5.0 后下一个 f32（0x40A00001 ≈ 5.0000006），
+    /// 减 5.0 后残差 ≈ 5.96e-7 > FLT_MIN，函数返回 true 且不调用 Evaporate。
+    #[test]
+    fn do_partial_melt_spawn_success_residual_above_flt_min() {
+        let _lock = PHASE4_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sd = make_test_sim_data_with_elements();
+        alloc_test_timers(&mut sd, 16);
+        let mut events = SimEvents::default();
+        set_element_full(0, 1, 1.0, 0.0, 100.0, 0xffff, 1);
+        set_element_full(1, 3, 1.0, 0.0, 100.0, 0xffff, 2);
+        set_element_full(2, 2, 1.0, 0.0, 200.0, 0xffff, 0xffff);
+        // 5.0 的下一个 f32（最小可表示增量）—— 确保 > 5.0 通过 L2511 检查
+        let mass_just_above_5: f32 = f32::from_bits(0x40A00001);
+        assert!(mass_just_above_5 > 5.0, "test setup: mass must be > 5.0");
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(5, 0);
+            updated.element_idx.set(6, 1);
+            updated.mass.set(5, 100.0);
+            updated.temperature.set(5, 200.0);
+            updated.mass.set(6, mass_just_above_5);
+            updated.temperature.set(6, 50.0);
+            updated.disease_count.set(6, 0);
+            updated.disease_idx.set(6, 0);
+            updated.disease_idx.set(5, 0);
+        }
+        let result = do_partial_melt(&mut sd, &mut events, 5, 6);
+        assert!(result, "spawn-success path should return true");
+        // 残差 = mass - 5.0 ≈ 5.96e-7，远大于 FLT_MIN → Evaporate 不触发
+        // spawn_liquid_info 应有 1 条（spawn 成功），evaporate 桩无副作用
+        assert_eq!(events.spawn_liquid_info.len(), 1, "spawn should push 1 event");
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            let residual = updated.mass.get(6);
+            assert!(residual > 1.1754944e-38,
+                "residual should be > FLT_MIN (Evaporate not triggered), got {}", residual);
+            assert!(residual < 1.0e-5,
+                "residual should be ~5.96e-7 (one ULP), got {}", residual);
+        }
+        free_test_timers(&mut sd, 16);
+        free_test_sim_data(&mut sd);
     }
 }

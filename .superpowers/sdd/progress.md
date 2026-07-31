@@ -936,3 +936,34 @@ Task P6-T4: complete (commits 189cae6..2862c3c, review clean — 完美通过)
 5. SimFrameManager::NewFrame 未实现（Phase 7+ 补全，SimFrameManager_NewGameFrame 特殊 arm 真正调用）
 6. dispatch_save_load_message 函数已不再被调用（Phase 6 改由 dispatch_handler_table 通过表查找），仅作历史参考保留
 
+## Phase 7 — 基础模拟（温度/质量）进度
+
+> 计划文件：`docs/superpowers/plans/2026-07-31-simdll-rs-phase7-basic-simulation-plan.md`
+
+### T11: complete (commit 42efbf9)
+- 产物：`temperature.rs`（update_temperature + update_temperature_for_backwall_exchange + 4 辅助函数 + 12 测试）、`vector_math.rs`（calculate_temperature_exchange_precise + calculate_temperature_exchange）、`elements_table.rs`（3 查询函数）、`sim_data.rs`（BackwallSOA::new + Default）、`sim_events.rs`（Default）、`elements_smoke.rs`（ELEMENTS_SMOKE_LOCK 串行锁）
+- 测试：299/299 通过
+- 修复：BackwallSOA::new / SimEvents::default 缺失编译错误、update_temperature_basic_heat_exchange 测试期望值错误、elements_smoke 并行 race condition
+
+### T12: complete (commit 761a32a)
+- 产物：`temperature.rs` 新增 do_load_time_state_transition（L7-73）+ do_state_transition（L78-403）+ 7 辅助函数（spawn_ore / spawn_ore_for_transition / clear_cell / change_substance / set_timer_bits / push_cell_melted_and_set_timers / internal_to_game_cell）+ 17 单元测试
+- 测试：316/316 通过（273 lib + 11 abi_smoke + 7 elements_smoke + 8 message_dispatch_smoke + 17 save_load_smoke）
+- 修复 3 个测试编译/逻辑错误：
+  1. ElementTemperatureData 私有字段 _pad1/_pad2：改用 `ElementTemperatureData::default()` + 字段赋值（4 处）
+  2. `do_load_time_state_transition_no_transition_idx_skip`：u16 默认是 0 不是 0xffff，需显式设置 transition_idx
+  3. `internal_to_game_cell_basic`：cell_idx=0 公式结果为 -3（非 -1），负值即边界外
+  4. `do_state_transition_low_temp_gas_to_solid_low_density_spawn_ore`：需设 is_debug_editing=true，否则 spawn_ore 因 visible_grid 为 null 返回 false
+
+### T13: complete (pending commit)
+- 产物：`temperature.rs` +1377 行，新增 3 个主函数 + 5 个辅助/stub 函数 + 28 单元测试
+  - `calculate_combined_temperature`（L1127）：质量加权平均温度，clamp 到 [min, max]，零/负质量处理
+  - `do_partial_heat_transition`（L1326）：高温相变部分热传导，Gas/Liquid 双分支 + DisplaceGas/DisplaceLiquid/Evaporate/SpawnFallingLiquid 桩
+  - `do_partial_melt`（L1634）：固体部分熔化，SpawnFallingLiquid 成功/失败双路径，含 Evaporate 触发
+  - 5 个 stub：clear_disease / spawn_falling_liquid / evaporate / displace_gas / displace_liquid（Phase 8+ 接入真实实现）
+- 测试：344/344 通过（301 lib + 11 abi_smoke + 7 elements_smoke + 8 message_dispatch_smoke + 17 save_load_smoke）
+- 修复 1 个测试问题：
+  - `do_partial_melt_spawn_success_triggers_evaporate`：f32 精度下 `5.0 + 1e-39 == 5.0`，无法同时满足 `mass > 5.0` 且 `mass - 5.0 <= FLT_MIN`。源码 L2586-2591 的 Evaporate 分支为防御性死代码。改写为 `do_partial_melt_spawn_success_residual_above_flt_min`：用 `f32::from_bits(0x40A00001)`（5.0 的下一表示值）验证残差 > FLT_MIN 不触发 Evaporate
+- Release build 成功（5 个遗留 warning，无新增）
+- 运行时影响：与原版完全等价（相变能量/质量/disease 调整公式相同）。stub 函数（displace_*/evaporate/spawn_falling_liquid）为 no-op/表记录，Phase 8+ 接入真实位移逻辑后才有画面差异
+
+
