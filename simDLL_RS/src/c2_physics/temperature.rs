@@ -7,6 +7,10 @@
 
 use crate::a_framework::game_data::SpawnOreInfo;
 use crate::a_framework::sim_data::SimData;
+use crate::b_elements::element::{ElementTemperatureData, INVALID_ELEMENT_INDEX};
+use crate::b_elements::elements_table::{get_element_by_idx, get_element_temperature_data};
+use crate::c2_physics::liquid_flow::{clear_cell, push_substance_change};
+use crate::a_framework::game_data::{CellMeltedInfo, SpawnFallingLiquidInfo};
 
 /// SimEvents::SpawnOre（原版 L133682-133737）。只推事件，不扣质量/疾病（调用方扣）。
 ///
@@ -52,17 +56,285 @@ pub(crate) fn spawn_ore(
     true
 }
 
+/// DoStateTransition（原版 L133261-133737）。每格换热/升温后调用，返回是否发生转变。
+///
+/// - 高温侧（T ≥ highTemp+3 且 highTempTransitionIdx 有效）：温度= max(0,T-1.5)，元素切换，
+///   矿渣扣质量/疾病；`updated.properties[cell] & 0x40` → cellMeltedInfo + timers |= 0x1F；ChangeSubstance。
+/// - 低温侧（T < lowTemp-3 且 lowTempTransitionIdx 有效）：温度= max(0,T+1.5)，矿渣扣减；
+///   目标固态且 mass/default_mass ≤ 0.8 → 清格出矿渣；否则保格切换；
+///   目标非固态且上格非固态+可见 → 液滴事件 + 清格；否则保格切换。
+pub(crate) fn do_state_transition(
+    sim: &mut SimData,
+    cell: usize,
+    etd: &ElementTemperatureData,
+) -> bool {
+    if sim.updated_cells.ptr.is_null() {
+        return false;
+    }
+    let width = sim.width as usize;
+    let game_w = (width as i32) - 2;
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if cell >= updated.mass.len() || updated.mass.get(cell) <= 0.0 {
+        return false;
+    }
+    let t = updated.temperature.get(cell);
+    let game_cell_of = |c: usize| -> i32 {
+        let row = c / width;
+        let col = c % width;
+        (row as i32 - 1) * game_w + col as i32 - 1
+    };
+
+    if t >= etd.low_temp - 3.0 || etd.low_temp_transition_idx == INVALID_ELEMENT_INDEX {
+        // 高温侧（沸腾/熔化）
+        if t <= etd.high_temp + 3.0 || etd.high_temp_transition_idx == INVALID_ELEMENT_INDEX {
+            return false;
+        }
+        updated.temperature.set(cell, (t - 1.5).max(0.0));
+        updated.element_idx.set(cell, etd.high_temp_transition_idx);
+        if etd.high_temp_transition_ore_idx != INVALID_ELEMENT_INDEX {
+            let ore_mass = etd.high_temp_transition_ore_mass_conversion * updated.mass.get(cell);
+            if ore_mass > 0.001 {
+                let converted =
+                    (updated.disease_count.get(cell) as f32 * etd.high_temp_transition_ore_mass_conversion)
+                        as i32;
+                if spawn_ore(
+                    sim,
+                    cell,
+                    etd.high_temp_transition_ore_idx,
+                    ore_mass,
+                    updated.temperature.get(cell),
+                    updated.disease_idx.get(cell),
+                    converted,
+                    true,
+                ) {
+                    updated.mass.set(cell, updated.mass.get(cell) - ore_mass);
+                    updated.disease_count.set(cell, updated.disease_count.get(cell) - converted);
+                }
+            }
+        }
+        if updated.properties.get(cell) & 0x40 != 0 {
+            let gc = game_cell_of(cell);
+            if gc >= 0 && gc < sim.num_game_cells {
+                let events = unsafe { &mut *sim.sim_events.ptr };
+                events.cell_melted_info.push(CellMeltedInfo { game_cell: gc as u32 });
+                if !sim.timers.ptr.is_null() {
+                    unsafe {
+                        (*sim.timers.ptr.offset(cell as isize)).stable_cell_ticks |= 0x1F;
+                    }
+                }
+            }
+        }
+        push_substance_change(sim, cell);
+        return true;
+    }
+
+    // 低温侧（冻结/冷凝）
+    updated.temperature.set(cell, (t + 1.5).max(0.0));
+    if etd.low_temp_transition_ore_idx != INVALID_ELEMENT_INDEX {
+        let ore_mass = etd.low_temp_transition_ore_mass_conversion * updated.mass.get(cell);
+        if ore_mass > 0.001 {
+            let converted =
+                (updated.disease_count.get(cell) as f32 * etd.low_temp_transition_ore_mass_conversion)
+                    as i32;
+            if spawn_ore(
+                sim,
+                cell,
+                etd.low_temp_transition_ore_idx,
+                ore_mass,
+                updated.temperature.get(cell),
+                updated.disease_idx.get(cell),
+                converted,
+                true,
+            ) {
+                updated.mass.set(cell, updated.mass.get(cell) - ore_mass);
+                updated.disease_count.set(cell, updated.disease_count.get(cell) - converted);
+            }
+        }
+    }
+    let Some(transition_etd) = get_element_temperature_data(etd.low_temp_transition_idx) else {
+        push_substance_change(sim, cell);
+        return true;
+    };
+    if transition_etd.state & 3 == 3 {
+        // 目标固态：质量比 ≤ 0.8 → 清格出矿渣；否则保格切换
+        let mass = updated.mass.get(cell);
+        if mass / transition_etd.default_mass <= 0.8
+            && spawn_ore(
+                sim,
+                cell,
+                etd.low_temp_transition_idx,
+                mass,
+                updated.temperature.get(cell),
+                updated.disease_idx.get(cell),
+                updated.disease_count.get(cell),
+                sim.debug_properties.is_debug_editing,
+            )
+        {
+            clear_cell(sim, updated, cell);
+            push_substance_change(sim, cell);
+            return true;
+        }
+        updated.element_idx.set(cell, etd.low_temp_transition_idx);
+        push_substance_change(sim, cell);
+        return true;
+    }
+    // 目标非固态：上格（稳定缓冲 cells.properties）非固态且可见 → 液滴事件 + 清格
+    if !sim.headless && cell >= width {
+        let above = cell - width;
+        let cells = unsafe { &*sim.cells.ptr };
+        if above < cells.properties.len() && cells.properties.get(above) & 2 == 0 {
+            let gc = game_cell_of(cell);
+            let visible = sim.visible_grid.ptr.is_null()
+                || unsafe { *sim.visible_grid.ptr.add(gc as usize) } != 0
+                || sim.debug_properties.is_debug_editing;
+            if visible {
+                if let Some(elem) = get_element_by_idx(etd.low_temp_transition_idx) {
+                    if elem.low_temp - 3.0 <= t && t <= elem.high_temp + 3.0 {
+                        let events = unsafe { &mut *sim.sim_events.ptr };
+                        events.spawn_liquid_info.push(SpawnFallingLiquidInfo {
+                            cell_idx: gc,
+                            element_idx: etd.low_temp_transition_idx,
+                            disease_idx: updated.disease_idx.get(cell),
+                            pad: 0,
+                            mass: updated.mass.get(cell),
+                            temperature: updated.temperature.get(cell),
+                            disease_count: updated.disease_count.get(cell),
+                        });
+                        clear_cell(sim, updated, cell);
+                        push_substance_change(sim, cell);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    updated.element_idx.set(cell, etd.low_temp_transition_idx);
+    push_substance_change(sim, cell);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::a_framework::sim_data::SimData;
+    use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
+    use crate::b_elements::element::Element;
     use crate::LIB_TESTS_LOCK;
 
     fn make_sim() -> SimData {
-        let mut sd = SimData::new_for_allocate(6, 6, 1, false, true);
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
         sd.vacuum_element_idx = 0;
         sd.void_element_idx = 0xFFFF;
         sd
+    }
+
+    /// 元素表：dummy(0) / 水 water(1) / 冰 ice(2) / 蒸汽 steam(3)。
+    fn init_phase_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.temperature_data.clear();
+
+        let mut water = ElementTemperatureData::default();
+        water.state = 2;
+        water.low_temp = 0.0;
+        water.high_temp = 100.0;
+        water.low_temp_transition_idx = 2; // → 冰
+        water.high_temp_transition_idx = 3; // → 蒸汽
+
+        let mut ice = ElementTemperatureData::default();
+        ice.state = 3;
+        ice.default_mass = 1000.0;
+
+        let mut steam = ElementTemperatureData::default();
+        steam.state = 1;
+        steam.low_temp_transition_idx = 1; // → 水
+        steam.low_temp = 100.0;
+        steam.high_temp = 999.0;
+
+        table.temperature_data.push(ElementTemperatureData::default()); // 0 dummy
+        table.temperature_data.push(water); // 1
+        table.temperature_data.push(ice); // 2
+        table.temperature_data.push(steam); // 3
+
+        let mut e_water = Element::default();
+        e_water.state = 2;
+        e_water.low_temp = 0.0;
+        e_water.high_temp = 100.0;
+        let mut e_ice = Element::default();
+        e_ice.state = 3;
+        let mut e_steam = Element::default();
+        e_steam.state = 1;
+        e_steam.low_temp = 100.0;
+        e_steam.high_temp = 999.0;
+        table.elements.push(Element::default()); // 0 dummy
+        table.elements.push(e_water); // 1
+        table.elements.push(e_ice); // 2
+        table.elements.push(e_steam); // 3
+    }
+
+    fn fill(sd: &mut SimData, cell: usize, elem: u16, mass: f32, temp: f32) {
+        let u = unsafe { &mut *sd.updated_cells.ptr };
+        u.element_idx.set(cell, elem);
+        u.mass.set(cell, mass);
+        u.temperature.set(cell, temp);
+    }
+
+    #[test]
+    fn high_transition_switches_element_and_emits_substance_change() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 1, 10.0, 105.0); // 水 105℃ ≥ high+3
+        let etd = get_element_temperature_data(1).unwrap();
+        assert!(do_state_transition(&mut sd, 14, &etd));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 3); // → 蒸汽
+        assert!((u.temperature.get(14) - 103.5).abs() < 1e-4); // max(0, 105-1.5)
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.substance_change_info.len(), 1);
+    }
+
+    #[test]
+    fn low_transition_solid_clears_cell_when_mass_ratio_small() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 1, 100.0, -5.0); // 水 -5℃ < low-3，低变=冰（固态）
+        let etd = get_element_temperature_data(1).unwrap();
+        assert!(do_state_transition(&mut sd, 14, &etd));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        // 100/1000 = 0.1 ≤ 0.8 → 清格出矿渣（spawn_ore_info 1 条，格子变 vacuum）
+        assert_eq!(u.element_idx.get(14), sd.vacuum_element_idx);
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.spawn_ore_info.len(), 1);
+        assert_eq!(events.spawn_ore_info.get(0).elem_idx, 2);
+    }
+
+    #[test]
+    fn low_transition_non_solid_drips_liquid_when_visible() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 20, 3, 5.0, 95.0); // 蒸汽 95℃ < low-3，低变=水（非固态）
+        let etd = get_element_temperature_data(3).unwrap();
+        assert!(do_state_transition(&mut sd, 20, &etd));
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.spawn_liquid_info.len(), 1, "可见且上格非固态 → 液滴");
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(20), sd.vacuum_element_idx);
+    }
+
+    #[test]
+    fn transition_gate_keeps_within_plus_minus_three() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 1, 10.0, 102.9); // 100+3 内 → 不转变
+        let etd = get_element_temperature_data(1).unwrap();
+        assert!(!do_state_transition(&mut sd, 14, &etd));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 1);
+        assert_eq!(u.temperature.get(14), 102.9);
     }
 
     #[test]
