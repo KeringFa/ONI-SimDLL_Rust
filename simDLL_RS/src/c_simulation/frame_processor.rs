@@ -1035,6 +1035,25 @@ fn process_building_heat_exchange_messages(frame: &mut SimFrameInfo, sim_data: &
     }
 
     {
+        // ModifyBuildingEnergy 消费（原版 L115484-115540：modifies 之后、removes 之前）。
+        // 16B 消息 {handle i32, deltaKJ f32, minTemperature f32, maxTemperature f32}。
+        let bytes = frame.modify_building_energy_messages.as_slice();
+        let n = bytes.len() / 16;
+        for i in 0..n {
+            let off = i * 16;
+            let handle = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let delta_kj = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            let min_temp = f32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+            let max_temp = f32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap());
+            let ok = crate::c_simulation::building_temperature::modify_building_energy(
+                handle, delta_kj, min_temp, max_temp,
+            );
+            tracing::debug!(handle, ok, "modify_building_energy consumed");
+        }
+        frame.modify_building_energy_messages.clear_keep_capacity();
+    }
+
+    {
         let removes = frame.building_heat_exchange_messages.removes.as_slice();
         let n = removes.len() / 8;
         for i in 0..n {

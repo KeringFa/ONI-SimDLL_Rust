@@ -203,6 +203,42 @@ impl BuildingTemperatureManager {
         true
     }
 
+    /// ModifyBuildingEnergy 消费（原版 L115484-115540）。
+    /// 返回 false 仅表示消息被跳过（坏句柄或钳制范围越出 [0,10000]）；
+    /// 非法终温时原版仅告警不写回（消息已消费，返回 true）。
+    pub fn modify_building_energy(
+        &mut self,
+        handle: i32,
+        delta_kj: f32,
+        min_temperature: f32,
+        max_temperature: f32,
+    ) -> bool {
+        let Some(record) = self.get_mut(handle) else {
+            return false;
+        };
+        let f = record.temperature;
+        let clamp_low = f.min(min_temperature);
+        let clamp_high = f.max(max_temperature);
+        if clamp_low >= 0.0 && clamp_high <= 10000.0 {
+            let area = (record.sim_max_x - record.sim_min_x) as f32
+                * (record.sim_max_y - record.sim_min_y) as f32;
+            let mut f2 = f + delta_kj / (area * record.per_cell_heat_capacity);
+            f2 = f2.max(clamp_low).min(clamp_high);
+            if f2 <= 0.0 || f2 >= 10000.0 {
+                tracing::warn!(
+                    handle,
+                    delta_kj,
+                    f2,
+                    "Invalid final temperature in ProcessBuildingHeatExchangeMessages"
+                );
+            } else {
+                record.temperature = f2;
+            }
+            return true;
+        }
+        false
+    }
+
     /// 释放句柄（原版 RemoveBuildingHeatExchange 处理；swap-remove 数据槽）。
     pub fn remove(&mut self, handle: i32) -> bool {
         let index = (handle & 0xffffff) as usize;
@@ -269,6 +305,13 @@ pub fn add_building(msg: &AddBuildingHeatExchangeMsg) -> i32 {
 /// 处理 ModifyBuildingHeatExchange 消息。
 pub fn modify_building(handle: i32, msg: &AddBuildingHeatExchangeMsg) -> bool {
     BUILDING_TEMPERATURE_MANAGER.lock().modify(handle, msg)
+}
+
+/// 处理 ModifyBuildingEnergy 消息（建筑产热）。
+pub fn modify_building_energy(handle: i32, delta_kj: f32, min_temp: f32, max_temp: f32) -> bool {
+    BUILDING_TEMPERATURE_MANAGER
+        .lock()
+        .modify_building_energy(handle, delta_kj, min_temp, max_temp)
 }
 
 /// 处理 RemoveBuildingHeatExchange 消息。
@@ -455,5 +498,38 @@ mod tests {
         let mut bad_elem = add_msg(10, 300.0);
         bad_elem.elem_idx = 0xffff;
         assert!(build_record_from_msg(&bad_elem).is_none());
+    }
+
+    #[test]
+    fn modify_building_energy_applies_delta_and_clamps() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let mut mgr = BuildingTemperatureManager::new();
+        let mut msg = add_msg(10, 300.0);
+        msg.mass = 100.0;
+        msg.min_x = 0;
+        msg.min_y = 0;
+        msg.max_x = 2;
+        msg.max_y = 2; // 面积 4 → perCellHC = 2×100/4 = 50
+        let h = mgr.add(&msg);
+        // delta = perCellHC×面积×1℃ = 50×4×1 = 200 → +1℃
+        assert!(mgr.modify_building_energy(h, 200.0, 0.0, 10000.0));
+        assert!((mgr.record(h).unwrap().temperature - 301.0).abs() < 1e-3);
+        // 钳制到 msg.max=350
+        assert!(mgr.modify_building_energy(h, 1e6, 0.0, 350.0));
+        assert!((mgr.record(h).unwrap().temperature - 350.0).abs() < 1e-3);
+        // 坏句柄（版本不符）
+        assert!(!mgr.modify_building_energy(h + (1 << 24), 200.0, 0.0, 10000.0));
+    }
+
+    #[test]
+    fn modify_building_energy_rejects_invalid_final_temperature() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let mut mgr = BuildingTemperatureManager::new();
+        let h = mgr.add(&add_msg(10, 300.0)); // 面积 1，perCellHC = 200
+        // 钳到 [0,10000] 上界 → 非法温度 → 不写回
+        assert!(mgr.modify_building_energy(h, 1e10, 0.0, 10000.0));
+        assert!((mgr.record(h).unwrap().temperature - 300.0).abs() < 1e-3);
     }
 }
