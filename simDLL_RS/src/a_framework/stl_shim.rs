@@ -1,0 +1,480 @@
+//! MSVC STL 容器的 Rust 等价物
+//!
+//! 对照源码 00_types_reference.c 中的 STL 容器定义。
+//! A1 阶段定义内存布局；A2 阶段为 MsvcVector 添加方法（resize/clear/push 等）。
+//! B1 阶段放宽 MsvcVector 方法约束：无约束块（new/is_empty/len/as_slice/set/erase）
+//! 与有约束块（get/resize/clear/push，需 T: Default + Copy）分离，支持非 Copy 类型
+//! （如 DiseaseInfo）作为 MsvcVector 元素。
+//!
+//! **关键**：MsvcVector 是 32B（4 指针），不是 24B。
+//! 原因：simDLL.dll 编译时启用 _ITERATOR_DEBUG_LEVEL >= 1，
+//! MSVC std::vector 多出 8B _Container_proxy* 头部。
+
+use std::os::raw::c_void;
+use std::alloc::{alloc, dealloc, Layout};
+
+/// MSVC std::vector 等价物（32 字节）。
+///
+/// 内部布局：_Container_proxy* + _First + _Last + _End（4 个 8 字节指针）。
+#[repr(C)]
+pub struct MsvcVector<T> {
+    pub container_proxy: *mut c_void,  // _Container_proxy*（IDL 头部）
+    pub begin: *mut T,                 // _First
+    pub end: *mut T,                   // _Last
+    pub capacity_end: *mut T,          // _End
+}
+
+/// 无约束方法：仅依赖指针运算，不需要 T: Default + Copy。
+impl<T> MsvcVector<T> {
+    /// 构造空 vector（4 个指针全 null，对应 MSVC 默认构造）。
+    pub fn new() -> Self {
+        Self {
+            container_proxy: std::ptr::null_mut(),
+            begin: std::ptr::null_mut(),
+            end: std::ptr::null_mut(),
+            capacity_end: std::ptr::null_mut(),
+        }
+    }
+
+    /// 是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 元素数量（end - begin，按 T 大小除）。
+    pub fn len(&self) -> usize {
+        if self.begin.is_null() || self.end.is_null() {
+            0
+        } else {
+            let byte_len = (self.end as usize).saturating_sub(self.begin as usize);
+            byte_len / std::mem::size_of::<T>()
+        }
+    }
+
+    /// 返回元素切片（只读）。空 vector 返回空切片。
+    pub fn as_slice(&self) -> &[T] {
+        if self.begin.is_null() || self.end.is_null() {
+            &[]
+        } else {
+            let len = self.len();
+            if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(self.begin, len) } }
+        }
+    }
+
+    /// 写入索引处的元素（越界时静默忽略）。
+    pub fn set(&mut self, index: usize, value: T) {
+        if index < self.len() {
+            unsafe { std::ptr::write(self.begin.add(index), value) }
+        }
+    }
+
+    /// 删除指定索引处元素（左移后续元素，end 退 1）。
+    pub fn erase(&mut self, index: usize) {
+        let len = self.len();
+        if index >= len { return; }
+        unsafe {
+            for i in index..len.saturating_sub(1) {
+                std::ptr::write(self.begin.add(i), std::ptr::read(self.begin.add(i + 1)));
+            }
+        }
+        self.end = unsafe { self.end.sub(1) };
+    }
+
+    /// 清空 vector 但保留已分配的内存（end = begin）。
+    /// 对照源码 Start 函数 L225-244 中对 sim_events 的 20 个 vector 执行的
+    /// `*(lVar1 + offset + 0x10) = *(lVar1 + offset + 0x8)` 操作。
+    pub fn clear_keep_capacity(&mut self) {
+        self.end = self.begin;
+    }
+
+    /// 返回 _First（begin）指针作为 `*const T`。
+    /// 用于 PrepareGameDataUpdate 中提取 SOA 数据指针。
+    pub fn as_ptr(&self) -> *const T {
+        self.begin as *const T
+    }
+
+    /// 追加元素到末尾（不要求 T: Default + Copy）。
+    /// 对应 MSVC vector::push_back。2x 增长策略。
+    /// 用于 *mut T 等不实现 Default 的裸指针类型。
+    pub fn push_unchecked(&mut self, value: T) {
+        let elem_size = std::mem::size_of::<T>();
+        let elem_align = std::mem::align_of::<T>().max(8);
+        let cur_len = self.len();
+        let cur_cap = if !self.begin.is_null() && !self.capacity_end.is_null() {
+            (self.capacity_end as usize).saturating_sub(self.begin as usize) / elem_size
+        } else {
+            0
+        };
+        if cur_len >= cur_cap {
+            let new_cap = if cur_cap == 0 { 1 } else { cur_cap * 2 };
+            let new_byte_len = new_cap.checked_mul(elem_size).expect("overflow");
+            let layout = Layout::from_size_align(new_byte_len, elem_align).unwrap();
+            let new_buf = unsafe { alloc(layout) as *mut T };
+            if new_buf.is_null() {
+                return;
+            }
+            if !self.begin.is_null() {
+                for i in 0..cur_len {
+                    unsafe { std::ptr::write(new_buf.add(i), std::ptr::read(self.begin.add(i))) };
+                }
+                let old_byte_len = cur_cap * elem_size;
+                let old_layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
+                unsafe { dealloc(self.begin as *mut u8, old_layout) };
+            }
+            self.begin = new_buf;
+            self.end = unsafe { new_buf.add(cur_len) };
+            self.capacity_end = unsafe { new_buf.add(new_cap) };
+        }
+        unsafe { std::ptr::write(self.end, value) };
+        self.end = unsafe { self.end.add(1) };
+    }
+}
+
+/// 有约束方法：需要 T: Default + Copy（构造或复制 T）。
+impl<T: Default + Copy> MsvcVector<T> {
+    /// 读取索引处的元素副本（越界返回 T::default()）。
+    pub fn get(&self, index: usize) -> T {
+        if index < self.len() {
+            unsafe { std::ptr::read(self.begin.add(index)) }
+        } else {
+            T::default()
+        }
+    }
+
+    /// 调整容量到 new_len，新元素用 value 填充。
+    ///
+    /// 对应 MSVC vector::resize。简化实现：分配新缓冲区，释放旧缓冲区。
+    pub fn resize(&mut self, new_len: usize, value: T) {
+        let elem_size = std::mem::size_of::<T>();
+        let elem_align = std::mem::align_of::<T>().max(8);
+        if new_len == 0 {
+            if !self.begin.is_null() {
+                let old_len = self.len();
+                let old_byte_len = old_len * elem_size;
+                let layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
+                unsafe { dealloc(self.begin as *mut u8, layout) };
+            }
+            self.begin = std::ptr::null_mut();
+            self.end = std::ptr::null_mut();
+            self.capacity_end = std::ptr::null_mut();
+            return;
+        }
+        let new_byte_len = new_len.checked_mul(elem_size).expect("overflow");
+        let layout = Layout::from_size_align(new_byte_len, elem_align).unwrap();
+        let new_buf = unsafe { alloc(layout) as *mut T };
+        if new_buf.is_null() {
+            return;
+        }
+        for i in 0..new_len {
+            unsafe { std::ptr::write(new_buf.add(i), value) };
+        }
+        if !self.begin.is_null() {
+            let old_len = self.len();
+            let old_byte_len = old_len * elem_size;
+            let old_layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
+            unsafe { dealloc(self.begin as *mut u8, old_layout) };
+        }
+        self.begin = new_buf;
+        self.end = unsafe { new_buf.add(new_len) };
+        self.capacity_end = self.end;
+    }
+
+    /// 清空 vector（释放内存，重置为空）。
+    pub fn clear(&mut self) {
+        self.resize(0, T::default());
+    }
+
+    /// 追加元素到末尾（对应 MSVC vector::push_back）。2x 增长策略。
+    pub fn push(&mut self, value: T) {
+        let elem_size = std::mem::size_of::<T>();
+        let elem_align = std::mem::align_of::<T>().max(8);
+        let cur_len = self.len();
+        let cur_cap = if !self.begin.is_null() && !self.capacity_end.is_null() {
+            (self.capacity_end as usize).saturating_sub(self.begin as usize) / elem_size
+        } else { 0 };
+        if cur_len >= cur_cap {
+            let new_cap = if cur_cap == 0 { 1 } else { cur_cap * 2 };
+            let new_byte_len = new_cap.checked_mul(elem_size).expect("overflow");
+            let layout = Layout::from_size_align(new_byte_len, elem_align).unwrap();
+            let new_buf = unsafe { alloc(layout) as *mut T };
+            if new_buf.is_null() { return; }
+            if !self.begin.is_null() {
+                for i in 0..cur_len {
+                    unsafe { std::ptr::write(new_buf.add(i), self.get(i)) };
+                }
+                let old_byte_len = cur_cap * elem_size;
+                let old_layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
+                unsafe { dealloc(self.begin as *mut u8, old_layout) };
+            }
+            self.begin = new_buf;
+            self.end = unsafe { new_buf.add(cur_len) };
+            self.capacity_end = unsafe { new_buf.add(new_cap) };
+        }
+        unsafe { std::ptr::write(self.end, value) };
+        self.end = unsafe { self.end.add(1) };
+    }
+}
+
+impl<T> Default for MsvcVector<T> {
+    fn default() -> Self {
+        Self {
+            container_proxy: std::ptr::null_mut(),
+            begin: std::ptr::null_mut(),
+            end: std::ptr::null_mut(),
+            capacity_end: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for MsvcVector<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MsvcVector")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+/// MSVC std::unique_ptr 等价物（8 字节）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UniquePtr<T> {
+    pub ptr: *mut T,
+}
+
+/// MSVC std::string 等价物（32 字节）。SSO 布局：16B buffer + 8B size + 8B capacity。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MsvcString {
+    pub buffer: [u8; 16],
+    pub size: u64,
+    pub capacity: u64,
+}
+
+impl Default for MsvcString {
+    fn default() -> Self {
+        Self { buffer: [0; 16], size: 0, capacity: 0 }
+    }
+}
+
+/// MSVC std::function 等价物（64 字节）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MsvcFunction {
+    pub buffer: [u8; 64],
+}
+
+/// MSVC std::mutex 等价物（80 字节，align 8）。
+///
+/// 内部使用 SRWLOCK（8 字节）实现互斥，前 8 字节作为 SRWLOCK 存储，
+/// 其余 72 字节为 padding 以匹配 MSVC _Mtx_internal_imp_t 的 80 字节布局。
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct MsvcMutex {
+    pub bytes: [u8; 80],
+}
+
+/// MsvcMutex 的锁守卫。Drop 时自动释放锁。
+pub struct MsvcMutexGuard<'a> {
+    mutex: &'a MsvcMutex,
+}
+
+impl MsvcMutex {
+    /// 获取互斥锁（阻塞）。返回 guard，Drop 时自动释放。
+    ///
+    /// 对照源码 _Mtx_lock。使用 SRWLOCK 独占锁。
+    pub fn lock(&self) -> MsvcMutexGuard<'_> {
+        unsafe {
+            windows::Win32::System::Threading::AcquireSRWLockExclusive(
+                self.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
+            );
+        }
+        MsvcMutexGuard { mutex: self }
+    }
+
+    /// 获取互斥锁（阻塞）。不返回 guard，需手动调用 `unlock_raw`。
+    ///
+    /// 用于 SimSync/GameSync 等需要在持有锁时调用 `MsvcCondVar::wait` 的场景
+    /// （wait 会自动释放并重新获取锁，guard 的自动 Drop 会导致双重释放）。
+    pub fn lock_raw(&self) {
+        unsafe {
+            windows::Win32::System::Threading::AcquireSRWLockExclusive(
+                self.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
+            );
+        }
+    }
+
+    /// 释放互斥锁（配合 `lock_raw` 使用）。
+    pub fn unlock_raw(&self) {
+        unsafe {
+            windows::Win32::System::Threading::ReleaseSRWLockExclusive(
+                self.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
+            );
+        }
+    }
+}
+
+impl Drop for MsvcMutexGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::System::Threading::ReleaseSRWLockExclusive(
+                self.mutex.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
+            );
+        }
+    }
+}
+
+/// MSVC std::condition_variable 等价物（8 字节，align 8）。
+///
+/// 内部使用 Windows CONDITION_VARIABLE（8 字节）。零初始化即为有效状态
+/// （INITIALIZE_CONDITION_VARIABLE 实际就是置零）。
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct MsvcCondVar {
+    pub bytes: [u8; 8],
+}
+
+impl MsvcCondVar {
+    /// 唤醒一个等待此条件变量的线程。
+    /// 对照 MSVC _Cnd_signal → WakeConditionVariable。
+    pub fn signal(&self) {
+        unsafe {
+            windows::Win32::System::Threading::WakeConditionVariable(
+                self.bytes.as_ptr() as *mut windows::Win32::System::Threading::CONDITION_VARIABLE,
+            );
+        }
+    }
+
+    /// 唤醒所有等待此条件变量的线程。
+    /// 对照 MSVC _Cnd_broadcast → WakeAllConditionVariable。
+    pub fn broadcast(&self) {
+        unsafe {
+            windows::Win32::System::Threading::WakeAllConditionVariable(
+                self.bytes.as_ptr() as *mut windows::Win32::System::Threading::CONDITION_VARIABLE,
+            );
+        }
+    }
+
+    /// 等待条件变量（必须在持有 `mutex` 的情况下调用）。
+    /// 对照 MSVC _Cnd_wait → SleepConditionVariableSRW。
+    ///
+    /// 会自动释放 `mutex` 并阻塞，被 `signal`/`broadcast` 唤醒后重新获取 `mutex`。
+    /// 返回 `true` 表示成功等到信号，`false` 表示系统错误。
+    pub fn wait(&self, mutex: &MsvcMutex) -> bool {
+        unsafe {
+            // windows 0.58: SleepConditionVariableSRW 返回 Result<(), Error>
+            // INFINITE = 0xFFFFFFFF (u32)
+            windows::Win32::System::Threading::SleepConditionVariableSRW(
+                self.bytes.as_ptr() as *mut windows::Win32::System::Threading::CONDITION_VARIABLE,
+                mutex.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
+                0xFFFFFFFFu32, // INFINITE
+                0, // 0 = exclusive lock
+            ).is_ok()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msvc_vector_size_is_32() {
+        assert_eq!(std::mem::size_of::<MsvcVector<u8>>(), 32);
+    }
+
+    #[test]
+    fn unique_ptr_size_is_8() {
+        assert_eq!(std::mem::size_of::<UniquePtr<u8>>(), 8);
+    }
+
+    #[test]
+    fn msvc_string_size_is_32() {
+        assert_eq!(std::mem::size_of::<MsvcString>(), 32);
+    }
+
+    #[test]
+    fn msvc_function_size_is_64() {
+        assert_eq!(std::mem::size_of::<MsvcFunction>(), 64);
+    }
+
+    #[test]
+    fn msvc_mutex_size_is_80() {
+        assert_eq!(std::mem::size_of::<MsvcMutex>(), 80);
+    }
+
+    #[test]
+    fn msvc_condvar_size_is_8() {
+        assert_eq!(std::mem::size_of::<MsvcCondVar>(), 8);
+    }
+
+    #[test]
+    fn msvc_vector_new_is_empty() {
+        let v: MsvcVector<i32> = MsvcVector::new();
+        assert!(v.is_empty());
+        assert_eq!(v.len(), 0);
+    }
+
+    #[test]
+    fn msvc_vector_resize_and_get() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(5, 42);
+        assert_eq!(v.len(), 5);
+        assert_eq!(v.get(0), 42);
+        assert_eq!(v.get(4), 42);
+    }
+
+    #[test]
+    fn msvc_vector_set() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(3, 0);
+        v.set(1, 99);
+        assert_eq!(v.get(1), 99);
+    }
+
+    #[test]
+    fn msvc_vector_push() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(10);
+        v.push(20);
+        v.push(30);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.get(0), 10);
+        assert_eq!(v.get(1), 20);
+        assert_eq!(v.get(2), 30);
+    }
+
+    #[test]
+    fn msvc_vector_clear() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(5, 42);
+        v.clear();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn msvc_vector_erase() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(1);
+        v.push(2);
+        v.push(3);
+        v.erase(1);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.get(0), 1);
+        assert_eq!(v.get(1), 3);
+    }
+
+    #[test]
+    fn msvc_vector_as_slice() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.push(10);
+        v.push(20);
+        let s = v.as_slice();
+        assert_eq!(s, &[10, 20]);
+    }
+
+    #[test]
+    fn msvc_vector_default_is_empty() {
+        let v: MsvcVector<i32> = MsvcVector::default();
+        assert!(v.is_empty());
+    }
+}

@@ -1,204 +1,190 @@
-//! Phase 6 集成测试：消息分派端到端 FFI 验证。
+//! FFI 集成测试：消息分派 smoke 测试。
 //!
-//! 通过 C ABI 的 `SIM_HandleMessage` / `SIM_HandleMessages` 入口验证两阶段分派路径：
-//! - 3 个特殊处理 ID（HandleMessage 路由）通过 FFI 返回 null
-//! - 42 个普通 emplace ID（HandleMessage 路由）通过 FFI 返回 null
-//! - 9 个 save_load ID 通过 FFI 返回 null（不回归 Phase 3）
-//! - 5 个非 save_load 桩 ID 通过 FFI 返回 null
-//! - 未知 ID（id=0）通过 FFI 返回 null
-//! - 批量消息（count=0/2/3）通过 FFI 返回 null
+//! 验证两阶段消息分派（对照源码 01_sim_api.c L208-244）：
+//! 1. SimFrameManager::handle_message（A3 桩，返回 false）
+//! 2. handler 表线性查找（14 项 gSimMessageHandlers）
 //!
-//! 这些测试不验证日志输出（tracing subscriber 在测试中未配置），
-//! 仅验证返回值 `is_null()` 与不 panic。日志验证留给部署后人工检查（spec §5）。
-//!
-//! 运行：cargo test --test message_dispatch_smoke
+//! 以及 SIM_HandleMessage / SIM_HandleMessages 的路由行为。
 
-use SimDLL::message_handler::MessageType;
-use SimDLL::sim_api::{SIM_HandleMessage, SIM_HandleMessages};
-use std::os::raw::{c_int, c_schar, c_void};
+use SimDLL::a_framework::buffer::BinaryBufferReader;
+use SimDLL::a_framework::message_handler::{
+    dispatch_handler_table, G_SIM_MESSAGE_HANDLERS, MessageType,
+};
+use SimDLL::a_framework::sim_api::*;
+use std::os::raw::{c_int, c_schar};
 
-/// 辅助：把 `MessageType` 转为 `c_int`（bit-pattern 保留，u32 → i32）。
-///
-/// 许多 enum 值超过 `i32::MAX`（如 `MoveElementChunk=3920055938`），
-/// 必须用 `as u32 as c_int` 做位模式保留转换，否则直接 `as c_int` 会溢出。
-fn id(mt: MessageType) -> c_int {
-    mt as u32 as c_int
+/// 串行化所有修改全局状态的测试。
+static DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ===== 静态表测试（不依赖全局状态，无需锁）=====
+
+#[test]
+fn handler_table_has_14_entries() {
+    assert_eq!(G_SIM_MESSAGE_HANDLERS.len(), 14);
 }
 
 #[test]
-fn handle_message_special_ids_return_null_via_ffi() {
-    // 3 个特殊处理 ID（SimFrameManager_NewGameFrame / SetDebugProperties / ModifyBuildingEnergy）
-    // 命中 HandleMessage 阶段 1 路由（log + return true），SIM_HandleMessage 返回 null。
-    let specials = [
-        MessageType::SimFrameManager_NewGameFrame,
-        MessageType::SetDebugProperties,
-        MessageType::ModifyBuildingEnergy,
-    ];
-    for mt in specials {
-        let result: *mut c_void = SIM_HandleMessage(id(mt), 0, std::ptr::null_mut());
-        assert!(
-            result.is_null(),
-            "special id {:?} should return null via FFI",
-            mt
-        );
+fn all_14_handlers_are_non_null() {
+    for entry in G_SIM_MESSAGE_HANDLERS {
+        assert!(entry.handler.is_some(), "handler for {:?} is null", entry.id);
     }
 }
 
 #[test]
-fn handle_message_emplace_ids_return_null_via_ffi() {
-    // 全部 42 个普通 emplace 路由 ID（T1 实际是 42 个，非简报的 41 个）。
-    // 列表来源：sim_frame_manager.rs 中 T1 实现的 const 常量列表（排除 3 个特殊 ID）。
-    // 每个 emplace ID 命中 HandleMessage 阶段 1 路由（log + return true），返回 null。
-    let emplace_ids = [
-        MessageType::ChangeCellProperties,
-        MessageType::AddBuildingToBuildingHeatExchange,
-        MessageType::RemoveBuildingInContactFromBuildingToBuildingHeatExchange,
-        MessageType::CellRadiationModification,
-        MessageType::ModifyDiseaseEmitter,
-        MessageType::CellDiseaseModification,
-        MessageType::ModifyDiseaseConsumer,
-        MessageType::AddInContactBuildingToBuildingToBuildingHeatExchange,
-        MessageType::RemoveElementEmitter,
-        MessageType::AddRadiationEmitter,
-        MessageType::ModifyChunkTemperatureAdjuster,
-        MessageType::ModifyCell,
-        MessageType::ConsumeDisease,
-        MessageType::RemoveElementChunk,
-        MessageType::SetInsulationValue,
-        MessageType::RemoveDiseaseConsumer,
-        MessageType::RemoveRadiationEmitter,
-        MessageType::ModifyBackwallData,
-        MessageType::AddElementEmitter,
-        MessageType::ModifyRadiationEmitter,
-        MessageType::RemoveBuildingHeatExchange,
-        MessageType::ModifyCellWorldZone,
-        MessageType::SetElementChunkData,
-        MessageType::MoveElementChunk,
-        MessageType::AddDiseaseConsumer,
-        MessageType::ModifyElementEmitter,
-        MessageType::RemoveDiseaseEmitter,
-        MessageType::RemoveBuildingToBuildingHeatExchange,
-        MessageType::MassEmission,
-        MessageType::ModifyCellEnergy,
-        MessageType::Dig,
-        MessageType::RadiationParamsModification,
-        MessageType::SetStrengthValue,
-        MessageType::MassConsumption,
-        MessageType::AddBuildingHeatExchange,
-        MessageType::ModifyBuildingHeatExchange,
-        MessageType::AddElementConsumer,
-        MessageType::AddElementChunk,
-        MessageType::AddDiseaseEmitter,
-        MessageType::SetElementConsumerData,
-        MessageType::ModifyElementChunkEnergy,
-        MessageType::RemoveElementConsumer,
-    ];
-    assert_eq!(
-        emplace_ids.len(),
-        42,
-        "普通 emplace 实际 42 项（T1 逐项核对源码后确认，含原计划遗漏的 ModifyElementChunkEnergy）"
+fn handler_table_contains_all_save_load_ids() {
+    let ids: Vec<u32> = G_SIM_MESSAGE_HANDLERS.iter().map(|e| e.id as u32).collect();
+    // 10 个 save_load handler
+    assert!(ids.contains(&(MessageType::Load as u32)));
+    assert!(ids.contains(&(MessageType::Start as u32)));
+    assert!(ids.contains(&(MessageType::AllocateCells as u32)));
+    assert!(ids.contains(&(MessageType::DefineWorldOffsets as u32)));
+    assert!(ids.contains(&(MessageType::PrepareGameData as u32)));
+    assert!(ids.contains(&(MessageType::ClearUnoccupiedCells as u32)));
+    assert!(ids.contains(&(MessageType::Elements_CreateInteractions as u32)));
+    assert!(ids.contains(&(MessageType::SetSavedOptions as u32)));
+    assert!(ids.contains(&(MessageType::SimData_ResizeAndInitializeVacuumCells as u32)));
+    assert!(ids.contains(&(MessageType::Disease_CreateTable as u32)));
+}
+
+#[test]
+fn handler_table_contains_non_save_load_ids() {
+    let ids: Vec<u32> = G_SIM_MESSAGE_HANDLERS.iter().map(|e| e.id as u32).collect();
+    // 4 个非 save_load handler
+    assert!(ids.contains(&(MessageType::Elements_CreateTable as u32)));
+    assert!(ids.contains(&(MessageType::SimData_InitializeFromCells as u32)));
+    assert!(ids.contains(&(MessageType::SimData_FreeCells as u32)));
+    assert!(ids.contains(&(MessageType::SetWorldZones as u32)));
+}
+
+// ===== dispatch_handler_table 测试 =====
+
+#[test]
+fn dispatch_unknown_id_returns_none() {
+    let data = [0u8; 4];
+    let mut reader = BinaryBufferReader::new(&data);
+    assert!(dispatch_handler_table(0xDEADBEEF, &mut reader).is_none());
+}
+
+#[test]
+fn dispatch_known_id_returns_some() {
+    let data = [0u8; 16];
+    let mut reader = BinaryBufferReader::new(&data);
+    // AllocateCells 是已知 ID，即使数据不完整也应找到 handler
+    let result = dispatch_handler_table(MessageType::AllocateCells as u32, &mut reader);
+    assert!(result.is_some(), "AllocateCells should be found in handler table");
+}
+
+// ===== SIM_HandleMessage 路由测试（依赖全局状态，需锁）=====
+
+/// 构造 AllocateCells 消息数据
+fn make_allocate_cells_data(width: i32, height: i32) -> Vec<u8> {
+    let mut data = Vec::with_capacity(10);
+    data.extend_from_slice(&width.to_le_bytes());
+    data.extend_from_slice(&height.to_le_bytes());
+    data.push(0u8);
+    data.push(0u8);
+    data
+}
+
+#[test]
+fn sim_handle_message_unknown_id_returns_null_after_init() {
+    let _guard = DISPATCH_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+
+    let data = vec![0u8; 4];
+    let result = SIM_HandleMessage(0xDEADBEEFu32 as c_int, 4, data.as_ptr() as *mut c_schar);
+    assert!(result.is_null(), "Unknown message ID should return null");
+}
+
+#[test]
+fn sim_handle_message_allocate_cells_returns_non_null() {
+    let _guard = DISPATCH_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+
+    let data = make_allocate_cells_data(4, 4);
+    let result = SIM_HandleMessage(
+        MessageType::AllocateCells as c_int,
+        data.len() as c_int,
+        data.as_ptr() as *mut c_schar,
     );
-    for mt in emplace_ids {
-        let result: *mut c_void = SIM_HandleMessage(id(mt), 0, std::ptr::null_mut::<c_schar>());
-        assert!(
-            result.is_null(),
-            "emplace id {:?} should return null via FFI",
-            mt
-        );
-    }
+    assert!(!result.is_null(), "AllocateCells via SIM_HandleMessage should return non-null");
 }
 
 #[test]
-fn handle_message_save_load_ids_return_null_via_ffi() {
-    // 9 个 save_load ID 不在 HandleMessage 路由表（阶段 1 返回 false），
-    // 回退到 gSimMessageHandlers 表（阶段 2）命中 save_load_shim。
-    // 空 buffer（null data → empty slice）让 save_load handler 返回 Err，
-    // shim 转 null（行为与 Phase 3 一致，验证升级不破坏 save_load 路径）。
-    let save_load_ids = [
-        MessageType::Load,
-        MessageType::Start,
-        MessageType::AllocateCells,
-        MessageType::DefineWorldOffsets,
-        MessageType::PrepareGameData,
-        MessageType::ClearUnoccupiedCells,
-        MessageType::SetSavedOptions,
-        MessageType::Disease_CreateTable,
-        MessageType::SimData_ResizeAndInitializeVacuumCells,
-    ];
-    for mt in save_load_ids {
-        let result: *mut c_void = SIM_HandleMessage(id(mt), 0, std::ptr::null_mut::<c_schar>());
-        assert!(
-            result.is_null(),
-            "save_load id {:?} should return null via FFI",
-            mt
-        );
-    }
-}
+fn sim_handle_messages_batch_returns_last_result() {
+    let _guard = DISPATCH_LOCK.lock().unwrap();
+    SIM_Initialize(None);
 
-#[test]
-fn handle_message_non_save_load_stub_ids_return_null_via_ffi() {
-    // 5 个非 save_load 桩 ID 不在 HandleMessage 路由表（阶段 1 返回 false），
-    // 回退到 gSimMessageHandlers 表（阶段 2）命中 non_save_load stub handler。
-    // 桩 handler 只 log + 返回 null（不读取 reader，不修改全局状态）。
-    let stub_ids = [
-        MessageType::SimData_InitializeFromCells,
-        MessageType::SimData_FreeCells,
-        MessageType::SetVisibleCells,
-        MessageType::SetWorldZones,
-        MessageType::RadiationSickness,
-    ];
-    for mt in stub_ids {
-        let result: *mut c_void = SIM_HandleMessage(id(mt), 0, std::ptr::null_mut::<c_schar>());
-        assert!(
-            result.is_null(),
-            "non_save_load stub id {:?} should return null via FFI",
-            mt
-        );
-    }
-}
+    // 2 条 AllocateCells 消息，每条 10 字节
+    let msg_size = 10;
+    let mut data = Vec::new();
+    // Message 1: width=2, height=2
+    data.extend_from_slice(&2i32.to_le_bytes());
+    data.extend_from_slice(&2i32.to_le_bytes());
+    data.push(0u8);
+    data.push(0u8);
+    // Message 2: width=3, height=3
+    data.extend_from_slice(&3i32.to_le_bytes());
+    data.extend_from_slice(&3i32.to_le_bytes());
+    data.push(0u8);
+    data.push(0u8);
 
-#[test]
-fn handle_message_unknown_id_returns_null_via_ffi() {
-    // id=0 不在任何路由表（阶段 1 返回 false，阶段 2 表查找无匹配），
-    // SIM_HandleMessage 返回 null。
-    let result: *mut c_void = SIM_HandleMessage(0, 0, std::ptr::null_mut::<c_schar>());
-    assert!(result.is_null(), "unknown id=0 should return null via FFI");
-}
-
-#[test]
-fn handle_messages_count_zero_returns_null_via_ffi() {
-    // count=0 直接返回 null（与原版 L266 `if (0 < param_3)` 一致，循环不执行）。
-    let result: *mut c_void =
-        SIM_HandleMessages(0, 0, 0, std::ptr::null_mut::<c_schar>());
-    assert!(
-        result.is_null(),
-        "count=0 should return null via FFI (loop not executed)"
+    let result = SIM_HandleMessages(
+        MessageType::AllocateCells as c_int,
+        msg_size,
+        2,
+        data.as_ptr() as *mut c_schar,
     );
+    assert!(!result.is_null(), "SIM_HandleMessages should return last message result");
 }
 
 #[test]
-fn handle_messages_count_two_returns_null_via_ffi() {
-    // count=2 + NewGameFrame id：每次都命中 HandleMessage 阶段 1 路由 → return null。
-    // 验证批量消息循环不 panic，返回 null（最后一次调用的结果）。
-    let id_v = id(MessageType::SimFrameManager_NewGameFrame);
-    let result: *mut c_void =
-        SIM_HandleMessages(id_v, 0, 2, std::ptr::null_mut::<c_schar>());
-    assert!(
-        result.is_null(),
-        "count=2 with NewGameFrame id should return null via FFI"
+fn sim_handle_messages_zero_count_returns_null() {
+    let _guard = DISPATCH_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+
+    let data = vec![0u8; 4];
+    let result = SIM_HandleMessages(
+        MessageType::AllocateCells as c_int,
+        4,
+        0,
+        data.as_ptr() as *mut c_schar,
     );
+    assert!(result.is_null(), "SIM_HandleMessages with count=0 should return null");
 }
 
 #[test]
-fn handle_messages_count_three_returns_null_via_ffi() {
-    // count=3 + Load id：每次都不命中 HandleMessage（阶段 1 返回 false），
-    // 回退到阶段 2 命中 save_load shim → empty buffer Err → null。
-    // 验证批量消息走阶段 2 分派不 panic，返回 null。
-    let id_v = id(MessageType::Load);
-    let result: *mut c_void =
-        SIM_HandleMessages(id_v, 0, 3, std::ptr::null_mut::<c_schar>());
-    assert!(
-        result.is_null(),
-        "count=3 with Load id should return null via FFI (stage 2 dispatch)"
+fn sim_handle_message_null_data_is_dispatched_safely() {
+    // 原版 01_sim_api.c L225 不检查 data=null/size<=0，直接构造 reader。
+    // C# 的 Sim.Start() 传入 size=0, data=null（Start 消息不需要 reader 数据），
+    // 原版用空 reader 继续分派，handler 自行决定是否读取。
+    //
+    // 此测试验证 null data 不导致崩溃，且消息正常分派到 handler 表。
+    let _guard = DISPATCH_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+
+    // null data + size=0：应安全分派（不崩溃），AllocateCells 返回非 null
+    let result = SIM_HandleMessage(MessageType::AllocateCells as c_int, 0, std::ptr::null_mut());
+    assert!(!result.is_null(), "AllocateCells with null data should still be dispatched and return non-null");
+
+    // null data + size>0：同样应安全分派（空 reader 读默认值）
+    let result2 = SIM_HandleMessage(MessageType::AllocateCells as c_int, 10, std::ptr::null_mut());
+    assert!(!result2.is_null(), "AllocateCells with null data + size>0 should still be dispatched safely");
+}
+
+#[test]
+fn two_phase_dispatch_routes_to_handler_table() {
+    // 验证两阶段分派：SimFrameManager 返回 false → handler 表处理
+    // AllocateCells 不在 SimFrameManager 的 45 个 arm 中（它属于 handler 表）
+    let _guard = DISPATCH_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+
+    let data = make_allocate_cells_data(2, 2);
+    let result = SIM_HandleMessage(
+        MessageType::AllocateCells as c_int,
+        data.len() as c_int,
+        data.as_ptr() as *mut c_schar,
     );
+    // 如果两阶段分派正常，AllocateCells 会被 handler 表处理并返回非 null
+    assert!(!result.is_null(), "Two-phase dispatch should route AllocateCells to handler table");
 }

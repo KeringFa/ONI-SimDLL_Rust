@@ -1,0 +1,105 @@
+# 代办清单
+
+## [进行中] 全量代码审查（2026-08-02）
+
+**背景**：A~C1 类基本完善，C2 类补齐液体纹理与基本物理模拟。下一步**全量代码审查**，严格对照原版原理（反编译源码）查漏补缺，确保后续工作畅通。
+
+**本阶段已完成并实测确认**（供审查对照）：
+- 液体水平扩散四分支（下/左/右/上推）+ viscosity 流率上限修复；
+- 液滴轨道（visible_grid + SpawnFallingLiquid + C# 落地回注 + Add 合并语义）；
+- 超压机制（DoPressureBreak 4 方向突破 + 向下倾倒阈值 max + ppd.max_mass 映射修复）；
+- 蒸发清理（液体 ≤0.01kg / 气体 <1e-9 清格）；
+- Flood 系列（MassConsumption 16B 结构修复 + 矩形/BFS 洪水移除 + MassConsumedCallback）；
+- 用户实测确认：超压破坏漏水与原版无差异；建砖挤压、密度下沉、合并/沉降正确。
+
+**审查计划**：docs/superpowers/plans/2026-08-02-full-code-review.md
+**审查产出**：.superpowers/sdd/review-*.md（分模块）+ 汇总报告 + 本清单更新
+
+**第一轮审查发现（2026-08-02，内联执行；子代理消息投递在本环境不可用）**：
+- ✅ 元素表 9 个附属结构字段映射逐行核对正确（03_elements.c L296-382）；消息结构体布局（MassConsumption/MassEmission/ModifyCell/DigPoint）与 C# 声明一致。
+- 🔴 **Critical：copy_sim_data_to_game 事件交换缺失 consumed_mass_info / emitted_mass_info** → **已修复**（2026-08-02 17:49 轮：补交换 + 实现 ElementConsumer 消费链路）。
+- 🟠 **Important：process_mass_emission 空桩** → **已实现**（消息式发射：加质量+事件+MassEmittedCallback）；ElementEmitter 组件本体（喷口建筑逐帧发射）仍待实现；RadiationEmitter/ElementChunk/BuildingHeatExchange 等组件消息仍被丢弃。
+- 🟡 Minor：elements_table.rs 过时注释（L305 映射描述仍为旧错误）；病菌汇总简化（与已知偏差一致）。
+- 修复进度：① ✅ 补交换 + ElementConsumer（水泵链路：注册→设速率→逐帧 BFS 消费→consumedMassInfo 回传，句柄经 component_state_changed 回传 C#）② ✅ MassEmission 消息（加质量+回调）③ ✅ 过时注释清理。
+
+---
+
+## [待实测] ElementConsumer 已实现（2026-08-02，水泵修复）
+
+- Register/Modify/Remove 消息解析 + 消费者注册表（16B/条，墓碑复用）；
+- ElementConsumer::Update：逐帧 BFS（radius）→ 按 configuration 选元素（指定/任意液体/任意气体）→ FloodRemoved 消耗 → consumedMassInfo（sim_handle/质量/温度/病菌）；
+- 句柄经 component_state_changed_messages（callbackIdx+simHandle）回传 C#；consumed_mass_info / emitted_mass_info 已加入 copy_sim_data_to_game 交换；
+- ProcessMassEmission 已实现（加质量+温度混合+事件+MassEmittedCallback）；
+- 全量 260 lib + 52 集成全过；release 编译成功（17:49）。
+- **待实测**：部署 17:49 DLL → 水泵/Dev Pump 吸水并排入水管；拖把/涡轮等消费者回归。
+- **后续**：ElementEmitter 组件本体（喷口/排液口建筑逐帧发射 + emittedMassInfo 填充）仍未实现。
+
+---
+
+## [备忘] 遗留技术隐患与已知偏差（含审查待分诊）
+
+- **测试套件并行 flaky（不做处理，仅知悉）**：全量 `cargo test` 偶发 lib 失败（frame_processor/sim_data_ops 等不持 LIB_TESTS_LOCK 的既有竞态，多次确认与新增代码无关），串行 `--test-threads=1` 稳定全过。对策：遇 flaky 用 `cargo test -- --test-threads=1`。
+- **液体已知偏差**：① 病菌混合简化（无 gDisease 表）；② 相变留桩（升华/熔融发射未实现，仅累积纹理值）；③ powf 参数反编译丢失取 1.0（仅影响 alpha）；④ 压力循环门控只跳固体（原版更严 state&3<2）；⑤ post_process 过压分支潜在 0/0 NaN（观察未修，ppd.max_mass 修复后风险降低）。
+- **气体分层 bug**：DoDensityDisplacement 对气体也生效（原版 L1810 同款），用户判定为行为 bug，暂不修（保留决策）。
+- **visible_grid 全可见兜底**：屏幕外也会发液滴事件（开销问题，不影响行为）；SetVisibleCells 消息的 C# 发送方未定位，找到后可做屏幕级门控。
+- **液体性能（已知优化项）**：元素表每格加锁查询（G_ELEMENTS_TABLE Mutex），液体密集区帧率可能受影响；优化方向：update_data 一次性读出元素数据快照或改 RwLock。
+- **game_data.rs 释放不一致**：game_data.rs 同样 leak 分配 flow/accumulated_flow（L309-332）但 Drop 未释放（L356 注释已过时）；sim_data.rs 已补释放，建议统一。
+
+## [待实测] 管道温度管理器按原版全量重写（2026-08-02，管道水珠/水泵）
+
+- **现象**：原版存档的管道水珠在加载后被清空；水泵排不进水管（Pipe Blocked，储罐 20kg 满）。
+- **根因**：C# 管道系统每帧从 sim 的 `ConduitTemperatureManager_*`（Add/Set/Update）读写管道温度；此前简易版句柄无版本位、释放立即复用 → 重建/拆除后句柄↔数组索引错位，C# 温度数组被 sim 覆盖后读到错误/0 温度。
+- **关键新证据**：用户实测「莫名版本」（my_Project\simDLL_RS_Kit\simDLL_RS）——水珠能被加载，但**水泵同样吸不了水/排不进管**。结论：温度管理器是水珠加载的必要条件（非充分），水泵 Blocked 另有第二根因，需实测定位。
+- **已实现**（严格对照原版 SimDLL_Source.c L94814-95886，未抄神秘版本）：
+  - 版本句柄 `handle = (version<<24)|index`，8bit 版本复用计数；
+  - 延迟释放双缓冲：Remove 入缓冲，sim 线程每轮 `ReleaseQueuedHandles`（已挂接 sim_thread L2113 位置）两轮后 swap-remove 回收；
+  - Add/Set 按元素表构造 Data（SHC×mass、TC、low/high 过渡温度，>10000 重置默认温度）；
+  - Update 全量换热：insulated→min 导热 / 否则 avg、热流×50、能量×dt×0.001、钳制防过冲、能量守恒取小值、交叉检测加权平均、NaN 回退、显著能量发 MODIFY_BUILDING_ENERGY(0xAF9B1296) 16B、±3.0 滞回相变 → frozen/melted；
+  - Update 第二参数长度取 GDU.num_building_temperature_info（C# 传的即 GDU buildingTemperatures 指针，Game.cs L1086）。
+- **探针**：Add 记录返回句柄/版本，Set/Remove/Update 计数，Update 记录 building_len——用于下次实测定位水泵根因。
+- 单测 11 条（句柄版本/延迟释放/换热数值/隔热/相变/交叉/跳过逻辑）；全量 323 测试串行全过；release 编译成功。
+- **待实测**：部署新 DLL → ① 原版存档加载后管道水珠应保留；② 水泵能否排入水管（若仍 Blocked，看日志中 Add/Set/Update/building_len 定位第二根因）。
+
+## [待实测] 根因确认：AddBuildingHeatExchange 空桩导致管道永不入网（2026-08-02 20:40）
+
+- **日志铁证**：20:16 会话共 188 次 ConduitTemperatureManager_Update（entries=0、building_len=0），**Add/Set/Remove 一次未调**；Player.log 确认 03_only 存档正常加载进游戏。
+- **根因链**（C# 管道注册机制）：管道 OnSpawn → StructureTemperature.SimRegister 发 `AddBuildingHeatExchange`（44B，带 callbackIdx）→ sim 分配建筑温度句柄 → `componentStateChangedMessages` 回调 C#（OnSimRegistered）→ 触发 `Conduit.OnStructureTemperatureRegistered` → 管道加入 UtilityNetwork → ConduitFlow.RebuildConnections 注册管道 → 温度管理器 Add。
+- 我们此前 `AddBuildingHeatExchange` 是 C2 空桩（只返回 true 不 emplace）→ 句柄从未分配、回调从未发出 → 管道永不入网 → 无水珠渲染、水泵 AddElement 返回 0（Pipe Blocked）、拆管仅释放 C# 网格残留内容。**这同时解释全部症状。**
+- **已实现**：
+  - frame_manager：Add/Modify 44B、Remove 8B 真实 emplace 进 building_heat_exchange_messages（原版 0x67A75D28/0x6C5C80A1/0xE4D1E06B）；
+  - 新增 c_simulation/building_temperature.rs：版本句柄分配（Add 分配+回调、Modify 更新、Remove 释放），每帧输出 building_temperature_info（按 handle index）→ GDU buildingTemperatures；
+  - copy_sim_data_to_game 每帧刷新 building_temperature_info；frame_processor 新增 process_building_heat_exchange_messages（callbackIdx→component_state_changed 回调链）。
+- 单测 5 条（消息尺寸/句柄版本/复用/输出索引）；全量 328 测试串行全过；release 20:40 构建成功。
+- **待实测**：部署 20:40 DLL → 日志应出现 "building_temperature: added" + "handle callback pushed"；随后 ConduitTemperatureManager_Add 应有调用（entries>0）→ ① 水珠应出现；② 水泵应能排入水管；③ building_len 应 >0。
+- **后续**：建筑↔周围格换热、过热/熔化检测仍未实现（本阶段只打通注册链）。
+
+## [已完成] 管道子系统全量恢复（2026-08-02 用户实测确认）
+
+- ① 水珠确认出现；② 水泵确认能排入水管；③ 管道内液体确认从绿口流向最近白口；
+  ④ 排水口确认正常排出滴液；气体管道同样正常。
+- **分类结论**：管道子系统归 **C1 类（消息/组件/句柄层）**——200ms 输送是 C# ConduitFlow
+  负责，simDLL 侧只是温度权威 + 注册链 + 消费者组件，不迭代格子状态（详见分类文档）。
+- 液体格子级物理已大致完成，剩余项见分类文档。
+
+### 全量模块分类
+
+- 分类文档：docs/superpowers/2026-08-02-module-classification.md（A/B/C1/C2 四类全量表）
+
+## [已完成] 管道子系统对照审查（2026-08-02 内联）
+
+- 审查报告：.superpowers/sdd/review-pipe-subsystem.md
+- **已修复**：① remove 回调 sim_handle 改 -1（原版 L116529-116537）；② 空闲槽
+  temperatureInfo 改 -1.0f（原版 Unregister L137245）。全量 329 测试串行全过，release 构建成功。
+- **建议修改（归属温度模块③）**：Modify 过热检测（buildingOverheatInfo）、
+  ModifyBuildingEnergy 消费（建筑产热 → 管道换热才有真实温差来源）、
+  建筑↔格子换热（BuildingHeatExchange::Update 主体）。
+- **仅供参考**：records 非压缩（长会话内存线性增长）、temperatureInfo 每帧重建（输出等价）。
+- 核对通过：ConduitTemperatureManager 全部语义、emplace 尺寸 44/44/8、adds→modifies→removes
+  顺序、add 回调传句柄、GDU 集成位置。
+
+### 参考文档
+
+- 全量审查计划：docs/superpowers/plans/2026-08-02-full-code-review.md
+- 液滴轨道设计：docs/superpowers/specs/2026-08-02-liquid-droplet-track-design.md
+- 上推/蒸发设计：docs/superpowers/specs/2026-08-02-liquid-pushup-and-evaporate-design.md
+- 进度账本：.superpowers/sdd/progress-horizontal.md

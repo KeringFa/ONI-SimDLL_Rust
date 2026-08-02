@@ -1,179 +1,229 @@
-//! Phase 3 集成测试：模拟 C# P/Invoke 调用 13 个存档加载函数。
+//! FFI 集成测试：存档加载/保存 smoke 测试。
 //!
-//! 运行：cargo test --test save_load_smoke
+//! 模拟 C# 端的完整加载流程：
+//! SIM_Initialize → AllocateCells → Load → Start → BeginSave → EndSave
 //!
-//! 对照 Phase 2 的 elements_smoke.rs 模式：验证不 panic + 边界条件。
+//! 对照源码 02_save_load.c 的 handler 链。
 
-use SimDLL::save_load::*;
-use SimDLL::buffer::{BinaryBufferReader, BinaryBufferWriter};
+use SimDLL::a_framework::message_handler::MessageType;
+use SimDLL::a_framework::sim_api::*;
+use std::os::raw::{c_int, c_schar};
 
-#[test]
-fn load_with_empty_buffer_returns_invalid_magic() {
-    let buf = [0u8; 0];
-    let mut reader = BinaryBufferReader::new(&buf);
-    let result = load(&mut reader);
-    assert_eq!(result, Err(SimDLL::buffer::BufferError::InvalidMagic));
+/// 串行化所有修改全局状态的测试，避免并行竞争。
+/// 集成测试在同一个 binary 内共享全局状态（gSim/gSimData/gFrameSync 等）。
+static SAVE_LOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 构造 AllocateCells 消息数据：width(i32) + height(i32) + flag1(bool) + flag2(bool)
+/// 对照源码 02_save_load.c L259-293。
+fn make_allocate_cells_data(width: i32, height: i32) -> Vec<u8> {
+    let mut data = Vec::with_capacity(10);
+    data.extend_from_slice(&width.to_le_bytes());
+    data.extend_from_slice(&height.to_le_bytes());
+    data.push(0u8); // flag1 = false (radiation_enabled)
+    data.push(0u8); // flag2 = false (headless)
+    data
 }
 
-#[test]
-fn load_with_valid_magic_high_version_does_not_panic() {
-    let mut w = BinaryBufferWriter::new();
-    w.write_bytes(&[0x53, 0x49, 0x4d, 0x53, 0x41, 0x56, 0x45, 0x00]).unwrap();
-    w.write_int(0x10).unwrap();
-    let buf = w.into_bytes();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = load(&mut reader);
-}
+/// 构造最小存档数据（version 15）。
+///
+/// 格式对照源码 02_save_load.c L7-207：
+/// - 8B magic "SIMSAVE\0"
+/// - 4B version (15 = 0xf)
+/// - 4B save_width
+/// - 4B save_height
+/// - 4B offset (version > 13)
+/// - 4B skip (version > 13)
+/// - 1B flag (version > 12)
+/// - cell 数据：save_width × save_height × 16B (element_hash + temp + mass + radiation)
+/// - disease 数据：save_width × save_height × 8B (disease_hash + disease_count)
+/// - backwall 数据：save_width × save_height × 12B (element_hash + mass + temp)
+fn make_save_data(save_width: i32, save_height: i32) -> Vec<u8> {
+    let total_cells = (save_width as usize) * (save_height as usize);
+    let mut data = Vec::new();
 
-#[test]
-fn start_does_not_panic() {
-    let buf = Vec::new();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = start(&mut reader);
-}
+    // Header (29 bytes)
+    data.extend_from_slice(b"SIMSAVE\0");
+    data.extend_from_slice(&15i32.to_le_bytes()); // version = 0xf
+    data.extend_from_slice(&save_width.to_le_bytes());
+    data.extend_from_slice(&save_height.to_le_bytes());
+    data.extend_from_slice(&0i32.to_le_bytes()); // offset
+    data.extend_from_slice(&0i32.to_le_bytes()); // skip
+    data.push(0u8); // flag
 
-#[test]
-fn allocate_cells_does_not_panic() {
-    let mut w = BinaryBufferWriter::new();
-    w.write_int(4).unwrap();
-    w.write_int(4).unwrap();
-    w.write_byte(0).unwrap();
-    w.write_byte(0).unwrap();
-    let buf = w.into_bytes();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = allocate_cells(&mut reader);
-}
-
-#[test]
-fn define_world_offsets_does_not_panic() {
-    let mut w = BinaryBufferWriter::new();
-    w.write_int(0).unwrap();  // count=0
-    let buf = w.into_bytes();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = define_world_offsets(&mut reader);
-}
-
-#[test]
-fn prepare_game_data_does_not_panic() {
-    let buf = Vec::new();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = prepare_game_data(&mut reader);
-}
-
-#[test]
-fn clear_unoccupied_cells_does_not_panic() {
-    let buf = Vec::new();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = clear_unoccupied_cells(&mut reader);
-}
-
-#[test]
-fn set_saved_options_does_not_panic() {
-    let mut w = BinaryBufferWriter::new();
-    w.write_byte(0x00).unwrap();
-    w.write_byte(0x01).unwrap();
-    let buf = w.into_bytes();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = set_saved_options(&mut reader);
-}
-
-#[test]
-fn resize_and_initialize_vacuum_cells_does_not_panic() {
-    // 先 allocate_cells
-    let mut w = BinaryBufferWriter::new();
-    w.write_int(2).unwrap();
-    w.write_int(2).unwrap();
-    w.write_byte(0).unwrap();
-    w.write_byte(0).unwrap();
-    let buf = w.into_bytes();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = allocate_cells(&mut reader);
-
-    // 调用 resize_and_initialize_vacuum_cells
-    let mut w2 = BinaryBufferWriter::new();
-    for _ in 0..6 {
-        w2.write_int(0).unwrap();
+    // Cell data: element_hash(u32) + temp(f32) + mass(f32) + radiation(f32)
+    for _ in 0..total_cells {
+        data.extend_from_slice(&0x2d39bf75u32.to_le_bytes()); // vacuum hash
+        data.extend_from_slice(&300.0f32.to_le_bytes()); // temperature
+        data.extend_from_slice(&100.0f32.to_le_bytes()); // mass
+        data.extend_from_slice(&0.0f32.to_le_bytes()); // radiation
     }
-    let buf2 = w2.into_bytes();
-    let mut reader2 = BinaryBufferReader::new(&buf2);
-    let _ = resize_and_initialize_vacuum_cells(&mut reader2);
-}
 
-#[test]
-fn create_disease_table_does_not_panic() {
-    let buf = Vec::new();
-    let mut reader = BinaryBufferReader::new(&buf);
-    let _ = create_disease_table(&mut reader);
-}
-
-#[test]
-fn cleanup_does_not_panic() {
-    cleanup();
-    // 多次调用应幂等
-    cleanup();
-}
-
-#[test]
-fn game_sync_function_does_not_panic() {
-    let buf = Vec::new();
-    let mut reader = BinaryBufferReader::new(&buf);
-    game_sync_function(&mut reader);
-}
-
-#[test]
-fn prepare_game_data_update_does_not_panic() {
-    prepare_game_data_update();
-}
-
-use SimDLL::sim_api::{SIM_BeginSave, SIM_EndSave};
-use SimDLL::save_load::G_SAVE_BUFFER;
-
-// 串行化 4 个直接操作 G_SAVE_BUFFER 的 FFI 测试，避免并行模式下
-// SIM_EndSave() 释放锁与 G_SAVE_BUFFER.lock() 重新获取之间的竞态窗口
-// （参考 save_load.rs mod tests 的 PHASE4_TEST_LOCK 模式）
-static SAVE_LOAD_SMOKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[test]
-fn sim_begin_save_returns_non_null_and_correct_size() {
-    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // empty SimData → 至少 29 字节（header only，无 cells）
-    // 注意：G_SIM_DATA 的 width/height 可能被其他测试修改，这里只断言非空 + size>=29
-    let mut size: i32 = -1;
-    let result = SIM_BeginSave(&mut size as *mut _, 0, 0);
-    assert!(!result.is_null(), "SIM_BeginSave should return non-null");
-    assert!(size >= 29, "size should be at least 29 (header), got {}", size);
-    SIM_EndSave();
-}
-
-#[test]
-fn sim_begin_save_with_null_out_size_does_not_panic() {
-    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let result = SIM_BeginSave(std::ptr::null_mut(), 0, 0);
-    assert!(!result.is_null(), "should return non-null even with null out_size");
-    SIM_EndSave();
-}
-
-#[test]
-fn sim_end_save_after_begin_save_no_op() {
-    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // begin_save + end_save + end_save → 第二次 end_save 不 panic（幂等）
-    let mut size: i32 = 0;
-    let _ = SIM_BeginSave(&mut size as *mut _, 0, 0);
-    SIM_EndSave();
-    SIM_EndSave();  // 幂等，不应 panic
-}
-
-#[test]
-fn sim_begin_save_after_end_save_safe() {
-    let _lock = SAVE_LOAD_SMOKE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // end_save 后再 begin_save 应正常工作
-    SIM_EndSave();  // 先调 end_save（此时无 buffer，no-op）
-    let mut size: i32 = 0;
-    let result = SIM_BeginSave(&mut size as *mut _, 0, 0);
-    assert!(!result.is_null());
-    SIM_EndSave();
-    {
-        let g = G_SAVE_BUFFER.lock().unwrap();
-        assert!(g.is_none(), "G_SAVE_BUFFER should be None after end_save");
+    // Disease data: disease_hash(u32) + disease_count(i32)
+    for _ in 0..total_cells {
+        data.extend_from_slice(&0u32.to_le_bytes()); // no disease
+        data.extend_from_slice(&0i32.to_le_bytes()); // count = 0
     }
+
+    // Backwall data: element_hash(u32) + mass(f32) + temp(f32)
+    for _ in 0..total_cells {
+        data.extend_from_slice(&0x2d39bf75u32.to_le_bytes()); // vacuum hash
+        data.extend_from_slice(&0.0f32.to_le_bytes()); // mass
+        data.extend_from_slice(&0.0f32.to_le_bytes()); // temp
+    }
+
+    data
+}
+
+/// 发送 AllocateCells 消息并验证返回非 null。
+fn do_allocate_cells(width: i32, height: i32) {
+    let data = make_allocate_cells_data(width, height);
+    let result = SIM_HandleMessage(
+        MessageType::AllocateCells as c_int,
+        data.len() as c_int,
+        data.as_ptr() as *mut c_schar,
+    );
+    assert!(!result.is_null(), "AllocateCells({},{}) should return non-null", width, height);
+}
+
+#[test]
+fn allocate_cells_returns_non_null_after_init() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+    do_allocate_cells(4, 4);
+}
+
+#[test]
+fn load_returns_non_null_after_allocate_cells() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+    do_allocate_cells(4, 4);
+
+    let save_data = make_save_data(4, 4);
+    let result = SIM_HandleMessage(
+        MessageType::Load as c_int,
+        save_data.len() as c_int,
+        save_data.as_ptr() as *mut c_schar,
+    );
+    assert!(!result.is_null(), "Load should return non-null");
+}
+
+#[test]
+fn start_returns_non_null_after_load() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+    do_allocate_cells(4, 4);
+
+    let save_data = make_save_data(4, 4);
+    let _ = SIM_HandleMessage(
+        MessageType::Load as c_int,
+        save_data.len() as c_int,
+        save_data.as_ptr() as *mut c_schar,
+    );
+
+    // Start handler 不读取 reader 数据，传最小 buffer 即可
+    let start_data = vec![0u8; 4];
+    let result = SIM_HandleMessage(
+        MessageType::Start as c_int,
+        start_data.len() as c_int,
+        start_data.as_ptr() as *mut c_schar,
+    );
+    assert!(!result.is_null(), "Start should return non-null GameDataUpdate pointer");
+
+    // Start 消息会启动 sim 线程，必须 Shutdown join 线程，避免后续测试死锁
+    SIM_Shutdown();
+}
+
+#[test]
+fn begin_save_returns_correct_size_after_allocate() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+    // AllocateCells(4, 4) → SimData(6, 6), total_cells = 36
+    do_allocate_cells(4, 4);
+
+    let mut size: c_int = 0;
+    let result = SIM_BeginSave(&mut size, 0, 0);
+
+    assert!(!result.is_null(), "BeginSave should return non-null pointer");
+    // total_size = width × height × 0x24 + 0x1d = 6 × 6 × 36 + 29 = 1325
+    assert_eq!(size, 1325, "BeginSave size should be 6×6×36+29 = 1325");
+
+    SIM_EndSave();
+}
+
+#[test]
+fn end_save_is_idempotent() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+    do_allocate_cells(2, 2);
+
+    let mut size: c_int = 0;
+    let _ = SIM_BeginSave(&mut size, 0, 0);
+    SIM_EndSave();
+    // Double EndSave should be safe (no-op)
+    SIM_EndSave();
+}
+
+#[test]
+fn reinitialize_cleans_up_properly() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+
+    // First init + allocate
+    SIM_Initialize(None);
+    do_allocate_cells(2, 2);
+
+    // Second init should clean up and not crash
+    SIM_Initialize(None);
+
+    // Should be able to allocate again with different dimensions
+    do_allocate_cells(3, 3);
+}
+
+#[test]
+fn load_with_small_dimensions_works() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+    do_allocate_cells(2, 2);
+
+    let save_data = make_save_data(2, 2);
+    let result = SIM_HandleMessage(
+        MessageType::Load as c_int,
+        save_data.len() as c_int,
+        save_data.as_ptr() as *mut c_schar,
+    );
+    assert!(!result.is_null(), "Load with 2×2 should return non-null");
+}
+
+#[test]
+fn full_load_to_start_pipeline() {
+    let _guard = SAVE_LOAD_LOCK.lock().unwrap();
+    SIM_Initialize(None);
+    do_allocate_cells(4, 4);
+
+    // Load
+    let save_data = make_save_data(4, 4);
+    let load_result = SIM_HandleMessage(
+        MessageType::Load as c_int,
+        save_data.len() as c_int,
+        save_data.as_ptr() as *mut c_schar,
+    );
+    assert!(!load_result.is_null(), "Load should succeed");
+
+    // Start
+    let start_data = vec![0u8; 4];
+    let start_result = SIM_HandleMessage(
+        MessageType::Start as c_int,
+        start_data.len() as c_int,
+        start_data.as_ptr() as *mut c_schar,
+    );
+    assert!(!start_result.is_null(), "Start should return GDU pointer");
+
+    // BeginSave
+    let mut size: c_int = 0;
+    let save_result = SIM_BeginSave(&mut size, 0, 0);
+    assert!(!save_result.is_null(), "BeginSave should succeed after Start");
+    assert_eq!(size, 1325);
+    SIM_EndSave();
+
+    // Start 消息会启动 sim 线程，必须 Shutdown join 线程，避免后续测试死锁
+    SIM_Shutdown();
 }

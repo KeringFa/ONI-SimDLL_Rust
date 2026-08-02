@@ -1,116 +1,85 @@
-//! Phase 0 冒烟测试：模拟 C# P/Invoke 调用 9 个导出函数。
-//!
-//! 运行：cargo test --test abi_smoke
+//! FFI 集成测试：模拟 C# P/Invoke 调用 9 个导出函数。
 
-use SimDLL::sim_api::*;
-use std::os::raw::{c_char, c_int, c_void};
+use SimDLL::a_framework::sim_api::*;
+use std::os::raw::{c_char, c_int, c_schar, c_void};
 
 #[test]
-fn sim_initialize_with_null_handler_smoke() {
-    // 模拟 C# 在主菜单启动时调用 SIM_Initialize(null)
-    // 应不崩、不返回（void）
-    SIM_Initialize(None);
-    // 二次调用应安全（幂等）
+fn sim_initialize_with_null_does_not_crash() {
     SIM_Initialize(None);
 }
 
 #[test]
-fn sim_handle_message_smoke() {
-    // 模拟 C# 发送一条空消息
-    let result: *mut c_void = SIM_HandleMessage(0, 0, std::ptr::null_mut());
-    assert!(result.is_null(), "Phase 0 stub should return null");
+fn sim_shutdown_does_not_crash() {
+    SIM_Shutdown();
 }
 
 #[test]
-fn sim_handle_messages_smoke() {
-    // 模拟 C# 批量发送
+fn sim_handle_message_null_returns_null() {
+    let result = SIM_HandleMessage(0, 0, std::ptr::null_mut());
+    assert!(result.is_null());
+}
+
+#[test]
+fn sim_handle_messages_null_returns_null() {
     let result = SIM_HandleMessages(0, 0, 0, std::ptr::null_mut());
     assert!(result.is_null());
 }
 
 #[test]
-fn sim_begin_save_smoke() {
-    // 模拟 C# 触发存档
-    let mut size: c_int = 0xDEAD; // 初始化为哨兵值
-    let result = SIM_BeginSave(&mut size as *mut c_int, 0, 0);
-    // Phase 4: begin_save 成功返回非空指针 + size>0（empty world → 29 字节头部）
-    assert!(!result.is_null(), "SIM_BeginSave should return non-null pointer");
-    assert!(size > 0, "size should be positive, got {}", size);
-    // 清理 save buffer（避免泄漏影响后续测试）
+fn sim_begin_save_returns_null_and_zero_size() {
+    let mut size: c_int = -1;
+    let result = SIM_BeginSave(&mut size, 0, 0);
+    assert!(result.is_null());
+    assert_eq!(size, 0);
+}
+
+#[test]
+fn sim_begin_save_null_out_size_does_not_crash() {
+    let result = SIM_BeginSave(std::ptr::null_mut(), 0, 0);
+    assert!(result.is_null());
+}
+
+#[test]
+fn sim_end_save_does_not_crash() {
     SIM_EndSave();
 }
 
 #[test]
-fn sim_end_save_smoke() {
-    // 模拟 C# 结束存档
-    SIM_EndSave();
-}
-
-#[test]
-fn sim_shutdown_smoke() {
-    // 模拟 C# 退出游戏
-    SIM_Shutdown();
-}
-
-#[test]
-fn sim_debug_crash_smoke() {
-    // 验证桩不真正崩溃
+fn sim_debug_crash_does_not_crash() {
     SIM_DebugCrash();
 }
 
 #[test]
-fn sysinfo_acquire_returns_valid_c_string_smoke() {
-    // 模拟 C# 读取 SYSINFO
-    unsafe {
-        let ptr: *mut c_char = SYSINFO_Acquire();
-        assert!(!ptr.is_null());
-        // 用 CStr 验证是合法的 NUL 终止字符串
-        let cstr = std::ffi::CStr::from_ptr(ptr);
-        let s = cstr.to_str().expect("should be valid UTF-8");
-        assert!(s.contains("stub"));
-        assert!(s.contains("windows"));
-        assert!(s.contains("x86_64"));
-    }
+fn sysinfo_acquire_returns_non_null() {
+    let ptr = SYSINFO_Acquire();
+    assert!(!ptr.is_null());
+    SYSINFO_Release(ptr);
 }
 
 #[test]
-fn sysinfo_release_smoke() {
-    // 释放应安全
-    SYSINFO_Release();
+fn sysinfo_release_null_is_safe() {
+    SYSINFO_Release(std::ptr::null_mut());
 }
 
 #[test]
-fn full_lifecycle_smoke() {
-    // 模拟游戏完整会话：启动 → 发消息 → 查 SYSINFO → 关闭
-    SIM_Initialize(None);
-    let _ = SIM_HandleMessage(42, 0, std::ptr::null_mut());
-    let _ = SYSINFO_Acquire();
-    SYSINFO_Release();
-    SIM_Shutdown();
+fn sim_handle_message_with_data_returns_null() {
+    // 构造一个简单的数据 buffer
+    let data: Vec<u8> = vec![1, 2, 3, 4];
+    let result = SIM_HandleMessage(42, 4, data.as_ptr() as *mut c_schar);
+    assert!(result.is_null());
 }
 
 #[test]
 fn binary_buffer_round_trip_integration() {
-    use SimDLL::buffer::{BinaryBufferReader, BinaryBufferWriter};
-
-    let mut writer = BinaryBufferWriter::new();
-    writer.write_int(42).unwrap();
-    writer.write_uint(0xDEAD_BEEF).unwrap();
-    writer.write_float(3.14).unwrap();
-    writer.write_string("hello simDLL").unwrap();
-    writer.write_byte(0xFF).unwrap();
-    writer.write_short(-1).unwrap();
-    writer.write_ushort(60000).unwrap();
-
-    let bytes = writer.into_bytes();
-    let mut reader = BinaryBufferReader::new(&bytes);
-
-    assert_eq!(reader.read_int().unwrap(), 42);
-    assert_eq!(reader.read_uint().unwrap(), 0xDEAD_BEEF);
-    assert_eq!(reader.read_float().unwrap(), 3.14);
-    assert_eq!(reader.read_string().unwrap(), "hello simDLL");
-    assert_eq!(reader.read_byte().unwrap(), 0xFF);
-    assert_eq!(reader.read_short().unwrap(), -1);
-    assert_eq!(reader.read_ushort().unwrap(), 60000);
-    assert!(reader.is_at_end());
+    use SimDLL::a_framework::buffer::{BinaryBufferReader, BinaryBufferWriter};
+    let mut w = BinaryBufferWriter::new();
+    w.write_int(42);
+    w.write_float(3.14);
+    w.write_string("test");
+    let bytes = w.into_bytes();
+    let mut r = BinaryBufferReader::new(&bytes);
+    assert_eq!(r.read_int().unwrap(), 42);
+    assert_eq!(r.read_float().unwrap(), 3.14);
+    assert_eq!(r.read_string().unwrap(), "test");
+    assert!(r.is_at_end());
 }

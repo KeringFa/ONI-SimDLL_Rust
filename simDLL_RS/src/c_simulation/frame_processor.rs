@@ -1,0 +1,1919 @@
+//! ProcessFrame 框架 + Process* 子函数。
+//!
+//! 对照源码 08_sim_frame_manager.c L1178-1899（ProcessFrame）和
+//! 06_process_messages.c（各 Process* 子函数）。
+//!
+//! C1 策略：
+//! - 非物理消息处理（Dig/ModifyCell/SetInsulation 等）真实实现
+//! - 物理消息处理（CellEnergy/MassConsumption/MassEmission 等）为桩，只清空 vector
+
+use crate::a_framework::sim_data::SimData;
+use crate::a_framework::sim_frame_manager::SimFrameInfo;
+use crate::b_elements::elements_table;
+
+/// ProcessFrame：处理一帧的所有消息。
+///
+/// 对照源码 08_sim_frame_manager.c L1178-1899。
+/// 依次调用处理步骤（非物理子函数真实实现，物理子函数桩）。
+pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    // 步骤 1: 内联处理 set_insulation_values
+    process_set_insulation_values(frame, sim_data);
+
+    // 步骤 2: 内联处理 set_strength_values
+    process_set_strength_values(frame, sim_data);
+
+    // 步骤 3: ProcessCellEnergyModifications（C2 桩）
+    process_cell_energy_modifications(frame, sim_data);
+
+    // 步骤 4: ProcessCellProperties
+    process_cell_properties(frame, sim_data);
+
+    // 步骤 5: ProcessMassConsumption（C2 桩）
+    process_mass_consumption(frame, sim_data);
+
+    // 步骤 6: ProcessMassEmission（C2 桩）
+    process_mass_emission(frame, sim_data);
+
+    // 步骤 7: ProcessConsumeDisease（C2 桩）
+    process_consume_disease(frame, sim_data);
+
+    // 步骤 8: 内联处理 cell_disease_modifications（C2 桩）
+    process_cell_disease_modifications(frame, sim_data);
+
+    // 步骤 9: ProcessCellRadiationChanges（C2 桩）
+    process_cell_radiation_changes(frame, sim_data);
+
+    // 步骤 10: ProcessDigPoints（C1 真实实现）
+    process_dig_points(frame, sim_data);
+
+    // 步骤 11: ProcessCellModifications
+    process_cell_modifications(frame, sim_data);
+
+    // 步骤 12: 内联处理 cell_world_zone_modifications
+    process_cell_world_zone_modifications(frame, sim_data);
+
+    // 步骤 13: ElementConsumer 消息（Register/Modify/Unregister，2026-08-02 实现）
+    process_element_consumer_messages(frame, sim_data);
+    process_building_heat_exchange_messages(frame, sim_data);
+
+    // 步骤 14+: 其他 Component 消息处理（C2 桩）
+    process_component_messages_stubs(frame, sim_data);
+}
+
+/// ProcessDigPoints：处理挖掘点。
+///
+/// 对照源码 06_process_messages.c L524-744。
+///
+/// 关键逻辑：
+/// 1. 遍历 dig_points（12 字节步长）
+/// 2. 坐标转换 gameCell → simCell
+/// 3. 读取元素索引（backwall 决定从 updatedCells 还是 backwall 读取）
+/// 4. 如果 callback_idx != -1，push 到 callback_info
+/// 5. 检查 element.state & 3 == 3（固体）
+/// 6. 如果固体且 !skip_event：读取 mass/temp/diseaseIdx/diseaseCount
+///    - 如果 mass > 0：push MassConsumedCallback 到 dig_info（复用 SpawnOreInfo）
+/// 7. 清除单元格（ClearCell 或 ClearBackwall）
+/// 8. 如果 backwall：push BackwallElementChangedInfo
+/// 9. push SubstanceChangeInfo（oldElementIdx=0xFFFF, newElementIdx=0xFFFF）
+/// 10. 设置 timers[simCell] |= 0x1F
+/// 11. 清空 dig_points
+pub fn process_dig_points(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    let game_w = sim_data.width - 2;
+    if game_w <= 0 {
+        frame.dig_points.clear_keep_capacity();
+        return;
+    }
+
+    if sim_data.updated_cells.ptr.is_null() || sim_data.backwall.ptr.is_null() || sim_data.sim_events.ptr.is_null() {
+        tracing::warn!("process_dig_points: updated_cells/backwall/sim_events ptr is null");
+        frame.dig_points.clear_keep_capacity();
+        return;
+    }
+
+    let dig_points_slice = frame.dig_points.as_slice();
+    let count = dig_points_slice.len();
+
+    for i in 0..count {
+        let dig_point = dig_points_slice[i];
+
+        // 1. 坐标转换：gameCell → simCell
+        // 公式：simCell = (gameCell % (width-2) + 1) + (gameCell / (width-2) + 1) * width
+        let internal_cell = ((dig_point.game_cell % game_w + 1) as i32)
+            + ((dig_point.game_cell / game_w + 1) as i32) * sim_data.width;
+        let cell_idx = internal_cell as usize;
+
+        // 2. 读取元素索引
+        let elem_idx = if dig_point.backwall == 0 {
+            let updated_cells = unsafe { &*sim_data.updated_cells.ptr };
+            updated_cells.element_idx.get(cell_idx)
+        } else {
+            let backwall = unsafe { &*sim_data.backwall.ptr };
+            backwall.element_idx.get(cell_idx)
+        };
+
+        // 3. 如果 callback_idx != -1，push 到 callback_info
+        if dig_point.callback_idx != -1 {
+            let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+            sim_events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
+                callback_idx: dig_point.callback_idx,
+            });
+        }
+
+        // 4. 检查元素是否为固体（state & 3 == 3）
+        let is_solid = match elements_table::get_element_state_by_idx(elem_idx) {
+            Some(state) => state == 3,
+            None => false,
+        };
+
+        if is_solid {
+            // 5. 如果 !skip_event，生成 MassConsumedCallback（push 到 dig_info）
+            if dig_point.skip_event == 0 {
+                let (mass, temp, disease_idx, disease_count) = if dig_point.backwall == 0 {
+                    let updated_cells = unsafe { &*sim_data.updated_cells.ptr };
+                    let mass = updated_cells.mass.get(cell_idx);
+                    let temp = updated_cells.temperature.get(cell_idx);
+                    let disease_idx = updated_cells.disease_idx.get(cell_idx);
+                    let disease_count = updated_cells.disease_count.get(cell_idx);
+                    (mass, temp, disease_idx, disease_count)
+                } else {
+                    let backwall = unsafe { &*sim_data.backwall.ptr };
+                    let mass = backwall.mass.get(cell_idx);
+                    let temp = backwall.temperature.get(cell_idx);
+                    (mass, temp, 0xFFu8, 0i32)
+                };
+
+                if mass > 0.0 {
+                    // 反向坐标转换：simCell → gameCell
+                    let game_cell_out = ((internal_cell % sim_data.width) - 1)
+                        + ((internal_cell / sim_data.width) - 1) * game_w;
+
+                    if game_cell_out >= 0 && game_cell_out < sim_data.num_game_cells {
+                        // push MassConsumedCallback 到 dig_info（复用 SpawnOreInfo）
+                        // 对照源码 L667-688：callbackIdx 字段复用存 gameCell
+                        let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+                        sim_events.dig_info.push(crate::a_framework::game_data::SpawnOreInfo {
+                            cell_idx: game_cell_out,  // 对应源码 callbackIdx = gameCell
+                            elem_idx: elem_idx,
+                            disease_idx: disease_idx,
+                            pad: 0,
+                            mass: mass,
+                            temperature: temp,
+                            disease_count: disease_count,
+                        });
+                    }
+                }
+            }
+
+            // 6. 移除单元格元素
+            if dig_point.backwall == 0 {
+                crate::c_simulation::sim_data_ops::clear_cell(sim_data, internal_cell);
+            } else {
+                crate::c_simulation::sim_data_ops::clear_backwall(sim_data, internal_cell);
+
+                // 生成 BackwallElementChangedInfo
+                let game_cell_out = ((internal_cell % sim_data.width) - 1)
+                    + ((internal_cell / sim_data.width) - 1) * game_w;
+                if game_cell_out >= 0 && game_cell_out < sim_data.num_game_cells {
+                    let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+                    sim_events.backwall_element_changed_info.push(
+                        crate::a_framework::game_data::BackwallElementChangedInfo {
+                            game_cell: game_cell_out as u32,
+                        }
+                    );
+                }
+            }
+
+            // 7. 生成 SubstanceChangeInfo
+            // 对照源码 06_process_messages.c L714-733。
+            //
+            // 原版此处 old/new 均填 0xFFFF 占位——真实值由
+            // CopySimDataToGame 的 SubstanceChangeInfo 后处理
+            // （sim_data_ops.rs，对照源码 L132321-132337）用
+            // mGameData(旧)/mSimData(新) 的 cells 回填，并派生
+            // solidInfo/solidSubstanceChangeInfo/liquidChangeInfo。
+            let game_cell_out = ((internal_cell % sim_data.width) - 1)
+                + ((internal_cell / sim_data.width) - 1) * game_w;
+            if game_cell_out >= 0 && game_cell_out < sim_data.num_game_cells {
+                let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+                sim_events.substance_change_info.push(
+                    crate::a_framework::game_data::SubstanceChangeInfo {
+                        cell_idx: game_cell_out,
+                        old_element_idx: 0xFFFF,
+                        new_element_idx: 0xFFFF,
+                    }
+                );
+            }
+
+            // 8. 设置定时器位标志（timers[cell] |= 0x1F）
+            // 对照源码 L734-735
+            if !sim_data.timers.ptr.is_null() {
+                unsafe {
+                    let timers_ptr = sim_data.timers.ptr as *mut u8;
+                    let old_val = std::ptr::read(timers_ptr.add(cell_idx));
+                    std::ptr::write(timers_ptr.add(cell_idx), old_val | 0x1F);
+                }
+            }
+        }
+    }
+
+    // 9. 清空 dig_points
+    frame.dig_points.clear_keep_capacity();
+}
+
+/// ProcessSetInsulationValues：处理绝缘值设置。
+/// 对照源码 ProcessFrame L1218-1234。
+fn process_set_insulation_values(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    let game_w = sim_data.width - 2;
+    if game_w <= 0 {
+        frame.set_insulation_values.clear_keep_capacity();
+        return;
+    }
+    if sim_data.updated_cells.ptr.is_null() {
+        frame.set_insulation_values.clear_keep_capacity();
+        return;
+    }
+    let slice = frame.set_insulation_values.as_slice();
+    let count = slice.len();
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    for i in 0..count {
+        let entry = slice[i];
+        let internal_cell = ((entry.game_cell % game_w + 1) as i32)
+            + ((entry.game_cell / game_w + 1) as i32) * sim_data.width;
+        updated_cells.insulation.set(internal_cell as usize, entry.value as u8);
+    }
+    frame.set_insulation_values.clear_keep_capacity();
+}
+
+/// ProcessSetStrengthValues：处理强度值设置。
+/// 对照源码 ProcessFrame L1235-1259。
+fn process_set_strength_values(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    let game_w = sim_data.width - 2;
+    if game_w <= 0 {
+        frame.set_strength_values.clear_keep_capacity();
+        return;
+    }
+    if sim_data.updated_cells.ptr.is_null() {
+        frame.set_strength_values.clear_keep_capacity();
+        return;
+    }
+    let slice = frame.set_strength_values.as_slice();
+    let count = slice.len();
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    for i in 0..count {
+        let entry = slice[i];
+        let internal_cell = ((entry.game_cell % game_w + 1) as i32)
+            + ((entry.game_cell / game_w + 1) as i32) * sim_data.width;
+        updated_cells.strength_info.set(internal_cell as usize, entry.value as u8);
+    }
+    frame.set_strength_values.clear_keep_capacity();
+}
+
+/// ProcessCellProperties：处理单元格属性设置/清除。
+/// 对照源码 06_process_messages.c L262-269。
+fn process_cell_properties(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    let game_w = sim_data.width - 2;
+    if game_w <= 0 {
+        frame.set_cell_properties.clear_keep_capacity();
+        return;
+    }
+    if sim_data.updated_cells.ptr.is_null() {
+        frame.set_cell_properties.clear_keep_capacity();
+        return;
+    }
+    let slice = frame.set_cell_properties.as_slice();
+    let count = slice.len();
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    for i in 0..count {
+        let entry = slice[i];
+        let internal_cell = ((entry.game_cell % game_w + 1) as i32)
+            + ((entry.game_cell / game_w + 1) as i32) * sim_data.width;
+        let idx = internal_cell as usize;
+        // entry.property_flags = mask, entry.set_or_clear = set(1)/clear(0) flag
+        let mask = entry.property_flags;
+        let set_flag = entry.set_or_clear;
+        let current = updated_cells.properties.get(idx);
+        let new_val = if set_flag == 0 {
+            current & !mask
+        } else {
+            current | mask
+        };
+        updated_cells.properties.set(idx, new_val);
+    }
+    frame.set_cell_properties.clear_keep_capacity();
+}
+
+/// ProcessCellModifications：处理单元格修改。
+/// 对照源码 06_process_messages.c ProcessCellModifications。
+/// ProcessCellModifications：处理单元格修改（ModifyCell 消息）。
+/// 对照源码 cellmodifications.cpp（SimDLL_Source.c L134789-135039）。
+///
+/// 按 replace_mode 分派（源码 L134880-135018）：
+/// - 1 (Replace)：replace_element，完整对照源码 L135141-135225
+/// - 0 (Add/按状态累加)：简化实现——写字段 + change_substance 通知
+///   （原版 AddGas/AddSolid/AddLiquid 的合并语义属 C2 物理，TODO C2）
+/// - 2 (ReplaceAndDisplace)：目标格液体 → displace_liquid；气体 → displace_gas；
+///   然后写字段 + change_substance 通知（K2 修复，原版 DisplaceGas/DisplaceLiquid 置换语义）。
+/// 每条消息末尾：callback_idx != -1 → push callback_info（源码 L135019-135031）。
+fn process_cell_modifications(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    let game_w = sim_data.width - 2;
+    if game_w <= 0 {
+        frame.cell_modifications.clear_keep_capacity();
+        return;
+    }
+    if sim_data.updated_cells.ptr.is_null() || sim_data.sim_events.ptr.is_null() {
+        frame.cell_modifications.clear_keep_capacity();
+        return;
+    }
+    let slice = frame.cell_modifications.as_slice();
+    let count = slice.len();
+    for i in 0..count {
+        let entry = slice[i];
+        let internal_cell = ((entry.game_cell % game_w + 1) as i32)
+            + ((entry.game_cell / game_w + 1) as i32) * sim_data.width;
+        let idx = internal_cell as usize;
+
+        match entry.replace_mode {
+            1 => replace_element(sim_data, idx, &entry),
+            // 2 (ReplaceAndDisplace)：先把目标格的液体/气体挤压到邻格，再写新字段
+            // （原版 06_process_messages.c L250-297：液体 → DisplaceLiquid；气体 → DisplaceGas）。
+            // K2 修复：此前为简化写入（TODO C2），挤压位移链路在生产中永不执行。
+            2 => {
+                let cur_elem = {
+                    let updated_cells = unsafe { &*sim_data.updated_cells.ptr };
+                    updated_cells.element_idx.get(idx)
+                };
+                let cur_state = elements_table::get_element_post_process_data(cur_elem)
+                    .map(|p| p.state & 3)
+                    .unwrap_or(0);
+                if cur_state == 2 {
+                    crate::c2_physics::liquid_flow::displace_liquid(sim_data, idx, cur_elem);
+                } else if cur_state == 1 {
+                    crate::c2_physics::liquid_flow::displace_gas(sim_data, idx, cur_elem);
+                }
+                let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+                updated_cells.element_idx.set(idx, entry.element_idx);
+                updated_cells.temperature.set(idx, entry.temperature);
+                updated_cells.mass.set(idx, entry.mass);
+                updated_cells.disease_count.set(idx, entry.disease_count);
+                updated_cells.disease_idx.set(idx, entry.disease_idx);
+                change_substance(sim_data, idx);
+            }
+            // 0 (Add)：严格对照原版 cellmodifications.cpp 分派（SimDLL_Source.c L134880-135018）——
+            // 按**被添加元素**形态分派：液体→add_liquid（合并吸收为一格）、气体→add_gas、固体→add_solid；
+            // mass<0 → 目标同形态减质量（<=0 清格 + 事件）。
+            // 2026-08-02 修复：此前直接覆盖质量（吞掉落点原有液体），液滴落地回注语义错误。
+            _ => {
+                if entry.replace_mode != 0 {
+                    tracing::warn!(
+                        "process_cell_modifications: invalid replace_mode {} (game_cell={})",
+                        entry.replace_mode, entry.game_cell
+                    );
+                }
+                let mass = entry.mass;
+                let add_state = crate::b_elements::elements_table::get_element_post_process_data(
+                    entry.element_idx,
+                )
+                .map(|p| p.state & 3)
+                .unwrap_or(0xFF);
+                if mass < 0.0 {
+                    // 原版 L134892-134955 负质量：目标同形态 → 减质量，<=0 清格 + 事件
+                    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+                    let cur_state =
+                        crate::b_elements::elements_table::get_element_post_process_data(
+                            updated_cells.element_idx.get(idx),
+                        )
+                        .map(|p| p.state & 3)
+                        .unwrap_or(0xFF);
+                    if cur_state == add_state {
+                        let new_mass = (updated_cells.mass.get(idx) + mass).max(0.0);
+                        updated_cells.mass.set(idx, new_mass);
+                        if new_mass <= 1.1754944e-38 {
+                            updated_cells.element_idx.set(idx, sim_data.vacuum_element_idx);
+                            updated_cells.mass.set(idx, 0.0);
+                            updated_cells.temperature.set(idx, 0.0);
+                            updated_cells.disease_idx.set(idx, 0xFF);
+                            updated_cells.disease_count.set(idx, 0);
+                            updated_cells.disease_infestation_tick_count.set(idx, 0);
+                            updated_cells.disease_growth_accumulated_error.set(idx, 0.0);
+                            change_substance(sim_data, idx);
+                        }
+                    }
+                } else if mass > 0.0 {
+                    let (elem, temp, didx, dcount) = (
+                        entry.element_idx,
+                        entry.temperature,
+                        entry.disease_idx,
+                        entry.disease_count,
+                    );
+                    match add_state {
+                        1 => crate::c2_physics::liquid_flow::add_gas(
+                            sim_data, idx, elem, mass, temp, didx, dcount,
+                        ),
+                        2 => crate::c2_physics::liquid_flow::add_liquid(
+                            sim_data, idx, elem, mass, temp, didx, dcount,
+                        ),
+                        3 => crate::c2_physics::liquid_flow::add_solid(
+                            sim_data, idx, elem, mass, temp, didx, dcount,
+                        ),
+                        _ => {
+                            // 真空元素 Add → 原版 "Invalid replacement type" 崩溃；安全跳过
+                            tracing::warn!(
+                                "process_cell_modifications: add vacuum element ignored (game_cell={})",
+                                entry.game_cell
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // callback_idx != -1 → push callback_info（源码 L135019-135031）
+        if entry.callback_idx != -1 {
+            let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+            sim_events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
+                callback_idx: entry.callback_idx,
+            });
+        }
+    }
+    frame.cell_modifications.clear_keep_capacity();
+}
+
+/// ReplaceElement（对照源码 L135141-135225）。
+///
+/// 1. 写入 element_idx
+/// 2. 新元素 state==0（Vacuum/Void）→ 温度钳 0、质量钳 0
+/// 3. 写入 temperature / mass
+/// 4. ChangeSubstance 通知（substance_change_info + timers 标脏）
+/// 5. 写入 disease 三字段并清零侵扰计数/增长误差
+fn replace_element(
+    sim_data: &mut SimData,
+    sim_cell_idx: usize,
+    entry: &crate::a_framework::sim_events::CellModification,
+) {
+    let idx = sim_cell_idx;
+    let state = elements_table::get_element_state_by_idx(entry.element_idx).unwrap_or(0);
+    let mut temperature = entry.temperature;
+    let mut mass = entry.mass;
+    {
+        let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+        updated_cells.element_idx.set(idx, entry.element_idx);
+        if state == 0 {
+            temperature = 0.0;
+        }
+        updated_cells.temperature.set(idx, temperature);
+        if state == 0 {
+            mass = 0.0;
+        }
+        updated_cells.mass.set(idx, mass);
+    }
+
+    // ChangeSubstance（源码 L135201）
+    change_substance(sim_data, idx);
+
+    // disease 字段（源码 L135202-135221：diseaseIdx/diseaseCount/侵扰计数/增长误差）
+    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+    updated_cells.disease_idx.set(idx, entry.disease_idx);
+    updated_cells.disease_count.set(idx, entry.disease_count);
+    updated_cells.disease_infestation_tick_count.set(idx, 0u8);
+    updated_cells.disease_growth_accumulated_error.set(idx, 0.0f32);
+}
+
+/// SimEvents::ChangeSubstance（对照源码 L133152-133186）。
+///
+/// simCell → gameCell 坐标转换，push substance_change_info
+/// （old/new 填 0xFFFF 占位，由 CopySimDataToGame 后处理回填并派生
+/// solidInfo/solidSubstanceChangeInfo/liquidChangeInfo），
+/// 并标记 timers[simCell] |= 0x1F。
+fn change_substance(sim_data: &mut SimData, sim_cell_idx: usize) {
+    let width = sim_data.width;
+    let game_w = width - 2;
+    let internal = sim_cell_idx as i32;
+    let game_cell = (internal % width - 1) + (internal / width - 1) * game_w;
+    if game_cell >= 0 && game_cell < sim_data.num_game_cells {
+        let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+        sim_events.substance_change_info.push(
+            crate::a_framework::game_data::SubstanceChangeInfo {
+                cell_idx: game_cell,
+                old_element_idx: 0xFFFF,
+                new_element_idx: 0xFFFF,
+            }
+        );
+    }
+    if !sim_data.timers.ptr.is_null() {
+        unsafe {
+            let timers_ptr = sim_data.timers.ptr as *mut u8;
+            let old_val = std::ptr::read(timers_ptr.add(sim_cell_idx));
+            std::ptr::write(timers_ptr.add(sim_cell_idx), old_val | 0x1F);
+        }
+    }
+}
+
+/// ProcessCellWorldZoneModifications：处理世界区域修改。
+/// 对照源码 ProcessFrame L1331-1343。
+fn process_cell_world_zone_modifications(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    let game_w = sim_data.width - 2;
+    if game_w <= 0 {
+        frame.cell_world_zone_modifications.clear_keep_capacity();
+        return;
+    }
+    if sim_data.world_zones.ptr.is_null() {
+        frame.cell_world_zone_modifications.clear_keep_capacity();
+        return;
+    }
+    let slice = frame.cell_world_zone_modifications.as_slice();
+    let count = slice.len();
+    let world_zones = sim_data.world_zones.ptr as *mut u8;
+    for i in 0..count {
+        let entry = slice[i];
+        let internal_cell = ((entry.game_cell % game_w + 1) as i32)
+            + ((entry.game_cell / game_w + 1) as i32) * sim_data.width;
+        unsafe {
+            std::ptr::write(world_zones.add(internal_cell as usize), entry.zone_id);
+        }
+    }
+    frame.cell_world_zone_modifications.clear_keep_capacity();
+}
+
+// ===== C2 桩子函数 =====
+
+fn process_cell_energy_modifications(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+    frame.cell_energy_modifications.clear_keep_capacity();
+}
+
+/// 被移除质量汇总（原版 ConsumedMassInfo 语义）。
+#[derive(Default, Clone, Copy)]
+struct RemovedMass {
+    disease_idx: u8,
+    mass: f32,
+    temperature: f32,
+    disease_count: i32,
+}
+
+/// 从单格移除质量（原版 do_remove，SimDLL_Source.c L136509）。
+/// 只移除 element == elem 的格；扣 min(mass_to_remove, cell_mass)，
+/// 质量加权温度混合进 removed、病菌按比例；格质量 <= 0 → 清格 + substance 事件。
+fn remove_mass_from_cell(
+    sim_data: &mut SimData,
+    cell: usize,
+    elem: u16,
+    mass_to_remove: &mut f32,
+    removed: &mut RemovedMass,
+) {
+    if sim_data.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim_data.updated_cells.ptr };
+    if cell >= updated.element_idx.len() || updated.element_idx.get(cell) != elem {
+        return;
+    }
+    let cell_mass = updated.mass.get(cell);
+    let remove = if *mass_to_remove < cell_mass { *mass_to_remove } else { cell_mass };
+    if remove <= 0.0 {
+        return;
+    }
+    let cell_disease = updated.disease_count.get(cell);
+    let disease_removed = ((cell_disease as f32) * (remove / cell_mass)) as i32;
+    let cell_temp = updated.temperature.get(cell);
+    // 质量加权温度混合（原版 L136345-136370，clamp 到两温度之间）
+    let new_mass = removed.mass + remove;
+    let mixed = if new_mass > 0.0 {
+        (removed.mass * removed.temperature + cell_temp * remove) / new_mass
+    } else {
+        cell_temp
+    };
+    let lo = removed.temperature.min(cell_temp);
+    let hi = removed.temperature.max(cell_temp);
+    removed.temperature = mixed.clamp(lo, hi);
+    removed.mass = new_mass;
+    // 病菌汇总（简化：同病菌累加、异病菌替换，与 add_disease_to_cell 一致）
+    let cell_d_idx = updated.disease_idx.get(cell);
+    if cell_d_idx != 0xFF {
+        if removed.disease_idx == 0xFF || removed.disease_idx == cell_d_idx {
+            removed.disease_idx = cell_d_idx;
+            removed.disease_count += disease_removed;
+        } else {
+            removed.disease_idx = cell_d_idx;
+            removed.disease_count = disease_removed;
+        }
+    }
+    // 源格扣减
+    let remaining_mass = cell_mass - remove;
+    let remaining_disease = cell_disease - disease_removed;
+    updated.mass.set(cell, remaining_mass);
+    updated.disease_count.set(cell, remaining_disease);
+    if remaining_disease <= 0 {
+        updated.disease_idx.set(cell, 0xFF);
+        updated.disease_infestation_tick_count.set(cell, 0);
+        updated.disease_growth_accumulated_error.set(cell, 0.0);
+    }
+    *mass_to_remove -= remove;
+    if remaining_mass <= 1.1754944e-38 {
+        // ClearCell + ChangeSubstance（原版 L136370-136377）
+        updated.element_idx.set(cell, sim_data.vacuum_element_idx);
+        updated.mass.set(cell, 0.0);
+        updated.temperature.set(cell, 0.0);
+        updated.disease_idx.set(cell, 0xFF);
+        updated.disease_count.set(cell, 0);
+        updated.disease_infestation_tick_count.set(cell, 0);
+        updated.disease_growth_accumulated_error.set(cell, 0.0);
+        change_substance(sim_data, cell);
+    }
+}
+
+/// RectangularRemoved（原版 L136290-136430）：矩形区域 [x, x+width) × [y, y+height)
+/// 逐格移除 elem，直到 mass_to_remove 耗尽。
+fn rectangular_removed(
+    sim_data: &mut SimData,
+    mass_to_remove: &mut f32,
+    elem: u16,
+    removed: &mut RemovedMass,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) {
+    let w = sim_data.width as usize;
+    for row in y..y + height {
+        for col in x..x + width {
+            if *mass_to_remove <= 0.0 {
+                return;
+            }
+            remove_mass_from_cell(sim_data, row * w + col, elem, mass_to_remove, removed);
+        }
+    }
+}
+
+/// FloodRemoved（原版 L136290 + Flood<> L135332）：从 (x,y) 起 BFS，深度 < radius。
+/// 过滤器按被移除元素形态：移除固体 → 只穿越固体；移除液体/气体 → 跳过固体。
+fn flood_removed(
+    sim_data: &mut SimData,
+    mass_to_remove: &mut f32,
+    elem: u16,
+    removed: &mut RemovedMass,
+    x: usize,
+    y: usize,
+    radius: usize,
+) {
+    let elem_is_solid = match elements_table::get_element_post_process_data(elem) {
+        Some(p) => (p.state & 3) == 3,
+        None => return,
+    };
+    let skip_solid = !elem_is_solid;
+    let skip_liquid = elem_is_solid;
+    let skip_gas = elem_is_solid;
+    let w = sim_data.width as usize;
+    let h = sim_data.height as usize;
+    let total = w * h;
+    let mut visited = vec![false; total];
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((x, y, 0usize));
+    if x < w && y < h {
+        visited[y * w + x] = true;
+    }
+    while let Some((cx, cy, depth)) = queue.pop_front() {
+        if *mass_to_remove <= 0.0 {
+            break;
+        }
+        if depth >= radius {
+            continue;
+        }
+        let cell = cy * w + cx;
+        let state = {
+            let updated = unsafe { &*sim_data.updated_cells.ptr };
+            if cell >= updated.element_idx.len() {
+                continue;
+            }
+            elements_table::get_element_post_process_data(updated.element_idx.get(cell))
+                .map(|p| p.state & 3)
+                .unwrap_or(0xFF)
+        };
+        if (skip_solid && state == 3) || (skip_liquid && state == 2) || (skip_gas && state == 1) {
+            continue;
+        }
+        remove_mass_from_cell(sim_data, cell, elem, mass_to_remove, removed);
+        for (nx, ny) in [
+            (cx + 1, cy),
+            (cx.wrapping_sub(1), cy),
+            (cx, cy + 1),
+            (cx, cy.wrapping_sub(1)),
+        ] {
+            if nx < w && ny < h {
+                let n = ny * w + nx;
+                if !visited[n] {
+                    visited[n] = true;
+                    queue.push_back((nx, ny, depth + 1));
+                }
+            }
+        }
+    }
+}
+
+/// ProcessMassConsumption（原版 SimDLL_Source.c L117050-117185）。
+/// MassConsumption 消息：radius 模式 → FloodRemoved；height>0 → RectangularRemoved；
+/// callback_idx != -1 → 推送 MassConsumedCallback。
+/// 2026-08-02 实现：此前为桩（且消息结构体 12B 错位），大块液体移除/建筑拆除排水缺失。
+fn process_mass_consumption(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    if sim_data.updated_cells.ptr.is_null() {
+        frame.mass_consumption_messages.clear_keep_capacity();
+        return;
+    }
+    let game_w = sim_data.width - 2;
+    let width = sim_data.width as usize;
+    let messages = frame.mass_consumption_messages.as_slice();
+    let count = messages.len();
+    for i in 0..count {
+        let msg = messages[i];
+        let internal = ((msg.game_cell % game_w + 1) as i32)
+            + ((msg.game_cell / game_w + 1) as i32) * sim_data.width;
+        if internal < 0 {
+            continue;
+        }
+        let internal = internal as usize;
+        let x = internal % width;
+        let y = internal / width;
+        let mut mass_to_remove = msg.mass;
+        let mut removed = RemovedMass {
+            disease_idx: 0xFF,
+            mass: 0.0,
+            temperature: 0.0,
+            disease_count: 0,
+        };
+        if msg.height == 0 {
+            flood_removed(sim_data, &mut mass_to_remove, msg.element_idx, &mut removed, x, y, msg.radius as usize);
+        } else {
+            rectangular_removed(
+                sim_data,
+                &mut mass_to_remove,
+                msg.element_idx,
+                &mut removed,
+                x,
+                y,
+                msg.radius as usize,
+                msg.height as usize,
+            );
+        }
+        if msg.callback_idx != -1 {
+            let events = unsafe { &mut *sim_data.sim_events.ptr };
+            events.mass_consumed_callbacks.push(
+                crate::a_framework::game_data::MassConsumedCallback {
+                    callback_idx: msg.callback_idx,
+                    elem_idx: msg.element_idx,
+                    disease_idx: removed.disease_idx,
+                    pad: 0,
+                    mass: removed.mass,
+                    temperature: removed.temperature,
+                    disease_count: removed.disease_count,
+                },
+            );
+        }
+    }
+    frame.mass_consumption_messages.clear_keep_capacity();
+}
+
+/// ElementConsumer Register（原版 L140670）：把消费者加入注册表，返回句柄（槽位索引）。
+/// cell_x=0xFFFF 为墓碑槽，可复用。
+fn element_consumer_register(
+    sim: &mut SimData,
+    msg: &crate::a_framework::sim_events::AddElementConsumerMsg,
+) -> i32 {
+    let game_w = sim.width - 2;
+    if game_w <= 0 {
+        return -1;
+    }
+    let width = sim.width as usize;
+    let internal = ((msg.cell_idx % game_w + 1) as i32)
+        + ((msg.cell_idx / game_w + 1) as i32) * sim.width;
+    if internal < 0 {
+        return -1;
+    }
+    let internal = internal as usize;
+    let entry = crate::a_framework::sim_data::ElementConsumerEntry {
+        consumption_rate: 0.0, // SetElementConsumerData 会设置真实速率
+        max_depth: msg.radius,
+        configuration: msg.configuration,
+        element_idx: msg.element_idx,
+        offset_idx: 0,
+        field_0x9: 0,
+        cell_y: (internal / width) as u16,
+        cell_x: (internal % width) as u16,
+        field_0xe: 0,
+    };
+    let registry = &mut sim.element_consumer.registry;
+    let mut handle = -1i32;
+    let n = registry.len();
+    for i in 0..n {
+        let e = registry.get(i);
+        if e.cell_x == 0xFFFF {
+            registry.set(i, entry);
+            handle = i as i32;
+            break;
+        }
+    }
+    if handle < 0 {
+        registry.push(entry);
+        handle = (registry.len() - 1) as i32;
+    }
+    handle
+}
+
+/// ElementConsumer Unregister（原版 L140760）：标记墓碑。
+fn element_consumer_unregister(sim: &mut SimData, handle: i32) {
+    if handle < 0 {
+        return;
+    }
+    let registry = &mut sim.element_consumer.registry;
+    let h = handle as usize;
+    if h < registry.len() {
+        let mut e = registry.get(h);
+        if e.cell_x != 0xFFFF {
+            e.cell_x = 0xFFFF;
+            registry.set(h, e);
+        }
+    }
+}
+
+/// ElementConsumer Modify（原版 L140620）：更新速率与格子。
+fn element_consumer_modify(sim: &mut SimData, msg: &crate::a_framework::sim_events::SetElementConsumerDataMsg) {
+    if msg.handle < 0 {
+        return;
+    }
+    let game_w = sim.width - 2;
+    if game_w <= 0 {
+        return;
+    }
+    let width = sim.width as usize;
+    let internal = ((msg.cell % game_w + 1) as i32) + ((msg.cell / game_w + 1) as i32) * sim.width;
+    if internal < 0 {
+        return;
+    }
+    let internal = internal as usize;
+    let registry = &mut sim.element_consumer.registry;
+    let h = msg.handle as usize;
+    if h < registry.len() {
+        let mut e = registry.get(h);
+        if e.cell_x != 0xFFFF {
+            e.consumption_rate = msg.consumption_rate;
+            e.cell_x = (internal % width) as u16;
+            e.cell_y = (internal / width) as u16;
+            registry.set(h, e);
+        }
+    }
+}
+
+/// 帧处理：ElementConsumer 消息（原版 ProcessFrame L116710-116790）。
+/// Register/Modify/Unregister + component_state_changed 回传句柄给 C#。
+fn process_element_consumer_messages(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    if sim_data.sim_events.ptr.is_null() {
+        frame.element_consumer_messages.adds.clear_keep_capacity();
+        frame.element_consumer_messages.modifies.clear_keep_capacity();
+        frame.element_consumer_messages.removes.clear_keep_capacity();
+        return;
+    }
+    // adds（12B）
+    {
+        let adds = frame.element_consumer_messages.adds.as_slice();
+        let n = adds.len() / 12;
+        for i in 0..n {
+            let msg = unsafe {
+                std::ptr::read_unaligned(
+                    adds.as_ptr().add(i * 12)
+                        as *const crate::a_framework::sim_events::AddElementConsumerMsg,
+                )
+            };
+            let handle = element_consumer_register(sim_data, &msg);
+            tracing::info!(
+                cell = msg.cell_idx,
+                callback = msg.callback_idx,
+                config = msg.configuration,
+                elem = msg.element_idx,
+                radius = msg.radius,
+                handle,
+                "element_consumer: registered"
+            );
+            if msg.callback_idx != -1 {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events
+                    .component_state_changed_messages
+                    .push(crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: msg.callback_idx,
+                        sim_handle: handle,
+                    });
+                tracing::info!(
+                    callback = msg.callback_idx,
+                    handle,
+                    "element_consumer: handle callback pushed"
+                );
+            }
+        }
+        frame.element_consumer_messages.adds.clear_keep_capacity();
+    }
+    // modifies（12B）
+    {
+        let mods = frame.element_consumer_messages.modifies.as_slice();
+        let n = mods.len() / 12;
+        for i in 0..n {
+            let msg = unsafe {
+                std::ptr::read_unaligned(
+                    mods.as_ptr().add(i * 12)
+                        as *const crate::a_framework::sim_events::SetElementConsumerDataMsg,
+                )
+            };
+            element_consumer_modify(sim_data, &msg);
+            tracing::info!(
+                handle = msg.handle,
+                cell = msg.cell,
+                rate = msg.consumption_rate,
+                "element_consumer: modified"
+            );
+        }
+        frame.element_consumer_messages.modifies.clear_keep_capacity();
+    }
+    // removes（8B）
+    {
+        let removes = frame.element_consumer_messages.removes.as_slice();
+        let n = removes.len() / 8;
+        for i in 0..n {
+            let msg = unsafe {
+                std::ptr::read_unaligned(
+                    removes.as_ptr().add(i * 8)
+                        as *const crate::a_framework::sim_events::RemoveElementConsumerMsg,
+                )
+            };
+            element_consumer_unregister(sim_data, msg.handle);
+            if msg.callback_idx != -1 {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events
+                    .component_state_changed_messages
+                    .push(crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: msg.callback_idx,
+                        sim_handle: -1,
+                    });
+            }
+        }
+        frame.element_consumer_messages.removes.clear_keep_capacity();
+    }
+}
+
+/// Frame handling for BuildingHeatExchange messages (adds 44B / modifies 44B / removes 8B).
+/// - adds: allocate building-temperature handle, push component_state_changed callback (C# pipe join)
+/// - modifies: msg.callback_idx carries the sim handle (C# SimMessages.ModifyBuildingHeatExchange)
+/// - removes: free handle
+fn process_building_heat_exchange_messages(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    if sim_data.sim_events.ptr.is_null() {
+        frame.building_heat_exchange_messages.adds.clear_keep_capacity();
+        frame
+            .building_heat_exchange_messages
+            .modifies
+            .clear_keep_capacity();
+        frame
+            .building_heat_exchange_messages
+            .removes
+            .clear_keep_capacity();
+        return;
+    }
+
+    {
+        let adds = frame.building_heat_exchange_messages.adds.as_slice();
+        let n = adds.len() / 44;
+        for i in 0..n {
+            let msg = unsafe {
+                std::ptr::read_unaligned(
+                    adds.as_ptr().add(i * 44)
+                        as *const crate::a_framework::sim_events::AddBuildingHeatExchangeMsg,
+                )
+            };
+            let handle = crate::c_simulation::building_temperature::add_building(&msg);
+            tracing::info!(
+                callback = msg.callback_idx,
+                elem = msg.elem_idx,
+                mass = msg.mass,
+                temp = msg.temperature,
+                handle,
+                "building_temperature: added"
+            );
+            if msg.callback_idx != -1 {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events
+                    .component_state_changed_messages
+                    .push(crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: msg.callback_idx,
+                        sim_handle: handle,
+                    });
+                tracing::info!(
+                    callback = msg.callback_idx,
+                    handle,
+                    "building_temperature: handle callback pushed"
+                );
+            }
+        }
+        frame.building_heat_exchange_messages.adds.clear_keep_capacity();
+    }
+
+    {
+        let mods = frame.building_heat_exchange_messages.modifies.as_slice();
+        let n = mods.len() / 44;
+        for i in 0..n {
+            let msg = unsafe {
+                std::ptr::read_unaligned(
+                    mods.as_ptr().add(i * 44)
+                        as *const crate::a_framework::sim_events::AddBuildingHeatExchangeMsg,
+                )
+            };
+            let ok =
+                crate::c_simulation::building_temperature::modify_building(msg.callback_idx, &msg);
+            tracing::trace!(
+                handle = msg.callback_idx,
+                ok,
+                temp = msg.temperature,
+                "building_temperature: modified"
+            );
+        }
+        frame
+            .building_heat_exchange_messages
+            .modifies
+            .clear_keep_capacity();
+    }
+
+    {
+        let removes = frame.building_heat_exchange_messages.removes.as_slice();
+        let n = removes.len() / 8;
+        for i in 0..n {
+            let msg = unsafe {
+                std::ptr::read_unaligned(
+                    removes.as_ptr().add(i * 8)
+                        as *const crate::a_framework::sim_events::RemoveBuildingHeatExchangeMsg,
+                )
+            };
+            let ok = crate::c_simulation::building_temperature::remove_building(msg.handle);
+            tracing::info!(handle = msg.handle, ok, "building_temperature: removed");
+            if msg.callback_idx != -1 {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events
+                    .component_state_changed_messages
+                    .push(crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: msg.callback_idx,
+                        // 原版 remove 回调 sim_handle = -1（SimDLL_Source.c L116529-116537）
+                        sim_handle: -1,
+                    });
+            }
+        }
+        frame
+            .building_heat_exchange_messages
+            .removes
+            .clear_keep_capacity();
+    }
+}
+
+/// BFS 找 radius 内第一个 state==target 的格元素（原版 GetReachableCells + AnyInputCellHasState）。
+fn find_reachable_state(sim: &SimData, x: usize, y: usize, radius: usize, target: u8) -> Option<u16> {
+    if sim.updated_cells.ptr.is_null() {
+        return None;
+    }
+    let w = sim.width as usize;
+    let h = sim.height as usize;
+    let total = w * h;
+    let mut visited = vec![false; total];
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((x, y, 0usize));
+    if x < w && y < h {
+        visited[y * w + x] = true;
+    }
+    while let Some((cx, cy, depth)) = queue.pop_front() {
+        if depth >= radius {
+            continue;
+        }
+        let cell = cy * w + cx;
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        if cell < updated.element_idx.len() {
+            let elem = updated.element_idx.get(cell);
+            let state = elements_table::get_element_post_process_data(elem)
+                .map(|p| p.state & 3)
+                .unwrap_or(0xFF);
+            if state == target {
+                return Some(elem);
+            }
+        }
+        for (nx, ny) in [
+            (cx + 1, cy),
+            (cx.wrapping_sub(1), cy),
+            (cx, cy + 1),
+            (cx, cy.wrapping_sub(1)),
+        ] {
+            if nx < w && ny < h {
+                let n = ny * w + nx;
+                if !visited[n] {
+                    visited[n] = true;
+                    queue.push_back((nx, ny, depth + 1));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// ElementConsumer::Update（原版 L140776）：逐帧对每个注册消费者 BFS 消费，
+/// 结果填入 elementConsumer.consumedMassInfo（供 C# 泵/涡轮取用）。
+pub(crate) fn process_element_consumers(sim: &mut SimData) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let registry_len = sim.element_consumer.registry.len();
+    if registry_len == 0 {
+        return;
+    }
+    let dt = 0.2f32; // 子步时长（与 sim_thread 200ms 子步一致）
+    let snapshot: Vec<crate::a_framework::sim_data::ElementConsumerEntry> =
+        sim.element_consumer.registry.as_slice().to_vec();
+    for (i, e) in snapshot.iter().enumerate() {
+        if e.cell_x == 0xFFFF {
+            continue;
+        }
+        let x = e.cell_x as usize;
+        let y = e.cell_y as usize;
+        let radius = e.max_depth as usize;
+        let elem = match e.configuration {
+            0 => Some(e.element_idx),
+            1 => find_reachable_state(sim, x, y, radius, 2),
+            2 => find_reachable_state(sim, x, y, radius, 1),
+            _ => None,
+        };
+        if let Some(elem) = elem {
+            let mut amount = dt * e.consumption_rate;
+            let mut removed = RemovedMass {
+                disease_idx: 0xFF,
+                ..Default::default()
+            };
+            flood_removed(sim, &mut amount, elem, &mut removed, x, y, radius);
+            if removed.mass > 0.0 {
+                sim.element_consumer
+                    .consumed_mass_info
+                    .push(crate::a_framework::game_data::ConsumedMassInfo {
+                        sim_handle: crate::a_framework::game_data::Handle {
+                            value: i as i32,
+                        },
+                        removed_elem_idx: elem,
+                        disease_idx: removed.disease_idx,
+                        pad: 0,
+                        mass: removed.mass,
+                        temperature: removed.temperature,
+                        disease_count: removed.disease_count,
+                    });
+                tracing::info!(
+                    handle = i,
+                    elem,
+                    mass = removed.mass,
+                    "element_consumer: consumed"
+                );
+            }
+            // offset_idx 轮转（原版 L140922）
+            let registry = &mut sim.element_consumer.registry;
+            if i < registry.len() {
+                let mut ent = registry.get(i);
+                ent.offset_idx = ent.offset_idx.wrapping_add(1);
+                registry.set(i, ent);
+            }
+        }
+    }
+}
+
+fn process_mass_emission(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+    if _sim_data.updated_cells.ptr.is_null() {
+        frame.mass_emission_messages.clear_keep_capacity();
+        return;
+    }
+    let game_w = _sim_data.width - 2;
+    if game_w <= 0 {
+        frame.mass_emission_messages.clear_keep_capacity();
+        return;
+    }
+    let messages = frame.mass_emission_messages.as_slice();
+    let count = messages.len();
+    for i in 0..count {
+        let msg = messages[i];
+        let internal = ((msg.game_cell % game_w + 1) as i32)
+            + ((msg.game_cell / game_w + 1) as i32) * _sim_data.width;
+        if internal < 0 {
+            continue;
+        }
+        let cell = internal as usize;
+        let updated = unsafe { &mut *_sim_data.updated_cells.ptr };
+        if cell >= updated.element_idx.len() {
+            continue;
+        }
+        let cur_elem = updated.element_idx.get(cell);
+        let emitted = cur_elem == msg.element_idx || cur_elem == _sim_data.vacuum_element_idx;
+        // 温度质量混合 + 加质量（原版 L117210-117245）
+        let cur_mass = updated.mass.get(cell);
+        let new_mass = cur_mass + msg.mass;
+        if new_mass > 0.0 {
+            let cur_temp = updated.temperature.get(cell);
+            let avg = (cur_mass * cur_temp + msg.temperature * msg.mass) / new_mass;
+            let lo = cur_temp.min(msg.temperature);
+            let hi = cur_temp.max(msg.temperature);
+            updated.temperature.set(cell, avg.clamp(lo, hi));
+            updated.mass.set(cell, new_mass);
+        }
+        if msg.disease_idx != 0xFF {
+            // AddDiseaseToCell 简化（同病菌累加/异病菌替换，与原库病菌简化一致）
+            let cur_d_idx = updated.disease_idx.get(cell);
+            if cur_d_idx == msg.disease_idx {
+                updated.disease_count.set(
+                    cell,
+                    updated.disease_count.get(cell) + msg.disease_count,
+                );
+            } else {
+                updated.disease_idx.set(cell, msg.disease_idx);
+                updated.disease_count.set(cell, msg.disease_count);
+            }
+        }
+        if cur_elem != msg.element_idx {
+            updated.element_idx.set(cell, msg.element_idx);
+            change_substance(_sim_data, cell);
+        }
+        let callback_idx = msg.callback_idx_or_temp.to_bits() as i32;
+        if callback_idx != -1 {
+            let events = unsafe { &mut *_sim_data.sim_events.ptr };
+            events
+                .mass_emitted_callbacks
+                .push(crate::a_framework::game_data::MassEmittedCallback {
+                    callback_idx,
+                    elem_idx: msg.element_idx,
+                    emitted: if emitted { 1 } else { 0 },
+                    disease_idx: msg.disease_idx,
+                    mass: msg.mass,
+                    temperature: msg.temperature,
+                    disease_count: msg.disease_count,
+                });
+        }
+    }
+    frame.mass_emission_messages.clear_keep_capacity();
+}
+
+fn process_consume_disease(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+    frame.consume_disease.clear_keep_capacity();
+}
+
+fn process_cell_disease_modifications(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+    frame.cell_disease_modifications.clear_keep_capacity();
+}
+
+fn process_cell_radiation_changes(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+    frame.cell_radiation_modifications.clear_keep_capacity();
+}
+
+/// 清空所有 ComponentMessages 的 adds/modifies/removes（C2 桩：不处理，只清空）。
+fn process_component_messages_stubs(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+    // building_heat_exchange_messages
+    frame.building_heat_exchange_messages.adds.clear_keep_capacity();
+    frame.building_heat_exchange_messages.modifies.clear_keep_capacity();
+    frame.building_heat_exchange_messages.removes.clear_keep_capacity();
+
+    // modify_building_energy_messages
+    frame.modify_building_energy_messages.clear_keep_capacity();
+
+    // building_to_building_heat_exchange_messages
+    frame.building_to_building_heat_exchange_messages.adds.clear_keep_capacity();
+    frame.building_to_building_heat_exchange_messages.modifies.clear_keep_capacity();
+    frame.building_to_building_heat_exchange_messages.removes.clear_keep_capacity();
+
+    // add_building_in_contact_messages
+    frame.add_building_in_contact_messages.clear_keep_capacity();
+
+    // element_chunk_messages
+    frame.element_chunk_messages.adds.clear_keep_capacity();
+    frame.element_chunk_messages.modifies.clear_keep_capacity();
+    frame.element_chunk_messages.removes.clear_keep_capacity();
+
+    // move_element_chunk_messages
+    frame.move_element_chunk_messages.clear_keep_capacity();
+
+    // modify_element_chunk_energy_messages
+    frame.modify_element_chunk_energy_messages.clear_keep_capacity();
+
+    // modify_element_chunk_adjuster_messages
+    frame.modify_element_chunk_adjuster_messages.clear_keep_capacity();
+
+    // modify_backwall_data_messages
+    frame.modify_backwall_data_messages.clear_keep_capacity();
+
+    // element_emitter_messages
+    frame.element_emitter_messages.adds.clear_keep_capacity();
+    frame.element_emitter_messages.modifies.clear_keep_capacity();
+    frame.element_emitter_messages.removes.clear_keep_capacity();
+
+    // disease_emitter_messages
+    frame.disease_emitter_messages.adds.clear_keep_capacity();
+    frame.disease_emitter_messages.modifies.clear_keep_capacity();
+    frame.disease_emitter_messages.removes.clear_keep_capacity();
+
+    // disease_consumer_messages
+    frame.disease_consumer_messages.adds.clear_keep_capacity();
+    frame.disease_consumer_messages.modifies.clear_keep_capacity();
+    frame.disease_consumer_messages.removes.clear_keep_capacity();
+
+    // radiation_emitter_messages
+    frame.radiation_emitter_messages.adds.clear_keep_capacity();
+    frame.radiation_emitter_messages.modifies.clear_keep_capacity();
+    frame.radiation_emitter_messages.removes.clear_keep_capacity();
+
+    // radiation_params_modifications
+    frame.radiation_params_modifications.clear_keep_capacity();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a_framework::sim_data::{CellSOA, BackwallSOA, Timers};
+    use crate::a_framework::sim_events::SimEvents;
+    use crate::a_framework::sim_frame_manager::SimFrameInfo;
+    use crate::a_framework::stl_shim::UniquePtr;
+    use crate::b_elements::element::{Element, ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData};
+    use crate::b_elements::elements_table::{G_ELEMENTS_TABLE, DestroyElementsTable};
+    use crate::LIB_TESTS_LOCK;
+
+    /// 初始化 elements_table：添加 2 个元素（索引 0=固体, 1=真空/非固体）
+    fn init_elements_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.state_data.clear();
+        // 元素 0：固体（state & 3 == 3）
+        table.state_data.push(ElementStateData { state: 3 });
+        // 元素 1：真空（state & 3 == 0）
+        table.state_data.push(ElementStateData { state: 0 });
+    }
+
+    /// K2-B 专用：建 4 元素表 0=真空(state=0)、1=液体(state=2)、2=固体(state=3)、3=气体(state=1)。
+    /// 挤压链路 displace_liquid/displace_gas 从 post_process_data 读状态，必须填充。
+    fn init_displace_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.element_names.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        for (id, state) in [(0i32, 0u8), (1i32, 2u8), (2i32, 3u8), (3i32, 1u8)] {
+            let mut elem = Element::default();
+            elem.id = id;
+            elem.state = state;
+            table.elements.push(elem);
+            table.state_data.push(ElementStateData { state });
+            table.liquid_data.push(ElementLiquidData { state, flow: 0.0, ..Default::default() });
+            table.pressure_data.push(ElementPressureData { state, flow: 0.0 });
+            table.post_process_data.push(ElementPostProcessData { state, ..Default::default() });
+        }
+    }
+
+    /// 构造测试用 SimData（4×4 含边界 = 6×6 = 36 个 cell）
+    fn make_test_sim_data() -> SimData {
+        let mut sd = SimData::new_zeroed();
+        sd.width = 6;
+        sd.height = 6;
+        sd.num_game_cells = 4 * 4;
+        sd.vacuum_element_idx = 1;
+
+        let total_cells = (sd.width as usize) * (sd.height as usize);
+
+        let cells = Box::new(CellSOA::with_size(total_cells));
+        sd.cells = UniquePtr { ptr: Box::into_raw(cells) };
+
+        // updated_cells 填充测试数据：cell_idx=5 处放固体元素
+        let mut updated_cells = CellSOA::with_size(total_cells);
+        updated_cells.element_idx.set(5, 0u16); // 元素索引 0
+        updated_cells.mass.set(5, 100.0f32);
+        updated_cells.temperature.set(5, 300.0f32);
+        updated_cells.disease_idx.set(5, 0u8);
+        updated_cells.disease_count.set(5, 0i32);
+        sd.updated_cells = UniquePtr { ptr: Box::into_raw(Box::new(updated_cells)) };
+
+        let backwall = Box::new(BackwallSOA::with_size(total_cells, sd.vacuum_element_idx));
+        sd.backwall = UniquePtr { ptr: Box::into_raw(backwall) };
+
+        let sim_events = Box::new(SimEvents::default());
+        sd.sim_events = UniquePtr { ptr: Box::into_raw(sim_events) };
+
+        // 分配 timers
+        let timers_vec: Vec<Timers> = vec![Timers::default(); total_cells];
+        let timers_box = timers_vec.into_boxed_slice();
+        sd.timers = UniquePtr { ptr: Box::into_raw(timers_box) as *mut Timers };
+
+        sd
+    }
+
+    #[test]
+    fn process_dig_points_clears_solid_cell() {
+        init_elements_table();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+
+        // gameCell=0, game_w=4 → simCell = (0%4+1) + (0/4+1)*6 = 1 + 6 = 7
+        // 把测试数据放到 cell_idx=7
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.element_idx.set(7, 0u16);  // 元素 0 = 固体
+        updated_cells.mass.set(7, 100.0f32);
+        updated_cells.temperature.set(7, 300.0f32);
+
+        frame.dig_points.push(crate::a_framework::sim_events::DigPoint {
+            game_cell: 0,
+            callback_idx: -1,
+            skip_event: 0,
+            backwall: 0,
+            _pad: [0, 0],
+        });
+
+        // 执行 process_dig_points
+        process_dig_points(&mut frame, &mut sd);
+
+        // 验证 cell_idx=7 已被清除
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.element_idx.get(7), sd.vacuum_element_idx, "element should be vacuum");
+        assert_eq!(updated_cells.mass.get(7), 0.0f32, "mass should be 0");
+
+        // 验证 dig_points 已清空
+        assert_eq!(frame.dig_points.len(), 0);
+
+        // 验证 dig_info 有 1 个条目（mass > 0）
+        let sim_events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(sim_events.dig_info.len(), 1, "dig_info should have 1 entry");
+
+        // 验证 substance_change_info 有 1 个条目
+        assert_eq!(sim_events.substance_change_info.len(), 1, "substance_change_info should have 1 entry");
+
+        // 验证 old/new 均为 0xFFFF 占位（与原版一致）——真实值由
+        // CopySimDataToGame 的 SubstanceChangeInfo 后处理回填
+        // （对照源码 L132321-132337）。
+        let sci = sim_events.substance_change_info.get(0);
+        assert_eq!(sci.old_element_idx, 0xFFFF, "old_element_idx 应为 0xFFFF 占位");
+        assert_eq!(sci.new_element_idx, 0xFFFF, "new_element_idx 应为 0xFFFF 占位（后处理回填）");
+    }
+
+    #[test]
+    fn process_dig_points_skips_non_solid() {
+        init_elements_table();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+
+        // cell_idx=7 放 vacuum_element_idx（元素 1，非固体）
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.element_idx.set(7, sd.vacuum_element_idx);
+        updated_cells.mass.set(7, 0.0f32);
+
+        frame.dig_points.push(crate::a_framework::sim_events::DigPoint {
+            game_cell: 0,
+            callback_idx: -1,
+            skip_event: 0,
+            backwall: 0,
+            _pad: [0, 0],
+        });
+
+        process_dig_points(&mut frame, &mut sd);
+
+        // 验证 cell 未被清除（元素仍为 vacuum，非固体不触发清除）
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.element_idx.get(7), sd.vacuum_element_idx);
+
+        // 验证 dig_info 为空（非固体不触发 dig_info）
+        let sim_events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(sim_events.dig_info.len(), 0, "dig_info should be empty");
+    }
+
+    #[test]
+    fn process_dig_points_with_callback_pushes_callback_info() {
+        init_elements_table();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+
+        // cell_idx=7 放固体元素
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.element_idx.set(7, 0u16);
+        updated_cells.mass.set(7, 50.0f32);
+
+        frame.dig_points.push(crate::a_framework::sim_events::DigPoint {
+            game_cell: 0,
+            callback_idx: 42,  // 有效 callback
+            skip_event: 1,     // 跳过事件（不生成 MassConsumedCallback）
+            backwall: 0,
+            _pad: [0, 0],
+        });
+
+        process_dig_points(&mut frame, &mut sd);
+
+        // 验证 callback_info 有 1 个条目
+        let sim_events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(sim_events.callback_info.len(), 1, "callback_info should have 1 entry");
+        assert_eq!(sim_events.callback_info.get(0).callback_idx, 42);
+
+        // 验证 dig_info 为空（skip_event=1）
+        assert_eq!(sim_events.dig_info.len(), 0, "dig_info should be empty (skip_event=1)");
+
+        // 验证 cell 已被清除
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.element_idx.get(7), sd.vacuum_element_idx);
+    }
+
+    /// Add（mode 0）语义（2026-08-02 液滴回注修复）：向真空格添加液体 → 直接放置
+    /// （add_liquid 真空分支，原版 L134426-134431），并产生 substance 事件。
+    #[test]
+    fn process_cell_modifications_add_liquid_to_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+
+        // gameCell=0 → simCell=7（默认真空）；添加液体元素 1
+        frame.cell_modifications.push(crate::a_framework::sim_events::CellModification {
+            game_cell: 0,
+            callback_idx: -1,
+            mass: 75.0,
+            temperature: 280.0,
+            disease_count: 5,
+            element_idx: 1,
+            disease_idx: 2,
+            replace_mode: 0,
+            flags: 0,
+            _pad: [0, 0, 0],
+        });
+
+        process_cell_modifications(&mut frame, &mut sd);
+
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.element_idx.get(7), 1);
+        assert_eq!(updated_cells.mass.get(7), 75.0);
+        assert_eq!(updated_cells.temperature.get(7), 280.0);
+        assert_eq!(updated_cells.disease_count.get(7), 5);
+        assert_eq!(updated_cells.disease_idx.get(7), 2);
+        let sim_events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(sim_events.substance_change_info.len(), 1, "Add 到真空应产生 substance 事件");
+    }
+
+    /// ProcessMassConsumption 矩形模式（原版 RectangularRemoved）：
+    /// 4 格各 100kg，ConsumeMass 250kg（宽4×高1）→ 移除 100+100+50，
+    /// 前两格清空、第三格剩 50、第四格不动；callback 推送 removed 质量 250。
+    #[test]
+    fn process_mass_consumption_rectangular_removes_region() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            for c in [7usize, 8, 9, 10] {
+                updated.element_idx.set(c, 1); // 液体
+                updated.mass.set(c, 100.0);
+                updated.temperature.set(c, 300.0);
+            }
+        }
+        let mut frame = SimFrameInfo::default();
+        frame.mass_consumption_messages.push(crate::a_framework::sim_events::MassConsumption {
+            game_cell: 0, // → 内部 (row1,col1)
+            callback_idx: 42,
+            mass: 250.0,
+            element_idx: 1,
+            radius: 4,
+            height: 1,
+        });
+        process_mass_consumption(&mut frame, &mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(7), 0, "cell7 应被清空（元素→真空）");
+            assert_eq!(updated.mass.get(7), 0.0);
+            assert_eq!(updated.element_idx.get(8), 0, "cell8 应被清空");
+            assert_eq!(updated.element_idx.get(9), 1, "cell9 应保留液体");
+            assert!(
+                (updated.mass.get(9) - 50.0).abs() < 1e-3,
+                "cell9 应剩 50，got {}",
+                updated.mass.get(9)
+            );
+            assert!((updated.mass.get(10) - 100.0).abs() < 1e-3, "cell10 不应被触及");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.mass_consumed_callbacks.len(), 1, "应推送 1 条回调");
+            let cb = events.mass_consumed_callbacks.get(0);
+            assert_eq!(cb.callback_idx, 42);
+            assert_eq!(cb.elem_idx, 1);
+            assert!(
+                (cb.mass - 250.0).abs() < 1e-3,
+                "回调质量应 250，got {}",
+                cb.mass
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// ProcessMassConsumption 洪水半径模式（原版 FloodRemoved + Flood<> BFS）：
+    /// 从 (row1,col1) 起半径 2（处理 0/1 跳），3 格液体 100kg，ConsumeMass 250kg
+    /// → 移除 100+100+50，前两格清空、第三格剩 50；callback=-1 → 无回调。
+    #[test]
+    fn process_mass_consumption_flood_radius_removes_connected() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            for c in [7usize, 8, 13] {
+                updated.element_idx.set(c, 1); // 液体（7=(1,1) 8=(1,2) 13=(2,1)）
+                updated.mass.set(c, 100.0);
+                updated.temperature.set(c, 300.0);
+            }
+        }
+        let mut frame = SimFrameInfo::default();
+        frame.mass_consumption_messages.push(crate::a_framework::sim_events::MassConsumption {
+            game_cell: 0,
+            callback_idx: -1,
+            mass: 250.0,
+            element_idx: 1,
+            radius: 2,
+            height: 0, // 洪水模式
+        });
+        process_mass_consumption(&mut frame, &mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(7), 0, "起点格应被清空");
+            assert_eq!(updated.element_idx.get(8), 0, "右邻应被清空");
+            assert_eq!(updated.element_idx.get(13), 1, "下邻应保留液体");
+            assert!(
+                (updated.mass.get(13) - 50.0).abs() < 1e-3,
+                "下邻应剩 50，got {}",
+                updated.mass.get(13)
+            );
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.mass_consumed_callbacks.len(), 0, "callback=-1 不应推送");
+        }
+        DestroyElementsTable();
+    }
+
+    /// ElementConsumer 链路（2026-08-02 水泵修复）：注册 → 设速率 → 逐帧消费 →
+    /// consumedMassInfo 携带正确 sim_handle（C# 泵靠它把水送进水管）。
+    #[test]
+    fn element_consumer_consumes_and_reports_mass() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(7, 1); // (row1,col1) 液体
+            updated.mass.set(7, 100.0);
+            updated.temperature.set(7, 300.0);
+        }
+        let mut frame = SimFrameInfo::default();
+        // 注册（12B 消息体）
+        let add = crate::a_framework::sim_events::AddElementConsumerMsg {
+            cell_idx: 0,
+            callback_idx: 42,
+            radius: 2,
+            configuration: 1, // 任意液体
+            element_idx: 0,
+        };
+        let bytes = unsafe { std::slice::from_raw_parts(&add as *const _ as *const u8, 12) };
+        for b in bytes {
+            frame.element_consumer_messages.adds.push(*b);
+        }
+        process_element_consumer_messages(&mut frame, &mut sd);
+        {
+            let events = unsafe { &*sd.sim_events.ptr };
+            assert_eq!(events.component_state_changed_messages.len(), 1);
+            assert_eq!(events.component_state_changed_messages.get(0).callback_idx, 42);
+            assert_eq!(events.component_state_changed_messages.get(0).sim_handle, 0);
+        }
+        // 设速率 10kg/s（12B 消息体）
+        let set = crate::a_framework::sim_events::SetElementConsumerDataMsg {
+            handle: 0,
+            cell: 0,
+            consumption_rate: 10.0,
+        };
+        let bytes = unsafe { std::slice::from_raw_parts(&set as *const _ as *const u8, 12) };
+        for b in bytes {
+            frame.element_consumer_messages.modifies.push(*b);
+        }
+        process_element_consumer_messages(&mut frame, &mut sd);
+        // 逐帧消费：10 × 0.2s = 2kg
+        process_element_consumers(&mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(7) - 98.0).abs() < 1e-3,
+                "应消耗 2kg，got {}",
+                updated.mass.get(7)
+            );
+            assert_eq!(updated.element_idx.get(7), 1);
+        }
+        let consumed = &sd.element_consumer.consumed_mass_info;
+        assert_eq!(consumed.len(), 1, "应推送 1 条 consumedMassInfo");
+        let c = consumed.get(0);
+        assert_eq!(c.sim_handle.value, 0);
+        assert_eq!(c.removed_elem_idx, 1);
+        assert!((c.mass - 2.0).abs() < 1e-3, "consumed mass 应 2，got {}", c.mass);
+        DestroyElementsTable();
+    }
+
+    /// ProcessMassEmission（2026-08-02 喷口输出）：向真空格发射 5kg 液体 →
+    /// 元素/质量/温度写入 + MassEmittedCallback 推送（emitted=1）。
+    #[test]
+    fn mass_emission_adds_mass_and_callback() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        let mut frame = SimFrameInfo::default();
+        frame.mass_emission_messages.push(crate::a_framework::sim_events::MassEmission {
+            game_cell: 0, // → 内部 (row1,col1)
+            callback_idx_or_temp: f32::from_bits(42), // callbackIdx=42 的位模式
+            mass: 5.0,
+            temperature: 300.0,
+            disease_count: 0,
+            element_idx: 1,
+            disease_idx: 0xFF,
+            emitted: 0,
+        });
+        process_mass_emission(&mut frame, &mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(7), 1);
+            assert!((updated.mass.get(7) - 5.0).abs() < 1e-3);
+            assert!((updated.temperature.get(7) - 300.0).abs() < 1e-3);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.mass_emitted_callbacks.len(), 1);
+            let cb = events.mass_emitted_callbacks.get(0);
+            assert_eq!(cb.callback_idx, 42);
+            assert_eq!(cb.elem_idx, 1);
+            assert_eq!(cb.emitted, 1, "真空目标 → emitted=1");
+            assert!((cb.mass - 5.0).abs() < 1e-3);
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn process_cell_modifications_replace_vacuum_destroys_cell() {
+        init_elements_table();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+
+        // 先在 cell_idx=7 放固体（元素 0）
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.element_idx.set(7, 0u16);
+        updated_cells.mass.set(7, 500.0f32);
+        updated_cells.temperature.set(7, 300.0f32);
+
+        // Destroy：Replace 为真空（元素 1），质量/温度任意（会被钳 0）
+        frame.cell_modifications.push(crate::a_framework::sim_events::CellModification {
+            game_cell: 0,
+            callback_idx: 7,
+            temperature: 0.0,
+            mass: 0.0,
+            disease_count: 0,
+            element_idx: 1, // 真空
+            replace_mode: 1,
+            disease_idx: 0xFF,
+            flags: 0,
+            _pad: [0, 0, 0],
+        });
+
+        process_cell_modifications(&mut frame, &mut sd);
+
+        // 格子已摧毁：元素=真空，质量/温度=0
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.element_idx.get(7), 1, "element should be vacuum");
+        assert_eq!(updated_cells.mass.get(7), 0.0f32, "vacuum mass clamped to 0");
+        assert_eq!(updated_cells.temperature.get(7), 0.0f32, "vacuum temperature clamped to 0");
+
+        // 通知已发出：substance_change_info + callback_info
+        let sim_events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(sim_events.substance_change_info.len(), 1, "ChangeSubstance should fire");
+        assert_eq!(sim_events.substance_change_info.get(0).cell_idx, 0);
+        assert_eq!(sim_events.callback_info.len(), 1, "callback should fire");
+        assert_eq!(sim_events.callback_info.get(0).callback_idx, 7);
+    }
+
+    #[test]
+    fn process_cell_modifications_replace_solid_spawns_cell() {
+        init_elements_table();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+
+        // cell_idx=7 初始为真空
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.element_idx.set(7, 1u16);
+        updated_cells.mass.set(7, 0.0f32);
+
+        // 生成固体（元素 0），500kg @ 350K
+        frame.cell_modifications.push(crate::a_framework::sim_events::CellModification {
+            game_cell: 0,
+            callback_idx: -1,
+            temperature: 350.0,
+            mass: 500.0,
+            disease_count: 0,
+            element_idx: 0, // 固体
+            replace_mode: 1,
+            disease_idx: 0xFF,
+            flags: 0,
+            _pad: [0, 0, 0],
+        });
+
+        process_cell_modifications(&mut frame, &mut sd);
+
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.element_idx.get(7), 0, "element should be solid");
+        assert_eq!(updated_cells.mass.get(7), 500.0f32, "mass preserved");
+        assert_eq!(updated_cells.temperature.get(7), 350.0f32, "temperature preserved");
+
+        let sim_events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(sim_events.substance_change_info.len(), 1, "ChangeSubstance should fire");
+    }
+
+    /// K2-B 修复测试：replace_mode 2（ReplaceAndDisplace）把目标格液体挤压到邻格后再写新字段。
+    /// 目标格 gameCell=5 → simCell=14（row2,col2 中心，4 邻格全内部）。
+    /// displace_liquid（原版 DisplaceLiquid L34136）：4 真空邻格各得 100/4=25，
+    /// 源格 ClearCell；随后新字段（固体元素 2）写入目标格。
+    #[test]
+    fn process_cell_modifications_replace_and_displace_squeezes_liquid() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1); // 液体
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            for c in [13usize, 15, 20, 8] {
+                updated.element_idx.set(c, 0); // 真空
+                updated.mass.set(c, 0.0);
+                updated.temperature.set(c, 0.0);
+            }
+        }
+        let mut frame = SimFrameInfo::default();
+        frame.cell_modifications.push(crate::a_framework::sim_events::CellModification {
+            game_cell: 5, // → simCell 14
+            callback_idx: -1,
+            temperature: 350.0,
+            mass: 500.0,
+            disease_count: 7,
+            element_idx: 2, // 固体（新元素）
+            replace_mode: 2,
+            disease_idx: 0xAA,
+            flags: 0,
+            _pad: [0, 0, 0],
+        });
+        process_cell_modifications(&mut frame, &mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            // 新字段已写入目标格
+            assert_eq!(updated.element_idx.get(14), 2, "目标格应写入新固体元素");
+            assert_eq!(updated.mass.get(14), 500.0, "目标格质量写入");
+            assert_eq!(updated.temperature.get(14), 350.0, "目标格温度写入");
+            assert_eq!(updated.disease_count.get(14), 7, "目标格病菌数写入");
+            assert_eq!(updated.disease_idx.get(14), 0xAA, "目标格病菌 idx 写入");
+            // 原液体被挤压均分到 4 邻格（displace_liquid 链路必须生产执行）
+            for c in [13usize, 15, 20, 8] {
+                assert_eq!(updated.element_idx.get(c), 1, "邻格 {} 应接收液体元素", c);
+                assert!(
+                    (updated.mass.get(c) - 25.0).abs() < 1e-3,
+                    "邻格 {} 应得 100/4=25，got {}",
+                    c,
+                    updated.mass.get(c)
+                );
+            }
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn process_cell_properties_sets_and_clears() {
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+
+        // 先设置初始值
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.properties.set(7, 0x00);
+
+        // 设置属性 0x0F
+        frame.set_cell_properties.push(crate::a_framework::sim_events::CellPropertiesChange {
+            game_cell: 0,         // → simCell=7
+            callback_idx: -1,
+            property_flags: 0x0F, // mask
+            set_or_clear: 1,      // set
+            _pad: [0, 0],
+        });
+
+        process_cell_properties(&mut frame, &mut sd);
+
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.properties.get(7), 0x0F);
+
+        // 清除属性 0x0F
+        let mut frame2 = SimFrameInfo::default();
+        frame2.set_cell_properties.push(crate::a_framework::sim_events::CellPropertiesChange {
+            game_cell: 0,
+            callback_idx: -1,
+            property_flags: 0x0F, // mask
+            set_or_clear: 0,      // clear
+            _pad: [0, 0],
+        });
+
+        process_cell_properties(&mut frame2, &mut sd);
+
+        let updated_cells = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(updated_cells.properties.get(7), 0x00);
+    }
+}

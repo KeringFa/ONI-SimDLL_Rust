@@ -1,0 +1,4180 @@
+//! 液体流动物理。对照源码 05_liquid_flow.c。
+//!
+//! 入口 update_liquids（由 c2_physics::update_data 调用）：
+//! 遍历 active region 内每个"液体格"（元素 state & 3 == 2 且 mass > 0），
+//! 调 update_liquid 做下落/转移，最后调 post_process_cell 做挤压与后处理。
+//!
+//! 本任务仅实现两个基础判定函数；液体物理在后续任务（6/7/8）追加。
+
+use crate::a_framework::sim_data::CellSOA;
+use crate::a_framework::sim_data::SimData;
+use crate::a_framework::vector_math::Vector4f;
+use crate::b_elements::elements_table;
+
+/// IsLiquidPermeable — 该格元素是否允许液体渗透。
+/// 对照源码 05_liquid_flow.c L599-626。
+/// 可渗透 ⟺ properties[cell] & 2 == 0 且 (state & 3) <= 1（真空/气体）。
+/// ⚠️ 液体（state&3==2）与固体（state&3==3）都**不可渗透**（原版 L615: `1 < (state&3)` → false）。
+/// 元素表缺失（测试环境）时返回 false。
+pub fn is_liquid_permeable(cells: &CellSOA, cell_idx: usize) -> bool {
+    // 原版 L607：properties bit1（值 2，固体标志）置位 → 不可渗透
+    if (cells.properties.get(cell_idx) & 2) != 0 {
+        return false;
+    }
+    let e = cells.element_idx.get(cell_idx);
+    match elements_table::get_element_liquid_data(e) {
+        Some(d) => (d.state & 3) <= 1, // 真空/气体可渗透；液体/固体不可渗透（原版 L615）
+        None => false,
+    }
+}
+
+/// IsSolid — 该格元素是否固体。
+/// 对照源码 05_liquid_flow.c L627-655。
+/// 固体 ⟺ (state & 3) == 3 或 properties[cell] & 2 置位（原版 L639-644）。
+/// 元素表缺失（测试环境）时返回 false。
+pub fn is_solid(cells: &CellSOA, cell_idx: usize) -> bool {
+    let e = cells.element_idx.get(cell_idx);
+    let state_solid = match elements_table::get_element_liquid_data(e) {
+        Some(d) => (d.state & 3) == 3,
+        None => false,
+    };
+    state_solid || (cells.properties.get(cell_idx) & 2) != 0
+}
+
+// ===== 任务 6：UpdateLiquid + UpdateNeighbourLiquidMass =====
+// 对照源码 05_liquid_flow.c L656-1212（UpdateLiquid）+ L1213-1274（UpdateNeighbourLiquidMass）。
+
+use crate::a_framework::game_data::SubstanceChangeInfo;
+
+/// UpdateLiquidData 入口 — 遍历内部格，对"液体格"（state&3==2 且 mass>0）调 update_liquid。
+/// 对照源码 11_msvcrt_ignored.c L42408-42435（遍历循环）：
+/// 从 cells（源缓冲）读元素/质量，写 updatedCells（目标缓冲）。
+/// 元素表为空（测试环境）时安全跳过。
+pub fn update_liquids(sim: &mut crate::a_framework::sim_data::SimData) {
+    let width = sim.width as usize;
+    let height = sim.height as usize;
+    if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    for row in 1..height - 1 {
+        for col in 1..width - 1 {
+            let idx = row * width + col;
+            let cells = unsafe { &*sim.cells.ptr };
+            let e = cells.element_idx.get(idx);
+            // 原版 L42423：state&3==2 且 mass>0 才调 UpdateLiquid
+            let is_liquid = match elements_table::get_element_liquid_data(e) {
+                Some(d) => (d.state & 3) == 2,
+                None => false,
+            };
+            if is_liquid && cells.mass.get(idx) > 0.0 {
+                update_liquid(sim, idx);
+            }
+        }
+    }
+    // K2 修复：post_process_cell 挂入生产路径（原版 UpdateData L43023 对每个内部格无条件调
+    // PostProcessCell）。post_process_cell 内部按真空/气体/固体/液体四分支处理，
+    // 元素表缺失时安全返回，故此处对全部内部格无条件调用。
+    // 挤压位移 / 密度分层 / 升华 accumulated_flow 累加由此在生产中真正执行。
+    for row in 1..height - 1 {
+        for col in 1..width - 1 {
+            post_process_cell(sim, row * width + col);
+        }
+    }
+}
+
+/// UpdateLiquid — 液体下落与质量转移。
+/// 对照源码 05_liquid_flow.c L656-1212（向下 + 左/右水平扩散；斜向流动属后续任务）。
+///
+/// 三个向下分支（按原版顺序）：
+/// 1. 同元素下落（src_elem == 下方格元素）：计算转移量 fVar22/fVar23，
+///    调 update_neighbour_liquid_mass，源格减质量、flow[DOWN] 累加。
+/// 2. 下方是 void → 源格转 vacuum（质量/温度/病菌清零），产生事件。
+/// 3. 下方真空/气体 → 角落检查（SpawnFallingLiquid）或 SwapCells 交换 + 事件。
+/// 然后水平扩散（左 L849-945 → 右 L946-1042）：判定链失败时跳过（fall-through，
+/// 不 return），转移量基于前序分支递减后的局部剩余质量，flow[LEFT]/flow[RIGHT]
+/// 分别累加到 flow 的 x/y 分量。
+pub fn update_liquid(sim: &mut crate::a_framework::sim_data::SimData, cell: usize) {
+    let width = sim.width as usize;
+    if width == 0 || cell < width {
+        return; // 防止下方格索引下溢
+    }
+    let below = cell - width;
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+
+    // —— 读源格数据（cells 缓冲，原版 L686-705）——
+    // mass_self/disease_count_self 声明 mut：向下分支转移成功后按原版 L751/L764 递减，
+    // 左分支用递减后的值计算扩散量（fVar22 = (fVar25 - left_mass) * 0.25，原版 L876）。
+    let (src_elem, mut mass_self, mut disease_count_self, disease_idx_self) = {
+        let cells = unsafe { &*sim.cells.ptr };
+        if cell >= cells.element_idx.len() {
+            return;
+        }
+        let src_elem = cells.element_idx.get(cell);
+        match elements_table::get_element_liquid_data(src_elem) {
+            Some(_) => {}
+            None => return,
+        }
+        (
+            src_elem,
+            cells.mass.get(cell),
+            cells.disease_count.get(cell),
+            cells.disease_idx.get(cell),
+        )
+    };
+
+    // —— 读下方格数据 ——
+    let (below_elem_cells, below_mass_cells, below_props) = {
+        let cells = unsafe { &*sim.cells.ptr };
+        (
+            cells.element_idx.get(below),
+            cells.mass.get(below),
+            cells.properties.get(below),
+        )
+    };
+    // 下方格元素（updatedCells 缓冲，原版 L711 uVar9）—— 用于非固体判断
+    let below_elem_updated = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        updated.element_idx.get(below)
+    };
+
+    // 原版 L712/L715：下方格**非固体**（updatedCells 元素 state&3!=3 且 cells properties&2==0）
+    // 时才进入向下处理块；否则**跳过**向下处理（不是 return）——原版 L712 if 为 false 时
+    // 直接落到 L849 左分支（本函数此前误实现为 return，挡住了左分支执行）。
+    let below_updated_state = match elements_table::get_element_liquid_data(below_elem_updated) {
+        Some(d) => d.state & 3,
+        None => return,
+    };
+    if below_updated_state != 3 && (below_props & 2 == 0) {
+        // 原版 L716：下方格元素状态（cells，bVar11）
+        let below_state = match elements_table::get_element_liquid_data(below_elem_cells) {
+            Some(d) => d.state & 3,
+            None => return,
+        };
+
+        if src_elem == below_elem_cells {
+            // ===== 分支 1：同元素下落（原版 L717-773）=====
+            // fVar23 = 下方质量（若下方是液体 state==2）否则 0（原版 L718-724）
+            let below_mass = if below_state == 2 { below_mass_cells } else { 0.0 };
+            let src_ld = match elements_table::get_element_liquid_data(src_elem) {
+                Some(d) => d,
+                None => return,
+            };
+            // fVar22 = max(mass_self*1.01, max_mass) - below_mass，clamp>=0（原版 L725-732）。
+            // ⚠️ 2026-08-02 根因修复：原版 `if (mass*1.01 <= max_mass) fVar22 = max_mass`
+            // 即 fVar22 = **max**(mass*1.01, max_mass)（目标容量恒 ≥ 满格值，上层水可快速灌满下层，
+            // 且超满格（如 1020>1000）时 f22 = 1030.2-1000 > 0 能向下排出）。
+            // 旧实现误用 min → 接近平衡时滴漏 ≈0.1kg/帧（底层难满）、超满格排不下去（卡在 1020）。
+            let mut f22 = (mass_self * 1.01).max(src_ld.max_mass) - below_mass;
+            if f22 < 0.0 {
+                f22 = 0.0;
+            }
+            // fVar23 = min(mass_self, 流率上限)，再 min(fVar22*0.5)（原版 L733-739）
+            // 流率上限 = liquid_data +8 = viscosity（原版 L734 读 lVar1+8）。
+            // ⚠️ 2026-08-02 根因修复：生产数据里 liquid.flow=0（YAML 无 flow 字段）、
+            // viscosity=speed（水=125），旧实现误用 flow → f23 恒 0 → 液体不扩散/水压水不转移。
+            let mut f23 = mass_self.min(src_ld.viscosity);
+            f23 = f23.min(f22 * 0.5);
+            // 原版 L740-741 条件：(mass_self<=min_vertical_flow || min_vertical_flow<=f23) && f23>0
+            let min_vertical = src_ld.min_vertical_flow;
+            if (mass_self <= min_vertical || min_vertical <= f23) && f23 > 0.0 {
+                // 病菌转移量 = (f23/mass_self)*disease_count（原版 L742）
+                let disease_to_transfer = ((f23 / mass_self) * disease_count_self as f32) as i32;
+                let ok = update_neighbour_liquid_mass(
+                    sim, cell, src_elem, below, below_elem_cells, f23, disease_idx_self,
+                    disease_to_transfer,
+                );
+                if ok {
+                    // 源格局部变量递减（原版 L751 local_res8 -= iVar14、L764 fVar25 -= fVar23）——
+                    // 左分支计算扩散量须用递减后的质量/病菌（原版 L876/L889）
+                    disease_count_self -= disease_to_transfer;
+                    mass_self -= f23;
+                    // 源格病菌减少（原版 L751/L758-762）
+                    let updated = unsafe { &mut *sim.updated_cells.ptr };
+                    if updated.disease_idx.get(cell) == disease_idx_self {
+                        modify_disease_count(updated, cell, -disease_to_transfer);
+                    }
+                    // 源格质量减少（原版 L768）
+                    updated.mass.set(cell, updated.mass.get(cell) - f23);
+                    // flow[DOWN] 累加（原版 L769-770，Vector4f offset 8 = z）
+                    if !sim.flow.ptr.is_null() {
+                        let flow = unsafe { &mut *sim.flow.ptr };
+                        let flow_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                flow,
+                                sim.width as usize * sim.height as usize,
+                            )
+                        };
+                        flow_slice[cell].z += f23;
+                    }
+                }
+            }
+        } else if below_state < 2 {
+            // ===== 分支 2+3：下方是真空/气体（原版 L774-846）=====
+            // 分支 2：下方是 void → 源格转 vacuum（原版 L775-792）
+            if below_elem_cells == sim.void_element_idx {
+                let updated = unsafe { &mut *sim.updated_cells.ptr };
+                updated.element_idx.set(cell, sim.vacuum_element_idx);
+                updated.temperature.set(cell, 0.0);
+                updated.mass.set(cell, 0.0);
+                clear_disease(updated, cell);
+                push_substance_change(sim, cell);
+                return; // 原版 L787 goto LAB_180049ebd：不执行左分支
+            }
+            // 分支 3a：角落可下落 → SpawnFallingLiquid（原版 L793-841）
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            let perm_left_up = is_liquid_permeable(updated, cell - 1);
+            let perm_left_down = is_liquid_permeable(updated, below - 1);
+            let perm_right_up = is_liquid_permeable(updated, cell + 1);
+            let perm_right_down = is_liquid_permeable(updated, below + 1);
+            let corner = (perm_left_up && !perm_left_down) || (perm_right_up && !perm_right_down);
+            if corner {
+                let cells = unsafe { &*sim.cells.ptr };
+                let src_temp = cells.temperature.get(cell);
+                if spawn_falling_liquid(
+                    sim,
+                    cell,
+                    src_elem,
+                    mass_self,
+                    src_temp,
+                    disease_idx_self,
+                    disease_count_self,
+                ) {
+                    let updated = unsafe { &mut *sim.updated_cells.ptr };
+                    updated.element_idx.set(cell, sim.vacuum_element_idx);
+                    updated.temperature.set(cell, 0.0);
+                    updated.mass.set(cell, 0.0);
+                    clear_disease(updated, cell);
+                    push_substance_change(sim, cell);
+                    return; // 原版 L834 goto LAB_180049ebd：不执行左分支
+                }
+                // 原版 L817-818：SpawnFallingLiquid 失败 → return
+                return;
+            }
+            // 分支 3b：SwapCells 交换 + 双事件（原版 L842-845）
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            swap_cells(updated, cell, below);
+            push_substance_change(sim, cell);
+            push_substance_change(sim, below);
+            return; // 原版 L845 goto LAB_180049ebd：swap 后不执行左分支
+        }
+    }
+
+    // —— 左分支（原版 L849-945）：水平向左扩散 ——
+    // 原版 L849-851：fVar25 <= 0 → 直接返回（向下转移已耗尽源格质量）
+    if mass_self <= 0.0 {
+        return;
+    }
+    // 任务 2 修正（对齐原版）：左分支判定链是 **if 块**（原版 L864-866）——判定失败
+    // （左邻固体/异液体/元素表缺失/左边界无左邻格）时**不 return**，而是 fall-through
+    // 继续右分支（LAB_18004a18f L946）。故用嵌套 if 控制转移块，而非提前 return。
+    if cell % width != 0 {
+        let left = cell - 1;
+        // 判定链（原版 L852-866）：
+        // 1. 左邻元素（cells 快照）：== 本格元素 或 state&3 < 2
+        let (left_elem_cells, left_mass_cells, left_props) = {
+            let cells = unsafe { &*sim.cells.ptr };
+            (
+                cells.element_idx.get(left),
+                cells.mass.get(left),
+                cells.properties.get(left),
+            )
+        };
+        let left_elem_updated = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            updated.element_idx.get(left)
+        };
+        let left_state_updated = match elements_table::get_element_liquid_data(left_elem_updated) {
+            Some(d) => d.state & 3,
+            None => 0xFF, // 元素表缺失 → 判定失败（跳过左转移，fall-through 到右分支）
+        };
+        let left_state_cells = match elements_table::get_element_liquid_data(left_elem_cells) {
+            Some(d) => d.state & 3,
+            None => 0xFF,
+        };
+        let same_or_gas = src_elem == left_elem_cells || left_state_cells < 2;
+        // 原版 L864-866：(same_or_gas) && (updated 非固体)；L869：properties&2==0
+        if same_or_gas && left_state_updated != 3 && (left_props & 2 == 0) {
+            // 扩散量计算（原版 L867-882）：
+            let left_mass = if left_state_cells == 2 { left_mass_cells } else { 0.0 };
+            let src_ld = match elements_table::get_element_liquid_data(src_elem) {
+                Some(d) => d,
+                None => return,
+            };
+            let mut f23 = (mass_self - left_mass) * 0.25; // fVar22（原版 L876）
+            // fVar23 = min(mass, 流率上限)（原版 L877-880 读 lVar1+8 = viscosity；
+            // 生产数据 flow=0、viscosity=speed，2026-08-02 根因修复）
+            let mut f23_flow = mass_self.min(src_ld.viscosity);
+            f23_flow = f23_flow.min(f23);
+            f23 = f23_flow;
+            // 门限（原版 L884）：f23 >= min_horizontal_flow 且 f23 > 0
+            if (f23 >= src_ld.min_horizontal_flow) && f23 > 0.0 {
+                // 病菌按比例（原版 L886）
+                let disease_to_transfer = ((f23 / mass_self) * disease_count_self as f32) as i32;
+                // 原版 L887-909：IsSolid(下方) && IsLiquidPermeable(左下方) → 先试 SpawnFallingLiquid
+                //（液滴轨道，2026-08-02 实现：质量离开格子由 C# 渲染+落地回注，悬崖处不再有实体方格滑落）；
+                // 成功则不转邻格；失败回退原版 L917-919 的 UpdateNeighbourLiquidMass(左邻)。
+                let (below_solid, src_temp, src_disease_idx) = {
+                    let cells = unsafe { &*sim.cells.ptr };
+                    let bs = is_solid(cells, below);
+                    let (t, d) = if bs {
+                        (cells.temperature.get(cell), cells.disease_idx.get(cell))
+                    } else {
+                        (0.0f32, 0xFFu8)
+                    };
+                    (bs, t, d)
+                };
+                let diagonal_permeable = if below_solid {
+                    let updated = unsafe { &*sim.updated_cells.ptr };
+                    is_liquid_permeable(updated, left - width)
+                } else {
+                    false
+                };
+                let mut transferred = false;
+                if below_solid && diagonal_permeable {
+                    transferred = spawn_falling_liquid(
+                        sim,
+                        left,
+                        src_elem,
+                        f23,
+                        src_temp,
+                        src_disease_idx,
+                        disease_to_transfer,
+                    );
+                }
+                if !transferred {
+                    transferred = update_neighbour_liquid_mass(
+                        sim, cell, src_elem, left, left_elem_cells, f23, disease_idx_self,
+                        disease_to_transfer,
+                    );
+                }
+                if transferred {
+                    // 源格局部变量递减（原版 L923 local_res8 -= iVar15、L936 fVar25 -= fVar23）——
+                    // 右分支计算扩散量须用左分支递减后的剩余质量/病菌
+                    disease_count_self -= disease_to_transfer;
+                    mass_self -= f23;
+                    // 源格病菌减少（原版 L930-934）
+                    let updated = unsafe { &mut *sim.updated_cells.ptr };
+                    if updated.disease_idx.get(cell) == disease_idx_self {
+                        modify_disease_count(updated, cell, -disease_to_transfer);
+                    }
+                    // 源格质量减少（原版 L936）
+                    updated.mass.set(cell, updated.mass.get(cell) - f23);
+                    // flow[LEFT] 累加（原版 L941-942，Vector4f offset 0 = x）
+                    if !sim.flow.ptr.is_null() {
+                        let flow = unsafe { &mut *sim.flow.ptr };
+                        let flow_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                flow,
+                                sim.width as usize * sim.height as usize,
+                            )
+                        };
+                        flow_slice[cell].x += f23;
+                    }
+                }
+            }
+        }
+    }
+
+    // —— 右分支（原版 L946-1042）：水平向右扩散 ——
+    // 原版 L947-948：fVar25 <= 0 → 直接返回（左分支已耗尽源格质量）
+    if mass_self <= 0.0 {
+        return;
+    }
+    if cell % width != width - 1 {
+        let right = cell + 1;
+        // 判定链（原版 L950-966）：与左分支对称
+        let (right_elem_cells, right_mass_cells, right_props) = {
+            let cells = unsafe { &*sim.cells.ptr };
+            (
+                cells.element_idx.get(right),
+                cells.mass.get(right),
+                cells.properties.get(right),
+            )
+        };
+        let right_elem_updated = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            updated.element_idx.get(right)
+        };
+        let right_state_updated = match elements_table::get_element_liquid_data(right_elem_updated) {
+            Some(d) => d.state & 3,
+            None => 0xFF, // 元素表缺失 → 判定失败（跳过右转移，函数至此结束）
+        };
+        let right_state_cells = match elements_table::get_element_liquid_data(right_elem_cells) {
+            Some(d) => d.state & 3,
+            None => 0xFF,
+        };
+        let same_or_gas = src_elem == right_elem_cells || right_state_cells < 2;
+        // 原版 L961-963：(same_or_gas) && (updated 非固体)；L966：properties&2==0
+        if same_or_gas && right_state_updated != 3 && (right_props & 2 == 0) {
+            // 扩散量计算（原版 L967-983）：mass_self 为左分支递减后的剩余质量
+            let right_mass = if right_state_cells == 2 { right_mass_cells } else { 0.0 };
+            let src_ld = match elements_table::get_element_liquid_data(src_elem) {
+                Some(d) => d,
+                None => return,
+            };
+            let mut f23 = (mass_self - right_mass) * 0.25; // fVar22（原版 L976）
+            // fVar23 = min(mass, 流率上限)（原版 L977-980 读 lVar1+8 = viscosity；
+            // 生产数据 flow=0、viscosity=speed，2026-08-02 根因修复）
+            let mut f23_flow = mass_self.min(src_ld.viscosity);
+            f23_flow = f23_flow.min(f23);
+            f23 = f23_flow;
+            // 门限（原版 L984）：f23 >= min_horizontal_flow 且 f23 > 0
+            if (f23 >= src_ld.min_horizontal_flow) && f23 > 0.0 {
+                // 病菌按比例（原版 L986）
+                let disease_to_transfer = ((f23 / mass_self) * disease_count_self as f32) as i32;
+                // 原版 L987-1007：IsSolid(下方) && IsLiquidPermeable(右下方) → 先试 SpawnFallingLiquid
+                //（液滴轨道，2026-08-02 实现，与左分支对称）；失败回退 L1014-1016 UpdateNeighbourLiquidMass(右邻)。
+                let (below_solid, src_temp, src_disease_idx) = {
+                    let cells = unsafe { &*sim.cells.ptr };
+                    let bs = is_solid(cells, below);
+                    let (t, d) = if bs {
+                        (cells.temperature.get(cell), cells.disease_idx.get(cell))
+                    } else {
+                        (0.0f32, 0xFFu8)
+                    };
+                    (bs, t, d)
+                };
+                let diagonal_permeable = if below_solid {
+                    let updated = unsafe { &*sim.updated_cells.ptr };
+                    is_liquid_permeable(updated, right - width)
+                } else {
+                    false
+                };
+                let mut transferred = false;
+                if below_solid && diagonal_permeable {
+                    transferred = spawn_falling_liquid(
+                        sim,
+                        right,
+                        src_elem,
+                        f23,
+                        src_temp,
+                        src_disease_idx,
+                        disease_to_transfer,
+                    );
+                }
+                if !transferred {
+                    transferred = update_neighbour_liquid_mass(
+                        sim, cell, src_elem, right, right_elem_cells, f23, disease_idx_self,
+                        disease_to_transfer,
+                    );
+                }
+                if transferred {
+                    // 注：原版 L1020/L1033 在此递减局部变量 local_res8/fVar25，但右分支是
+                    // UpdateLiquid 最后一个消费方（其后无其他分支读取），Rust 省略等价。
+                    // 源格病菌减少（原版 L1027-1031）
+                    let updated = unsafe { &mut *sim.updated_cells.ptr };
+                    if updated.disease_idx.get(cell) == disease_idx_self {
+                        modify_disease_count(updated, cell, -disease_to_transfer);
+                    }
+                    // 源格质量减少（原版 L1033）
+                    updated.mass.set(cell, updated.mass.get(cell) - f23);
+                    // flow[RIGHT] 累加（原版 L1038-1039，Vector4f offset 4 = y）
+                    if !sim.flow.ptr.is_null() {
+                        let flow = unsafe { &mut *sim.flow.ptr };
+                        let flow_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                flow,
+                                sim.width as usize * sim.height as usize,
+                            )
+                        };
+                        flow_slice[cell].y += f23;
+                    }
+                }
+            }
+        }
+    }
+
+    // —— 上推分支（原版 L1043-1110，LAB_18004a4b2）：压力回流 ——
+    // 原版 L1044-1045：fVar25 <= 0 → 直接返回（前序分支已耗尽源格质量）。
+    // 2026-08-02 实现：此前缺失 → 超满格（如 2000kg）无法向上回流 → 过压 200%+。
+    // 原版三层水时底层封顶 ~1020kg（threshold = max(中层×1.01, maxMass)）。
+    if mass_self <= 0.0 {
+        return;
+    }
+    let up = cell + width;
+    let total = width * sim.height as usize;
+    if up < total {
+        // 判定链（原版 L1047-1064）：与左右分支对称
+        let (up_elem_cells, up_mass_cells, up_props) = {
+            let cells = unsafe { &*sim.cells.ptr };
+            (
+                cells.element_idx.get(up),
+                cells.mass.get(up),
+                cells.properties.get(up),
+            )
+        };
+        let up_elem_updated = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            updated.element_idx.get(up)
+        };
+        let up_state_updated = match elements_table::get_element_liquid_data(up_elem_updated) {
+            Some(d) => d.state & 3,
+            None => 0xFF,
+        };
+        let up_state_cells = match elements_table::get_element_liquid_data(up_elem_cells) {
+            Some(d) => d.state & 3,
+            None => 0xFF,
+        };
+        let same_or_gas = src_elem == up_elem_cells || up_state_cells < 2;
+        if same_or_gas && up_state_updated != 3 && (up_props & 2 == 0) {
+            // 压力公式（原版 L1066-1077）：
+            let up_mass = if up_state_cells == 2 { up_mass_cells } else { 0.0 };
+            let src_ld = match elements_table::get_element_liquid_data(src_elem) {
+                Some(d) => d,
+                None => return,
+            };
+            // threshold = max(up_mass×1.01, max_mass)（原版 L1066-1069，与下落分支同款 max 公式）
+            let threshold = (up_mass * 1.01).max(src_ld.max_mass);
+            let mut transfer = (mass_self - threshold).max(0.0) * 0.5;
+            // 原版 L1070-1075：mass < 2×threshold → 受 viscosity / mass 上限约束
+            if mass_self < threshold * 2.0 {
+                transfer = transfer.min(src_ld.viscosity).min(mass_self);
+            }
+            // 原版 L1077：0.01 < transfer 才执行
+            if transfer > 0.01 {
+                let disease_to_transfer =
+                    ((transfer / mass_self) * disease_count_self as f32) as i32;
+                let ok = update_neighbour_liquid_mass(
+                    sim, cell, src_elem, up, up_elem_cells, transfer, disease_idx_self,
+                    disease_to_transfer,
+                );
+                if ok {
+                    // 注：原版 L1087/L1093 在此递减局部变量 local_res8/fVar25，但上推分支是
+                    // UpdateLiquid 最后一个分支（其后无其他分支读取），Rust 省略等价。
+                    let updated = unsafe { &mut *sim.updated_cells.ptr };
+                    if updated.disease_idx.get(cell) == disease_idx_self {
+                        modify_disease_count(updated, cell, -disease_to_transfer);
+                    }
+                    updated.mass.set(cell, updated.mass.get(cell) - transfer);
+                    // flow[UP] 累加（原版 L1090-1091，Vector4f offset 0xc = w）
+                    if !sim.flow.ptr.is_null() {
+                        let flow = unsafe { &mut *sim.flow.ptr };
+                        let flow_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                flow,
+                                sim.width as usize * sim.height as usize,
+                            )
+                        };
+                        flow_slice[cell].w += transfer;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// UpdateNeighbourLiquidMass — 邻格质量转移辅助。
+/// 对照源码 05_liquid_flow.c L1213-1274。
+///
+/// 参数：src_cell 源格、src_elem 源元素、dst_cell 目标格、dst_elem 目标元素、
+/// amount 转移量、disease_idx 病菌索引、disease_count 转移病菌数。
+/// 返回 false 表示转移被拒绝（目标为不同液体 / 气体无法置换 / 索引越界）。
+fn update_neighbour_liquid_mass(
+    sim: &mut crate::a_framework::sim_data::SimData,
+    src_cell: usize,
+    src_elem: u16,
+    dst_cell: usize,
+    _dst_elem: u16,
+    amount: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) -> bool {
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return false;
+    }
+    // fVar1 = 源格温度（从 cells 读，原版 L1227-1230）
+    let src_temp = {
+        let cells = unsafe { &*sim.cells.ptr };
+        cells.temperature.get(src_cell)
+    };
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if dst_cell >= updated.element_idx.len() {
+        return false;
+    }
+    // 目标格当前元素（原版 L1235 uVar2）
+    let dst_elem_now = updated.element_idx.get(dst_cell);
+    // 原版 L1236：目标已是同元素 → AddMassAndUpdateTemperature + return true
+    if src_elem == dst_elem_now {
+        add_mass_and_update_temperature(updated, dst_cell, amount, src_temp, disease_idx, disease_count);
+        return true;
+    }
+    let elem_count = elements_table::get_element_count_pub();
+    if (dst_elem_now as usize) >= elem_count {
+        return false;
+    }
+    // 原版 L1243：目标是 void → 目标格质量清零
+    if dst_elem_now == sim.void_element_idx {
+        updated.mass.set(dst_cell, 0.0);
+        return true;
+    }
+    let dst_state = match elements_table::get_element_liquid_data(dst_elem_now) {
+        Some(d) => d.state & 3,
+        None => return false,
+    };
+    // 原版 L1252-1257：目标是液体（不同元素）→ false；目标是气体且无法置换 → false
+    if dst_state == 2 {
+        return false;
+    }
+    if dst_state == 1 {
+        // 原版调 DisplaceGas（气体置换）；本任务 YAGNI 不实现气体置换，保守拒绝
+        return false;
+    }
+    // 目标格元素改为源元素（原版 L1261）
+    updated.element_idx.set(dst_cell, src_elem);
+    add_mass_and_update_temperature(updated, dst_cell, amount, src_temp, disease_idx, disease_count);
+    // 事件：ChangeSubstance（原版 L1265）—— 元素类型变化必须通知 C# 刷新画面
+    push_substance_change(sim, dst_cell);
+    true
+}
+
+/// AddMassAndUpdateTemperature（原版 11_msvcrt_ignored.c L33887-33994）。
+/// 目标格质量 += amount；温度按质量加权混合并钳制到 [min, max]；
+/// 病菌按 disease_idx/disease_count 转移（AddDiseaseToCell）。
+fn add_mass_and_update_temperature(
+    cells: &mut CellSOA,
+    cell: usize,
+    amount: f32,
+    src_temp: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) {
+    let cur_mass = cells.mass.get(cell);
+    let new_mass = cur_mass + amount;
+    if new_mass <= 0.0 {
+        // 原版 L33913-33919：质量清零 → 温度清零 + ClearDisease
+        cells.temperature.set(cell, 0.0);
+        clear_disease(cells, cell);
+        return;
+    }
+    let cur_temp = cells.temperature.get(cell);
+    // 原版 L33925-33947：质量加权平均温度，钳制到 [min(cur,src), max(cur,src)]
+    let avg = (cur_mass * cur_temp + src_temp * amount) / new_mass;
+    let lo = cur_temp.min(src_temp);
+    let hi = cur_temp.max(src_temp);
+    let mixed = avg.clamp(lo, hi);
+    cells.mass.set(cell, new_mass);
+    cells.temperature.set(cell, mixed);
+    add_disease_to_cell(cells, cell, disease_idx, disease_count);
+}
+
+/// Disease::AddDiseaseToCell（原版 11_msvcrt_ignored.c L26163-26263）简化版。
+/// 病菌转移：同病菌累加 count；不同病菌替换（原版还有基于疾病强度的混合，
+/// 依赖 gDisease 全局疾病表，Rust 侧暂无此表，此处简化为直接替换）。
+fn add_disease_to_cell(cells: &mut CellSOA, cell: usize, disease_idx: u8, disease_count: i32) {
+    let cur_idx = cells.disease_idx.get(cell);
+    let cur_count = cells.disease_count.get(cell);
+    let (new_idx, new_count) = if cur_idx == disease_idx {
+        (disease_idx, cur_count + disease_count)
+    } else {
+        (disease_idx, disease_count)
+    };
+    cells.disease_idx.set(cell, new_idx);
+    cells.disease_count.set(cell, new_count);
+    if new_count > 0 {
+        // 原版 L26225-26231：病菌类型变化 → 侵扰 tick count 清零
+        if new_idx != cur_idx {
+            cells.disease_infestation_tick_count.set(cell, 0);
+        }
+        return;
+    }
+    // 原版 L26234-26251：count<=0 → 清除病菌
+    clear_disease(cells, cell);
+}
+
+/// CellSOA::ModifyDiseaseCount（原版 11_msvcrt_ignored.c L43462-43485）。
+/// disease_count += delta；<=0 时清除病菌四字段。
+fn modify_disease_count(cells: &mut CellSOA, cell: usize, delta: i32) {
+    let new = cells.disease_count.get(cell) + delta;
+    cells.disease_count.set(cell, new);
+    if new > 0 {
+        return;
+    }
+    clear_disease(cells, cell);
+}
+
+/// CellSOA::ClearDisease（原版 11_msvcrt_ignored.c L43186-43214）。
+fn clear_disease(cells: &mut CellSOA, cell: usize) {
+    cells.disease_idx.set(cell, 0xFF);
+    cells.disease_count.set(cell, 0);
+    cells.disease_infestation_tick_count.set(cell, 0);
+    cells.disease_growth_accumulated_error.set(cell, 0.0);
+}
+
+/// CellSOA::SwapCells（原版 11_msvcrt_ignored.c L33397-33461）。
+/// 交换两格 7 个字段：element_idx/mass/temperature/disease_idx/disease_count/
+/// disease_infestation_tick_count/disease_growth_accumulated_error。
+fn swap_cells(cells: &mut CellSOA, a: usize, b: usize) {
+    let ea = cells.element_idx.get(a);
+    cells.element_idx.set(a, cells.element_idx.get(b));
+    cells.element_idx.set(b, ea);
+    let ma = cells.mass.get(a);
+    cells.mass.set(a, cells.mass.get(b));
+    cells.mass.set(b, ma);
+    let ta = cells.temperature.get(a);
+    cells.temperature.set(a, cells.temperature.get(b));
+    cells.temperature.set(b, ta);
+    let dia = cells.disease_idx.get(a);
+    cells.disease_idx.set(a, cells.disease_idx.get(b));
+    cells.disease_idx.set(b, dia);
+    let dca = cells.disease_count.get(a);
+    cells.disease_count.set(a, cells.disease_count.get(b));
+    cells.disease_count.set(b, dca);
+    let ita = cells.disease_infestation_tick_count.get(a);
+    cells.disease_infestation_tick_count.set(a, cells.disease_infestation_tick_count.get(b));
+    cells.disease_infestation_tick_count.set(b, ita);
+    let ga = cells.disease_growth_accumulated_error.get(a);
+    cells.disease_growth_accumulated_error.set(a, cells.disease_growth_accumulated_error.get(b));
+    cells.disease_growth_accumulated_error.set(b, ga);
+}
+
+/// SimEvents::ChangeSubstance（原版 11_msvcrt_ignored.c L33178-33212）。
+/// simCell → gameCell 坐标转换，push substance_change_info
+/// （old/new 填 0xFFFF 占位，由 copy_sim_data_to_game 后处理回填），
+/// 并标记 timers[simCell] |= 0x1F。
+/// 这是 C# 画面刷新的关键：液体转移后格子元素变化必须产生事件。
+fn push_substance_change(sim: &mut crate::a_framework::sim_data::SimData, sim_cell: usize) {
+    if sim.sim_events.ptr.is_null() {
+        return;
+    }
+    let width = sim.width;
+    let game_w = width - 2;
+    let internal = sim_cell as i32;
+    let game_cell = (internal % width - 1) + (internal / width - 1) * game_w;
+    if game_cell >= 0 && game_cell < sim.num_game_cells {
+        let events = unsafe { &mut *sim.sim_events.ptr };
+        events.substance_change_info.push(SubstanceChangeInfo {
+            cell_idx: game_cell,
+            old_element_idx: 0xFFFF,
+            new_element_idx: 0xFFFF,
+        });
+    }
+    if !sim.timers.ptr.is_null() {
+        unsafe {
+            let timers_ptr = sim.timers.ptr as *mut u8;
+            let old = std::ptr::read(timers_ptr.add(sim_cell));
+            std::ptr::write(timers_ptr.add(sim_cell), old | 0x1F);
+        }
+    }
+}
+
+/// SimEvents::SpawnFallingLiquid（原版 11_msvcrt_ignored.c L43489-43554）简化版。
+/// 液体从壁边下落时产生 spawn_liquid_info 事件（下落粒子效果）。
+/// headless 模式返回 false；visible_grid 为 null（未分配）时保守返回 false。
+#[allow(clippy::too_many_arguments)]
+fn spawn_falling_liquid(
+    sim: &mut crate::a_framework::sim_data::SimData,
+    cell: usize,
+    elem_idx: u16,
+    mass: f32,
+    temperature: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) -> bool {
+    if sim.headless {
+        return false;
+    }
+    let width = sim.width as usize;
+    if sim.cells.ptr.is_null() || sim.visible_grid.ptr.is_null() {
+        return false;
+    }
+    if cell < width {
+        return false;
+    }
+    let cells = unsafe { &*sim.cells.ptr };
+    // 原版 L43510-43512：上方格 properties & 2 == 0（上方非固体）
+    if cells.properties.get(cell - width) & 2 != 0 {
+        return false;
+    }
+    // 原版 L43513-43516：game cell 计算 + 可见性检查
+    let i4 = ((cell / width) as i32 - 1) * (sim.width - 2) + (cell % width) as i32;
+    let callback = i4 - 1;
+    if callback < 0 || callback >= sim.num_game_cells {
+        return false;
+    }
+    let visible = unsafe { std::ptr::read(sim.visible_grid.ptr.add(i4 as usize - 1)) };
+    if visible == 0 && !sim.debug_properties.is_debug_editing {
+        return false;
+    }
+    // 原版 L43524-43526：温度范围检查 low_temp-3 <= temp <= high_temp+3
+    match elements_table::get_element_temperature_data(elem_idx) {
+        Some(td) => {
+            if temperature < td.low_temp - 3.0 || temperature > td.high_temp + 3.0 {
+                return false;
+            }
+        }
+        None => return false,
+    }
+    if sim.sim_events.ptr.is_null() {
+        return false;
+    }
+    let events = unsafe { &mut *sim.sim_events.ptr };
+    events.spawn_liquid_info.push(crate::a_framework::game_data::SpawnFallingLiquidInfo {
+        cell_idx: callback,
+        element_idx: elem_idx,
+        disease_idx,
+        pad: 0,
+        mass,
+        temperature,
+        disease_count,
+    });
+    true
+}
+
+// ===== 任务 7：UpdatePressure（压强平衡）=====
+// 对照源码 05_liquid_flow.c L1436-1629（UpdatePressure）。
+//
+// 语义：单邻格质量转移——本格与 `neighbor` 之间的质量差 × 压力系数（上限 12.5%），
+// 使相邻液体质量趋于平衡。原版由 UpdateData（11_msvcrt_ignored.c L42108/42144/42192）
+// 对每个方向各调一次，并用**返回值**在调用点累加 flow 分量（任务 9 挂接时处理）；
+// 本函数只实现函数本体，返回 clamp 后的带符号转移量 fVar18。
+
+/// UpdatePressure — 向单个邻格转移质量差 × 压力系数，使两格液体质量趋于平衡。
+/// 对照源码 05_liquid_flow.c L1436-1629。
+///
+/// 参数：
+/// - `cell`：本格（原版 param_5）
+/// - `neighbor`：邻格索引（原版 param_9，方向由调用方决定）
+///
+/// 算法（逐行对照原版）：
+/// 1. 转移量 `f18 = flow_coeff × (mass[cell] − mass[neighbor])`（原版 L1478）；
+///    flow_coeff = 邻格元素 pressure_data.flow（原版 L1476，param_7 != 1 时覆盖）。
+/// 2. clamp 上限 +mass[cell]×12.5%（L1479-1481）、下限 −mass[neighbor]×12.5%（L1482-1484）。
+/// 3. 方向：f18 >= 0（本格→邻格）来源=本格/接收=邻格；f18 < 0（邻格→本格）反之（L1485-1496）。
+/// 4. 实际转移量 = min(|f18|, 来源格质量)（L1497-1500）。
+/// 5. 病菌按质量比例转移（L1501-1513），来源格病菌 idx/温度从 updatedCells 读（L1504-1518）。
+/// 6. 接收格质量 += 转移量 + 温度加权混合 + 病菌（L1519-1556，复用 add_mass_and_update_temperature）。
+/// 7. 来源格质量/病菌减少（L1559-1580）。
+/// 8. 元素段（L1581-1608）：仅当接收格元素 pressure state & 3 == 0（真空）时，
+///    接收格元素改为来源元素并产生 ChangeSubstance 事件（复用 push_substance_change）；
+///    接收格原为 void 时清零质量/温度/病菌。
+///
+/// 返回值：clamp 后的带符号转移量 fVar18，供调用点累加 flow 分量（原版 L42121-42126）。
+/// 元素表缺失（测试环境）或索引越界时安全返回 0.0。
+pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: usize, neighbor: usize) -> f32 {
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return 0.0;
+    }
+    let cells = unsafe { &*sim.cells.ptr };
+    if cell >= cells.mass.len() || neighbor >= cells.mass.len() {
+        return 0.0;
+    }
+    // —— 元素与压力数据（原版 L1463-1471）——
+    // uVar14 = elementIdx[param_9]（邻格元素），bVar12 = 邻格元素 pressure state & 3
+    let cell_elem = cells.element_idx.get(cell);
+    let neighbor_elem = cells.element_idx.get(neighbor);
+    let neighbor_pd = match elements_table::get_element_pressure_data(neighbor_elem) {
+        Some(p) => p,
+        None => return 0.0,
+    };
+    let mut bvar12 = neighbor_pd.state & 3;
+    // —— 质量（原版 L1469-1474：fVar15 = mass[cell]，fVar19 = mass[neighbor]）——
+    let mass_cell = cells.mass.get(cell);
+    let mass_neighbor = cells.mass.get(neighbor);
+    // —— 压力系数（原版 L1475-1477：param_7 != 1 时用 param_9 邻格元素 pressure_data.flow）——
+    let cell_pd = match elements_table::get_element_pressure_data(cell_elem) {
+        Some(p) => p,
+        None => return 0.0,
+    };
+    let cell_state = cell_pd.state & 3; // 原版 param_7
+    // K1 修复（方案 A）：系数选择从"本格状态"判定改为"邻格状态"判定。
+    // 原版 L1475-1477：param_7（驱动格状态）!= 1 时取 param_9（邻格）的 flow ——
+    // 原版从真空/气体格驱动、液体为邻格，驱动格非气体时取**液体邻格**的 flow。
+    // Rust 由液体格驱动（mod.rs 压力循环 L42108-42192 语义）、真空/气体为邻格，
+    // 驱动格/邻格角色对调 → 邻格为气体（state==1）时用邻格（气体）flow，
+    // 邻格为真空/液体/固体时用本格（液体）flow。修复前取真空 flow≈0 → 横向不蔓延。
+    let flow_coeff = if bvar12 == 1 { neighbor_pd.flow } else { cell_pd.flow };
+    // —— 转移量 + clamp（原版 L1478-1484）——
+    let mut f18 = flow_coeff * (mass_cell - mass_neighbor);
+    if mass_cell * 0.125 <= f18 {
+        f18 = mass_cell * 0.125;
+    }
+    if f18 <= mass_neighbor * -0.125 {
+        f18 = mass_neighbor * -0.125;
+    }
+    // —— 方向：来源格/接收格/新元素（原版 L1485-1496）——
+    // uVar13 = 接收格新元素，uVar14 = 接收格当前元素（void 判断）
+    let mut uvar13 = cell_elem;
+    let mut uvar14 = neighbor_elem;
+    let (src_cell, dst_cell, src_mass) = if f18 < 0.0 {
+        // 邻格 → 本格：来源=邻格，接收=本格
+        bvar12 = cell_state; // 原版 L1488：bVar12 = param_7（接收格=本格）
+        uvar13 = neighbor_elem; // 原版 L1489：uVar13 = 邻格元素
+        uvar14 = cell_elem; // 原版 L1490：uVar14 = 本格元素
+        (neighbor, cell, mass_neighbor)
+    } else {
+        // 本格 → 邻格：来源=本格，接收=邻格
+        (cell, neighbor, mass_cell)
+    };
+    // —— 实际转移量 = min(|f18|, 来源格质量)（原版 L1497-1500）——
+    let transfer = f18.abs().min(src_mass);
+    if transfer <= 0.0 {
+        return f18; // 无质量转移（避免 0/0 NaN；原版此场景为边界，质量/病菌转移量均 0）
+    }
+    // —— 病菌：来源格病菌数从 cells 读（原版 L1501-1513）——
+    let src_disease_count = cells.disease_count.get(src_cell);
+    let ratio = (transfer / src_mass).clamp(0.0, 1.0);
+    let disease_to_transfer = (ratio * src_disease_count as f32) as i32;
+    // —— 来源格病菌 idx / 温度（原版 L1504-1518：从 updatedCells 读）——
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if src_cell >= updated.mass.len() || dst_cell >= updated.mass.len() {
+        return f18;
+    }
+    let src_disease_idx = updated.disease_idx.get(src_cell);
+    let src_temp = updated.temperature.get(src_cell);
+    // —— 接收格质量/温度/病菌（原版 L1519-1556，复用质量加权混合）——
+    add_mass_and_update_temperature(updated, dst_cell, transfer, src_temp, src_disease_idx, disease_to_transfer);
+    // —— 来源格质量减少（原版 L1559-1567，clamp >= 0）——
+    let src_mass_new = (updated.mass.get(src_cell) - transfer).max(0.0);
+    updated.mass.set(src_cell, src_mass_new);
+    // —— 来源格病菌减少（原版 L1568-1580）——
+    modify_disease_count(updated, src_cell, -disease_to_transfer);
+    // —— 元素段（原版 L1581-1608）：仅接收格非真空才产生事件 ——
+    if bvar12 != 0 {
+        return f18; // 接收格已是气体/液体/固体：不改变元素、不产生事件（原版 L1581-1583）
+    }
+    if uvar14 == sim.void_element_idx {
+        // 接收格原为 void → 质量/温度清零 + 清病菌（原版 L1584-1599）
+        updated.mass.set(dst_cell, 0.0);
+        updated.temperature.set(dst_cell, 0.0);
+        clear_disease(updated, dst_cell);
+        return f18;
+    }
+    // 接收格元素改为来源元素 + 事件（原版 L1600-1607）
+    updated.element_idx.set(dst_cell, uvar13);
+    push_substance_change(sim, dst_cell);
+    f18
+}
+
+// ===== 任务 8：PostProcessCell + DoDensityDisplacement + 挤压位移 =====
+// 对照源码 05_liquid_flow.c L2320-2867（PostProcessCell）、L1755-1840（DoDensityDisplacement）、
+// 11_msvcrt_ignored.c L34035（DisplaceGas）、L34136（DisplaceLiquid）、
+// L34206（DisplaceLiquidSimple）、L34357（DoDisplacement）。
+//
+// 用户观察的两条挤压链路（设计文档 3.4 节）：
+// - 液体被固体挤压 → 质量**平均分配**给上下左右可容纳格（异类液体也接收）→ displace_liquid
+// - 气体被固体挤压 → **单方向**转移全部质量（方向由 tickCount 旋转候选序驱动）→ displace_gas
+// ⚠️ 事件产生必须完整（push_substance_change）：挤压位移改变格子内容，C# 画面靠事件更新。
+
+/// 原版 LCG 伪随机数（L1786/L2474/L2746）：`seed = seed * 0x343fd + 0x269ec3`，
+/// 返回 `((seed >> 16) & 0x7fff) * 3.051851e-05`，∈ [0, 1)。
+fn next_random(sim: &mut SimData) -> f32 {
+    sim.random_seed = sim.random_seed.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+    ((sim.random_seed >> 16) & 0x7fff) as f32 * 3.051851e-05
+}
+
+/// CellSOA::ClearCell（原版 11_msvcrt_ignored.c L23677-23723）。
+/// 清空格子：元素 → vacuumElementIdx、质量/温度清零、病菌四字段清除。
+fn clear_cell(sim: &SimData, cells: &mut CellSOA, cell: usize) {
+    cells.element_idx.set(cell, sim.vacuum_element_idx);
+    cells.mass.set(cell, 0.0);
+    cells.temperature.set(cell, 0.0);
+    clear_disease(cells, cell);
+}
+
+/// FastCalculateCombinedTemperature（原版 DoDensityDisplacement L1820 调用）——
+/// 两格同元素液体质量加权平均温度。
+fn fast_combined_temperature(mass_a: f32, temp_a: f32, mass_b: f32, temp_b: f32) -> f32 {
+    (mass_a * temp_a + mass_b * temp_b) / (mass_a + mass_b)
+}
+
+/// 清空格子 flow 四分量（原版 L2455-2458/L2552-2555，flow 为 Vector4f 数组）。
+fn clear_flow(sim: &mut SimData, cell: usize) {
+    if !sim.flow.ptr.is_null() {
+        let total = sim.width as usize * sim.height as usize;
+        let flow = unsafe { std::slice::from_raw_parts_mut(sim.flow.ptr, total) };
+        if cell < total {
+            flow[cell] = Vector4f::default();
+        }
+    }
+}
+
+/// Evaporate（原版 05_liquid_flow.c L2194-2208）：清空格子 + substance 事件。
+/// 调用 SimData::ClearCell（11_msvcrt L23677：元素→真空、质量/温度清零、病菌四字段）。
+/// 2026-08-02 实现：此前留桩 → 表层微克级残水（≤0.01kg / 气体 <1e-9）永不清理。
+fn do_evaporate(sim: &mut SimData, cell: usize) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if cell >= updated.element_idx.len() {
+        return;
+    }
+    clear_cell(sim, updated, cell);
+    push_substance_change(sim, cell);
+}
+
+/// DoSublimation 的相变发射部分（原版 L2722-2863）—— 相变留桩，
+/// 但 accumulatedFlow 累加（L2831）在 post_process_cell 内单独实现。
+fn do_sublimation_stub(_sim: &mut SimData, _cell: usize) {}
+
+/// DoUnstableCheck（塌方/下落检查，原版 L2537-2545）—— 留桩。
+fn do_unstable_check_stub(_sim: &mut SimData, _cell: usize) {}
+
+/// DoPartialMelt 的"是否熔融"判定近似（原版 04_temperature.c L2471-2658）。
+///
+/// **近似说明**：原版在判定熔融后还会执行熔融发射（SpawnFallingLiquid / DisplaceGas +
+/// 质量/温度改写等相变），本实现按设计文档把相变发射留桩，此处仅复现**判定**部分——
+/// 用可用数据（元素状态、质量、properties、temperature_data）逐条复现原版前置条件，
+/// 前序条件全部满足即视为"会发生部分熔融"返回 true。
+///
+/// 用途：PostProcessCell 气体邻居置换门控（原版 05_liquid_flow.c L2469-2475）需要
+/// `四个方向 DoPartialMelt 全 false` 才进入置换；本近似使该门控结构与原版一致。
+/// 越界格安全返回 false（原版为 `_invalid_parameter_noinfo_noreturn()` 崩溃）。
+fn do_partial_melt(sim: &SimData, cell: usize, neighbor: usize) -> bool {
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    if neighbor >= updated.element_idx.len() || neighbor >= updated.mass.len() {
+        return false;
+    }
+    let (cell_elem, neigh_elem) = (updated.element_idx.get(cell), updated.element_idx.get(neighbor));
+    let (Some(cell_ppd), Some(neigh_ppd)) = (
+        elements_table::get_element_post_process_data(cell_elem),
+        elements_table::get_element_post_process_data(neigh_elem),
+    ) else {
+        return false;
+    };
+    // 原版 L2505-2507：当前格液体/固体，或邻居非固体 → false
+    if (cell_ppd.state & 3) > 1 || (neigh_ppd.state & 3) != 3 {
+        return false;
+    }
+    // 原版 L2511-2512：邻居质量 <= 5.0 → false
+    if updated.mass.get(neighbor) <= 5.0 {
+        return false;
+    }
+    // 原版 L2517-2518：邻居 props & 0x48 置位 → false
+    if updated.properties.get(neighbor) & 0x48 != 0 {
+        return false;
+    }
+    // 温度条件（原版 L2523-2535）：用 temperature_data 的 high_temp 替代 Element.highTemp
+    let Some(neigh_td) = elements_table::get_element_temperature_data(neigh_elem) else {
+        return false;
+    };
+    // 原版 L2524-2527：当前格温度 <= 邻居元素 highTemp + 3 → false
+    if updated.temperature.get(cell) <= neigh_td.high_temp + 3.0 {
+        return false;
+    }
+    // 原版 L2529-2532：邻居温度 >= 邻居元素 highTemp - 3 → false
+    if updated.temperature.get(neighbor) >= neigh_td.high_temp - 3.0 {
+        return false;
+    }
+    // 原版 L2533-2535：邻居元素高温相变目标无效 → false
+    if neigh_td.high_temp_transition_idx == 0xffff {
+        return false;
+    }
+    // 后续熔融量计算与发射（L2540-2658）留桩；前序条件满足即视为会熔融。
+    true
+}
+
+/// DoDensityDisplacement — 密度分层（原版 05_liquid_flow.c L1755-1840）。
+///
+/// 对照原版逐行：
+/// 1. 当前格元素状态 != 下方格元素状态 → false（不同物质不相邻置换，L1783-1785）。
+/// 2. 随机门：`next_random() <= param_5` → false（L1786-1789）。
+///    液体调用方传 0.3（70% 通过）、气体传 0.99（1% 通过）；测试可传 0.0 强制通过。
+/// 3. 下方格更轻（below.molar_mass <= cell.molar_mass 且不等）→ 当前格更重 → 交换下沉
+///    （L1791-1797）+ 2 条事件。
+/// 4. 同元素分支（L1798-1833）：元素不同 → false；mass[below] <= mass[cell] → false；
+///    temp[below] <= temp[cell] → false；非液体（气体）→ 直接交换；
+///    液体 → 温度质量加权合并（FastCalculateCombinedTemperature），两格同温。
+///
+/// 返回 true 表示发生了交换/合并（调用方不再做后续处理，原版 L2560-2562）。
+/// 元素表缺失或索引越界时安全返回 false。
+pub fn do_density_displacement(sim: &mut SimData, cell: usize, param_5: f32) -> bool {
+    if sim.updated_cells.ptr.is_null() {
+        return false;
+    }
+    let width = sim.width as usize;
+    if width == 0 || cell < width {
+        return false; // 防止下方格索引下溢
+    }
+    let below = cell - width;
+    let (cell_elem, below_elem) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        (updated.element_idx.get(cell), updated.element_idx.get(below))
+    };
+    // 原版 L1781-1785：param_4->state != 下方格元素 Element.state → false。
+    // ppd.state 与 Element.state 同源（03_elements.c L296），故两格都用 ppd.state 比较。
+    let (cell_ppd, below_ppd) = match (
+        elements_table::get_element_post_process_data(cell_elem),
+        elements_table::get_element_post_process_data(below_elem),
+    ) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    if cell_ppd.state != below_ppd.state {
+        return false;
+    }
+    // 原版 L1786-1789：随机门
+    if next_random(sim) <= param_5 {
+        return false;
+    }
+    // 原版 L1791-1797：当前格更重 → 交换下沉
+    if below_ppd.molar_mass <= cell_ppd.molar_mass && cell_ppd.molar_mass != below_ppd.molar_mass {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        swap_cells(updated, cell, below);
+        push_substance_change(sim, cell);
+        push_substance_change(sim, below);
+        return true;
+    }
+    // —— 同元素分支（原版 L1798-1833）——
+    if cell_elem != below_elem {
+        return false;
+    }
+    let (mass_below, mass_cell, temp_below, temp_cell) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        (
+            updated.mass.get(below),
+            updated.mass.get(cell),
+            updated.temperature.get(below),
+            updated.temperature.get(cell),
+        )
+    };
+    // 原版 L1809-1811：mass[below] <= mass[cell] → false
+    if mass_below <= mass_cell {
+        return false;
+    }
+    // 原版 L1809-1811：temp[below] <= temp[cell] → false
+    if temp_below <= temp_cell {
+        return false;
+    }
+    if (cell_ppd.state & 3) != 2 {
+        // 原版 L1812-1815：非液体（气体）→ 直接交换
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        swap_cells(updated, cell, below);
+        return true;
+    }
+    // 原版 L1816-1831：液体 → 温度质量加权合并
+    let combined = fast_combined_temperature(mass_cell, temp_cell, mass_below, temp_below);
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    updated.temperature.set(cell, combined);
+    updated.temperature.set(below, combined);
+    true
+}
+
+/// DoDisplacement（原版 11_msvcrt_ignored.c L34357-34419）—— 把源格**全部**内容
+/// 移到目标格：质量/温度/病菌整体累加、目标格元素改为源格元素、源格 ClearCell，
+/// 产生 2 条 substance 事件（源 + 目标）。DisplaceGas 与挤压链路共用。
+fn do_displacement(sim: &mut SimData, src: usize, dst: usize) {
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    let (mass, temp, d_idx, d_count) = (
+        updated.mass.get(src),
+        updated.temperature.get(src),
+        updated.disease_idx.get(src),
+        updated.disease_count.get(src),
+    );
+    add_mass_and_update_temperature(updated, dst, mass, temp, d_idx, d_count);
+    updated.element_idx.set(dst, updated.element_idx.get(src));
+    clear_cell(sim, updated, src);
+    push_substance_change(sim, src);
+    push_substance_change(sim, dst);
+}
+
+/// DisplaceGas — 气体被挤压 → **单方向转移全部质量**（原版 11_msvcrt_ignored.c L34035-34129）。
+///
+/// 源格必须质量 > 0 且元素为气体（postProcessData.state & 3 == 1）。
+/// 候选顺序（原版 L34068-34074）`[下, 左, 右, 上]`，按 `tickCount` 旋转
+/// （原版 `local_60[uVar4 + tickCount & 3]`）——这是"随机单方向"的确定性实现
+/// （每帧 tickCount 递增，起始方向交替变化）。
+///
+/// 循环 1（主方向 L34075-34092）：候选元素 == 目标气体 或 == vacuum 且
+/// `properties & 1 == 0` → DoDisplacement 全量转移，返回 true。
+/// 循环 2（对角下 L34093-34121）：候选为 左下/右下（按 tickCount 取一），
+/// 候选元素 == 目标气体 且 同侧平格（updatedCells）非固体（liquidData.state & 3 != 3）
+/// 且 `properties & 1 == 0` → DoDisplacement。
+///
+/// 返回 false 表示无方向可去（原版返回 false，调用方决定是否放弃）。
+pub fn displace_gas(sim: &mut SimData, cell: usize, gas_elem: u16) -> bool {
+    if sim.updated_cells.ptr.is_null() {
+        return false;
+    }
+    let width = sim.width as usize;
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    if cell >= updated.mass.len() || updated.mass.get(cell) <= 0.0 {
+        return false;
+    }
+    // 原版 L34062-34067：源格元素必须为气体
+    let cell_elem = updated.element_idx.get(cell);
+    let is_gas = match elements_table::get_element_post_process_data(cell_elem) {
+        Some(ppd) => (ppd.state & 3) == 1,
+        None => false,
+    };
+    if !is_gas {
+        return false;
+    }
+    let len = updated.element_idx.len();
+    // 原版 L34068-34074：候选 = [下, 左, 右, 上]
+    let candidates = [cell + width, cell.wrapping_sub(1), cell + 1, cell.wrapping_sub(width)];
+    let tick = sim.tick_count as usize;
+    // 循环 1（L34075-34092）
+    for i in 0..4 {
+        let c = candidates[(tick + i) & 3];
+        if c >= len {
+            continue;
+        }
+        let e = updated.element_idx.get(c);
+        let is_target = e == gas_elem || e == sim.vacuum_element_idx;
+        if is_target && (updated.properties.get(c) & 1) == 0 {
+            do_displacement(sim, cell, c);
+            return true;
+        }
+    }
+    // 循环 2（L34093-34121）：对角向下
+    let diag = [cell + width - 1, cell + width + 1]; // 左下、右下
+    let sides = [cell.wrapping_sub(1), cell + 1]; // 左、右
+    for i in 0..2 {
+        let dir = (tick + i) & 1;
+        let c = diag[dir];
+        if c >= len {
+            continue;
+        }
+        if updated.element_idx.get(c) != gas_elem {
+            continue;
+        }
+        // 同侧平格（updatedCells）非固体才允许对角移动（原版 L34102-34109）
+        let side = sides[dir];
+        let side_ok = match elements_table::get_element_liquid_data(updated.element_idx.get(side)) {
+            Some(ld) => (ld.state & 3) != 3,
+            None => false,
+        };
+        if side_ok && (updated.properties.get(c) & 1) == 0 {
+            do_displacement(sim, cell, c);
+            return true;
+        }
+    }
+    false
+}
+
+/// DisplaceLiquidSimple（原版 11_msvcrt_ignored.c L34206-34352）——
+/// 把源格液体质量**平均分配**给候选格。
+///
+/// 对照原版：
+/// 1. 源格质量 >= 0.01（L34256）且候选非空。
+/// 2. 收集候选：元素 == 目标液体 或 == vacuum，且 `properties & 2 == 0`
+///    （非固体标志，L34262-34282）——**异类液体也接收**（原版检查的是元素
+///    相等或真空，不是"同类才收"）。
+/// 3. 每格 AddMassAndUpdateTemperature(mass/n) + 元素改为目标液体 + substance 事件
+///    + timers |= 0x1F（L34309-34342）；病菌按 `(count + n - 1) / n` 分配。
+/// 4. 全部派发后源格 ClearCell + 1 条事件（L34295-34297）。
+///
+/// 返回 true 表示派发完成。
+fn displace_liquid_simple(sim: &mut SimData, cell: usize, elem: u16, candidates: &[usize]) -> bool {
+    if sim.updated_cells.ptr.is_null() {
+        return false;
+    }
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    if cell >= updated.mass.len() || candidates.is_empty() {
+        return false;
+    }
+    let mass_cell = updated.mass.get(cell);
+    if mass_cell < 0.01 {
+        return false; // 原版 L34256
+    }
+    // 收集可容纳格（L34262-34282）
+    let mut valid: Vec<usize> = Vec::new();
+    for &c in candidates {
+        if c >= updated.element_idx.len() {
+            continue;
+        }
+        let e = updated.element_idx.get(c);
+        let is_target = e == elem || e == sim.vacuum_element_idx;
+        if is_target && (updated.properties.get(c) & 2) == 0 {
+            valid.push(c);
+        }
+    }
+    let n = valid.len();
+    if n == 0 {
+        return false;
+    }
+    let fvar4 = updated.mass.get(cell);
+    let disease_count = updated.disease_count.get(cell);
+    let disease_idx = updated.disease_idx.get(cell);
+    let temp = updated.temperature.get(cell);
+    let per = fvar4 / n as f32;
+    // 原版 L34314：病菌按 `(count + n - 1) / n` 均分（整除，可能略超）
+    let disease_per = (disease_count + n as i32 - 1) / n as i32;
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    for &c in &valid {
+        add_mass_and_update_temperature(updated, c, per, temp, disease_idx, disease_per);
+        updated.element_idx.set(c, elem);
+        // 目标格元素类型变化必须产生事件（原版 L34322-34339）+ timers（push 内处理）
+        push_substance_change(sim, c);
+    }
+    // 源格 ClearCell + 事件（原版 L34295-34297）
+    clear_cell(sim, updated, cell);
+    push_substance_change(sim, cell);
+    true
+}
+
+/// DisplaceLiquid — 液体被固体/异类挤压 → 质量平均分配（原版 11_msvcrt_ignored.c L34136-34199）。
+///
+/// 对照原版：
+/// 1. 源格质量 > 0 且元素为液体（postProcessData.state & 3 == 2，L34154-34161）。
+/// 2. 先 DisplaceLiquidSimple 尝试 4 方向均分（右/左/下/上，L34162-34168）。
+/// 3. 失败则按 tickCount 旋转顺序找气体邻居 → DisplaceGas 把气体挤走（L34170-34188），
+///    成功后重试 DisplaceLiquidSimple。
+///
+/// `elem` 是被挤压液体的元素索引（原版 param_5，来自调用点读到的源格元素）。
+pub fn displace_liquid(sim: &mut SimData, cell: usize, elem: u16) -> bool {
+    if sim.updated_cells.ptr.is_null() {
+        return false;
+    }
+    let width = sim.width as usize;
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    if cell >= updated.mass.len() || updated.mass.get(cell) <= 0.0 {
+        return false;
+    }
+    // 原版 L34156-34161：源格元素必须为液体
+    let cell_elem = updated.element_idx.get(cell);
+    let is_liquid = match elements_table::get_element_post_process_data(cell_elem) {
+        Some(ppd) => (ppd.state & 3) == 2,
+        None => false,
+    };
+    if !is_liquid {
+        return false;
+    }
+    // 原版 L34162-34165：候选 = [右, 左, 下, 上]
+    let candidates = [cell + 1, cell.wrapping_sub(1), cell + width, cell.wrapping_sub(width)];
+    if displace_liquid_simple(sim, cell, elem, &candidates) {
+        return true;
+    }
+    // 原版 L34170-34191：气体邻居置换后重试
+    let len = updated.element_idx.len();
+    let tick = sim.tick_count as usize;
+    for i in 0..4 {
+        let c = candidates[(tick + i) & 3];
+        if c >= len {
+            continue;
+        }
+        let e = updated.element_idx.get(c);
+        let is_gas = match elements_table::get_element_post_process_data(e) {
+            Some(ppd) => (ppd.state & 3) == 1,
+            None => false,
+        };
+        if is_gas && displace_gas(sim, c, e) {
+            return displace_liquid_simple(sim, cell, elem, &candidates);
+        }
+    }
+    false
+}
+
+// ===== Add 系列（cellmodifications.cpp，原版 SimDLL_Source.c L134150-134789）=====
+// 供 frame_processor process_cell_modifications mode 0（ReplaceType.None / Add）分派。
+// 语义：把 (mass, temp, disease) 添加到目标格，按目标格元素状态处理：
+// 同元素 → 合并质量/温度（吸收为一格）；真空 → 直接放置；
+// 异形态 → Displace 挤走原内容后放置（失败则四邻找同元素/真空格）；固体 → 四邻找非固体格。
+// 2026-08-02 实现：液滴落地回注（C# AddToSim → AddRemoveSubstance → ModifyCell Add）的核心。
+
+/// 查询 updated 缓冲中某格的元素状态（state & 3；元素表缺失返回 0xFF）。
+fn elem_state(updated: &CellSOA, idx: usize) -> u8 {
+    let e = updated.element_idx.get(idx);
+    elements_table::get_element_post_process_data(e)
+        .map(|p| p.state & 3)
+        .unwrap_or(0xFF)
+}
+
+/// 原版 L134837-134897 的"原位放置/替换 + 剩余合并"（LAB_18003784e）：
+/// 目标格已有质量 > 传入质量 → 只减质量；否则清空目标格，剩余质量合并进去。
+fn place_subtract(
+    sim: &mut SimData,
+    target: usize,
+    elem: u16,
+    mass: f32,
+    temperature: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if target >= updated.mass.len() {
+        return;
+    }
+    let cur_mass = updated.mass.get(target);
+    if mass < cur_mass {
+        updated.mass.set(target, cur_mass - mass);
+        return;
+    }
+    let leftover = mass - cur_mass;
+    updated.element_idx.set(target, elem);
+    updated.mass.set(target, 0.0);
+    updated.temperature.set(target, 0.0);
+    let disease_to_add = if mass > 0.0 {
+        ((leftover / mass) * disease_count as f32) as i32
+    } else {
+        0
+    };
+    add_mass_and_update_temperature(updated, target, leftover, temperature, disease_idx, disease_to_add);
+    if updated.mass.get(target) <= 1.1754944e-38 {
+        updated.element_idx.set(target, sim.vacuum_element_idx);
+    }
+    push_substance_change(sim, target);
+}
+
+/// 四邻（右/左/上/下）找同元素格 → 合并并返回 true。
+fn merge_into_same_element_neighbor(
+    sim: &mut SimData,
+    target: usize,
+    elem: u16,
+    mass: f32,
+    temperature: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) -> bool {
+    if sim.updated_cells.ptr.is_null() {
+        return false;
+    }
+    let width = sim.width as usize;
+    let found = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        let mut found_n = None;
+        for n in [target + 1, target.wrapping_sub(1), target + width, target.wrapping_sub(width)] {
+            if n < updated.element_idx.len() && updated.element_idx.get(n) == elem {
+                found_n = Some(n);
+                break;
+            }
+        }
+        found_n
+    };
+    if let Some(n) = found {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        add_mass_and_update_temperature(updated, n, mass, temperature, disease_idx, disease_count);
+        return true;
+    }
+    false
+}
+
+/// AddLiquid（原版 L134362-134555）。
+pub(crate) fn add_liquid(
+    sim: &mut SimData,
+    cell: usize,
+    elem: u16,
+    mass: f32,
+    temperature: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if cell >= updated.element_idx.len() {
+        return;
+    }
+    let cur = updated.element_idx.get(cell);
+    // 原版 L134375-134377：同元素 → 合并（吸收为一格）
+    if cur == elem {
+        add_mass_and_update_temperature(updated, cell, mass, temperature, disease_idx, disease_count);
+        return;
+    }
+    let width = sim.width as usize;
+    // 原版 L134379-134411：目标固体 → 四邻找第一个非固体格（左/右/下/上）
+    let mut target = cell;
+    if elem_state(updated, cell) == 3 {
+        for n in [
+            cell.wrapping_sub(1),
+            cell + 1,
+            cell.wrapping_sub(width),
+            cell + width,
+        ] {
+            if n < updated.element_idx.len() && elem_state(updated, n) != 3 {
+                target = n;
+                break;
+            }
+        }
+    }
+    let target_state = elem_state(updated, target);
+    // 原版 L134412-134425：目标固体/void → 原位减质量或替换+剩余合并
+    if target_state == 3 || updated.element_idx.get(target) == sim.void_element_idx {
+        place_subtract(sim, target, elem, mass, temperature, disease_idx, disease_count);
+        return;
+    }
+    if target_state == 0 {
+        // 原版 L134426-134431：真空 → 直接放置
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(target, elem);
+        add_mass_and_update_temperature(updated, target, mass, temperature, disease_idx, disease_count);
+        push_substance_change(sim, target);
+        return;
+    }
+    if target_state == 1 {
+        // 原版 L134456-134495：气体 → DisplaceGas；失败 → 下方液体交换 + 四邻同元素合并/放置
+        let gas = updated.element_idx.get(target);
+        if displace_gas(sim, target, gas) {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.element_idx.set(target, elem);
+            add_mass_and_update_temperature(updated, target, mass, temperature, disease_idx, disease_count);
+            push_substance_change(sim, target);
+            return;
+        }
+        let below = target.wrapping_sub(width);
+        if below < updated.element_idx.len() && elem_state(updated, below) == 2 {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            swap_cells(updated, below, target);
+            push_substance_change(sim, below);
+            push_substance_change(sim, target);
+        }
+        if merge_into_same_element_neighbor(sim, target, elem, mass, temperature, disease_idx, disease_count) {
+            return;
+        }
+        place_subtract(sim, target, elem, mass, temperature, disease_idx, disease_count);
+        return;
+    }
+    // 原版 L134446-134455：异液体 → DisplaceLiquid 挤走后，四邻同元素合并/放置
+    let liq = updated.element_idx.get(target);
+    displace_liquid(sim, target, liq);
+    if merge_into_same_element_neighbor(sim, target, elem, mass, temperature, disease_idx, disease_count) {
+        return;
+    }
+    place_subtract(sim, target, elem, mass, temperature, disease_idx, disease_count);
+}
+
+/// AddGas（原版 L134150-134360）。
+pub(crate) fn add_gas(
+    sim: &mut SimData,
+    cell: usize,
+    elem: u16,
+    mass: f32,
+    temperature: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if cell >= updated.element_idx.len() {
+        return;
+    }
+    let cur = updated.element_idx.get(cell);
+    if cur == elem {
+        add_mass_and_update_temperature(updated, cell, mass, temperature, disease_idx, disease_count);
+        return;
+    }
+    let width = sim.width as usize;
+    let target_state = elem_state(updated, cell);
+    // 原版 L134186-134207：真空直接放置；异形态 Displace 后放置
+    let displace_ok = match target_state {
+        0 => true,
+        1 => displace_gas(sim, cell, cur),
+        2 => {
+            displace_liquid(sim, cell, cur);
+            true
+        }
+        _ => false,
+    };
+    if displace_ok {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(cell, elem);
+        add_mass_and_update_temperature(updated, cell, mass, temperature, disease_idx, disease_count);
+        push_substance_change(sim, cell);
+        return;
+    }
+    // 原版 L134208-134249：Displace 失败 → 四邻（左/右/上）找真空或同元素格
+    // 原版 L134208-134249：Displace 失败 → 四邻（左/右/上）找真空或同元素格
+    let (vacuum_n, same_n) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        let mut vn = None;
+        let mut sn = None;
+        for n in [cell.wrapping_sub(1), cell + 1, cell + width] {
+            if n >= updated.element_idx.len() {
+                continue;
+            }
+            let ne = updated.element_idx.get(n);
+            if vn.is_none() && ne == sim.vacuum_element_idx {
+                vn = Some(n);
+            }
+            if sn.is_none() && ne == elem {
+                sn = Some(n);
+            }
+        }
+        (vn, sn)
+    };
+    if let Some(n) = vacuum_n {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(n, elem);
+        updated.mass.set(n, mass);
+        updated.temperature.set(n, temperature);
+        updated.disease_idx.set(n, disease_idx);
+        updated.disease_count.set(n, disease_count);
+        push_substance_change(sim, n);
+        return;
+    }
+    if let Some(n) = same_n {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        add_mass_and_update_temperature(updated, n, mass, temperature, disease_idx, disease_count);
+        return;
+    }
+    // 原版 L134249-134277：兜底原位减质量或替换+剩余合并
+    place_subtract(sim, cell, elem, mass, temperature, disease_idx, disease_count);
+}
+
+/// AddSolid（原版 L134555-134789 的简化版）。
+/// ⚠️ 垂直位移（DoVerticalDisplacement）推迟：属排液口/网格砖机制（用户裁决暂不做）。
+/// 语义：同元素合并；目标固体 → 四邻找非固体格；异形态 → Displace 后放置。
+pub(crate) fn add_solid(
+    sim: &mut SimData,
+    cell: usize,
+    elem: u16,
+    mass: f32,
+    temperature: f32,
+    disease_idx: u8,
+    disease_count: i32,
+) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if cell >= updated.element_idx.len() {
+        return;
+    }
+    let cur = updated.element_idx.get(cell);
+    if cur == elem {
+        add_mass_and_update_temperature(updated, cell, mass, temperature, disease_idx, disease_count);
+        return;
+    }
+    let width = sim.width as usize;
+    let mut target = cell;
+    if elem_state(updated, cell) == 3 {
+        for n in [
+            cell.wrapping_sub(1),
+            cell + 1,
+            cell.wrapping_sub(width),
+            cell + width,
+        ] {
+            if n < updated.element_idx.len() && elem_state(updated, n) != 3 {
+                target = n;
+                break;
+            }
+        }
+    }
+    let target_state = elem_state(updated, target);
+    if target_state == 3 || updated.element_idx.get(target) == sim.void_element_idx {
+        place_subtract(sim, target, elem, mass, temperature, disease_idx, disease_count);
+        return;
+    }
+    if target_state == 0 {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(target, elem);
+        add_mass_and_update_temperature(updated, target, mass, temperature, disease_idx, disease_count);
+        push_substance_change(sim, target);
+        return;
+    }
+    if target_state == 1 {
+        let gas = updated.element_idx.get(target);
+        if !displace_gas(sim, target, gas) {
+            place_subtract(sim, target, elem, mass, temperature, disease_idx, disease_count);
+            return;
+        }
+    } else {
+        let liq = updated.element_idx.get(target);
+        displace_liquid(sim, target, liq);
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    updated.element_idx.set(target, elem);
+    add_mass_and_update_temperature(updated, target, mass, temperature, disease_idx, disease_count);
+    push_substance_change(sim, target);
+}
+
+/// DoPressureBreak（原版 04_temperature.c L2663-2792）：超压液体沿一个方向尝试突破。
+///
+/// 从 `cell` 出发沿 `offset` 走最多 3 格：每遇到一格固体，累加其"抗压阻力"：
+/// `resistance += ((mass/maxMass)*bit7 + (1-bit7)) * strength * (strengthInfo&0x7f) * 0.25 + 0.1`
+/// （bit7=strengthInfo 最高位；不可破坏固体 state&4 或 properties&8 → 直接挡住）。
+/// 非固体格 → 停止走；若累计阻力 < 压强比（mass/maxMass）→ 突破成功：
+/// 对被穿过的固体格产生 worldDamageInfo，返回 true。
+/// 2026-08-02 实现：原版超压第一优先是 4 方向突破（缺失时总是向下倾倒 → 上下合并异常）。
+fn do_pressure_break(sim: &mut SimData, cell: usize, ratio: f32, offset: isize) -> bool {
+    if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
+        return false;
+    }
+    let width = sim.width as usize;
+    let total = width * sim.height as usize;
+    let mut cur = cell as isize;
+    let mut solid_count: usize = 0;
+    let mut resistance = 1.0f32;
+    let mut iter = 0usize;
+    while iter < 3 {
+        cur += offset;
+        if cur < 0 || cur as usize >= total {
+            return false; // 越界（原版崩溃，Rust 安全返回）
+        }
+        let c = cur as usize;
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        let elem = updated.element_idx.get(c);
+        let ppd = match elements_table::get_element_post_process_data(elem) {
+            Some(p) => p,
+            None => return false,
+        };
+        if (ppd.state & 3) != 3 {
+            break; // 非固体 → 停止走（原版 L2686）
+        }
+        if (ppd.state & 4) != 0 {
+            return false; // 不可破坏固体（原版 L2688）
+        }
+        if (updated.properties.get(c) & 8) != 0 {
+            return false; // properties bit3 挡住（原版 L2693）
+        }
+        solid_count += 1;
+        let sb = updated.strength_info.get(c);
+        let fvar14 = if (sb >> 7) == 1 { 1.0f32 } else { 0.0f32 };
+        let fvar13 = if fvar14 >= 1.0 { 0.0f32 } else { 0.100000024 };
+        let mass_c = updated.mass.get(c);
+        let strength = ppd.strength;
+        resistance += ((mass_c / ppd.max_mass) * fvar14 + (1.0 - fvar14))
+            * strength
+            * ((sb & 0x7f) as f32)
+            * 0.25
+            + fvar13;
+        if ratio < resistance {
+            return false; // 压强不足 → 被挡（原版 L2707）
+        }
+        iter += 1;
+    }
+    // 原版 L2716：穿过固体少于 3 格且阻力 < 压强 → 突破
+    if (solid_count as i32 - 1) < 2 && resistance < ratio {
+        let c = cur as usize;
+        if c < total {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            let elem = updated.element_idx.get(c);
+            if let Some(ppd2) = elements_table::get_element_post_process_data(elem) {
+                // 原版 L2720-2728：边界格是液体且有质量 → 从压强比中扣除
+                if (ppd2.state & 3) == 2 {
+                    let m = updated.mass.get(c);
+                    if m > 0.0 {
+                        let ratio_after = ratio - m / ppd2.max_mass;
+                        if resistance < ratio_after {
+                            push_world_damage(sim, cell, offset, solid_count);
+                            return true;
+                        }
+                    }
+                } else if resistance < ratio {
+                    push_world_damage(sim, cell, offset, solid_count);
+                    return true;
+                }
+            } else if resistance < ratio {
+                push_world_damage(sim, cell, offset, solid_count);
+                return true;
+            }
+        } else if resistance < ratio {
+            push_world_damage(sim, cell, offset, solid_count);
+            return true;
+        }
+    }
+    false
+}
+
+/// 对被穿过的固体格产生 worldDamageInfo（原版 L2730-2765）。
+fn push_world_damage(sim: &mut SimData, cell: usize, offset: isize, solid_count: usize) {
+    let width = sim.width as usize;
+    let game_w = sim.width - 2;
+    let src_game = ((cell % width) as i32 - 1) + ((cell / width) as i32 - 1) * game_w;
+    let mut pos = cell as isize;
+    for _ in 0..solid_count {
+        pos += offset;
+        if pos < 0 {
+            continue;
+        }
+        let p = pos as usize;
+        let game_cell = ((p % width) as i32 - 1) + ((p / width) as i32 - 1) * game_w;
+        if game_cell >= 0 && game_cell < sim.num_game_cells {
+            let events = unsafe { &mut *sim.sim_events.ptr };
+            events.world_damage_info.push(crate::a_framework::game_data::WorldDamageInfo {
+                cell_idx: game_cell,
+                damage_source_cell_idx: src_game,
+            });
+        }
+    }
+}
+
+/// PostProcessCell — 格后处理（原版 05_liquid_flow.c L2320-2867）。
+///
+/// 按元素状态分支：
+/// - 真空（state&3==0）：properties&1 置位 → return；否则 DoSublimation（留桩）。
+/// - 气体（state&3==1）：
+///   1. `displacementDirection` 每格交替反转（L2382-2384）。
+///   2. 质量 ∈ [1e-9, 0.001) 时检查挤压邻居（顺序受 displacementDirection 驱动：
+///      [cell+dir, cell-dir, cell-width, cell+width]），任一邻居质量 >= 1.0 且为气体
+///      → 清 flow + Evaporate（L2392-2460）。
+///   3. DoDensityDisplacement(cell, 0.99)（L2461）；失败且非固体属性时，
+///      随机 > 0.9（10%）→ 找 [cell-dir, cell+dir, cell-width] 中最轻的气体邻居交换
+///      （L2469-2526，molar_mass 轻者优先，首次迭代不进入更重气体）。
+/// - 固体（state&3==3）：state & 0xb == 0xb 时 DoUnstableCheck（留桩）。
+/// - 液体（state&3==2）：
+///   1. 质量 <= 0.01 → 清 flow + Evaporate（L2551-2558）。
+///   2. DoDensityDisplacement(cell, 0.3)（L2559）；true → return。
+///   3. 质量 > maxMass → 过压释放（L2566-2704）：下方格是液体且更轻时，
+///      DisplaceLiquid 挤走下方液体腾出空间，再转移质量 × 0.49751243 到下方
+///      （含温度/元素/病菌复制 + 事件）。
+///   4. DoPartialHeatTransition（留桩）+ DoSublimation（相变留桩，仅保留
+///      accumulatedFlow 累加 L2831）。
+///
+/// 元素表缺失（测试环境）时安全返回。
+pub fn post_process_cell(sim: &mut SimData, cell: usize) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim.width as usize;
+    let height = sim.height as usize;
+    if width < 3 || height < 3 || cell < width {
+        return;
+    }
+    // —— 读元素 + 后处理数据（原版 L2361-2371）——
+    let (elem, ppd, props_cell) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        if cell >= updated.element_idx.len() {
+            return;
+        }
+        let elem = updated.element_idx.get(cell);
+        let ppd = match elements_table::get_element_post_process_data(elem) {
+            Some(p) => p,
+            None => return,
+        };
+        (elem, ppd, updated.properties.get(cell))
+    };
+    let state3 = ppd.state & 3;
+
+    // ===== 真空（原版 L2373-2380）=====
+    if state3 == 0 {
+        if props_cell & 1 != 0 {
+            return;
+        }
+        do_sublimation_stub(sim, cell);
+        return;
+    }
+
+    // ===== 气体（原版 L2381-2531）=====
+    if state3 == 1 {
+        // 原版 L2382-2384：displacementDirection 每格交替反转
+        let dir = sim.displacement_direction;
+        sim.displacement_direction = -dir;
+        let mass_cell = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            updated.mass.get(cell)
+        };
+        if mass_cell >= 1e-09 {
+            if mass_cell < 0.001 {
+                // 挤压邻居检查（L2392-2450）：顺序 [cell+dir, cell-dir, cell-width, cell+width]
+                let total = width * height;
+                let order = [
+                    cell as isize + dir as isize,
+                    cell as isize - dir as isize,
+                    cell as isize - width as isize,
+                    cell as isize + width as isize,
+                ];
+                let mut squeezed = false;
+                for cand in order {
+                    if cand < 0 {
+                        continue;
+                    }
+                    let cand = cand as usize;
+                    if cand >= total {
+                        continue;
+                    }
+                    let updated = unsafe { &*sim.updated_cells.ptr };
+                    if updated.mass.get(cand) >= 1.0 {
+                        if let Some(ppd2) =
+                            elements_table::get_element_post_process_data(updated.element_idx.get(cand))
+                        {
+                            if (ppd2.state & 3) == 1 {
+                                squeezed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if squeezed {
+                    clear_flow(sim, cell);
+                    do_evaporate(sim, cell);
+                }
+            }
+        } else {
+            // 原版 L2454-2460：mass < 1e-09 → 清 flow + Evaporate
+            clear_flow(sim, cell);
+            do_evaporate(sim, cell);
+        }
+        // 原版 L2461：DoDensityDisplacement(cell, ppd, 0.99)
+        if !do_density_displacement(sim, cell, 0.99) {
+            // 原版 L2469-2475：门控 = (props&2 != 0 || 四方向 DoPartialMelt 全 false) && random > 0.9。
+            // 注意 props&2 置位（固体标志）的气体格**也**进入置换——原版是 OR 关系，
+            // 旧实现 `(props&2)==0` 把置位格排除，与本修正冲突。
+            // DoPartialMelt 熔融判定见 do_partial_melt（近似实现，相变发射留桩）。
+            let melt_blocked = do_partial_melt(sim, cell, cell.wrapping_sub(width))
+                || do_partial_melt(sim, cell, cell.wrapping_sub(1))
+                || do_partial_melt(sim, cell, cell + 1)
+                || do_partial_melt(sim, cell, cell + width);
+            if ((props_cell & 2) != 0 || !melt_blocked) && next_random(sim) > 0.9 {
+                // 候选顺序（原版 L2484-2486）：L2384 先反转 dir、L2484 再读新值，
+                // 净效果 = [cell-旧dir, cell+旧dir, cell-width]（旧实现顺序相反，已修正）
+                let candidates = [
+                    cell as isize - dir as isize,
+                    cell as isize + dir as isize,
+                    cell as isize - width as isize,
+                ];
+                let total = width * height;
+                let mut best: Option<(usize, f32)> = None;
+                for (idx, &cand) in candidates.iter().enumerate() {
+                    if cand < 0 {
+                        continue;
+                    }
+                    let cand = cand as usize;
+                    if cand >= total {
+                        continue;
+                    }
+                    let updated = unsafe { &*sim.updated_cells.ptr };
+                    let mass = updated.mass.get(cand);
+                    if let Some((_, best_mass)) = best {
+                        if mass > best_mass {
+                            continue; // 原版 L2496：fVar24 <= fVar23（质量不优于当前最优）
+                        }
+                    }
+                    if next_random(sim) <= 0.5 {
+                        continue; // 原版 L2497-2498：0.5 < random
+                    }
+                    let cand_elem = updated.element_idx.get(cand);
+                    let cand_ppd = elements_table::get_element_post_process_data(cand_elem);
+                    let is_gas = matches!(cand_ppd, Some(p) if (p.state & 3) == 1);
+                    if !is_gas {
+                        continue;
+                    }
+                    // 原版 L2506-2510：首次迭代（idx==0）不进入更重/等重气体
+                    if idx == 0 {
+                        if let Some(cp) = cand_ppd {
+                            if ppd.molar_mass <= cp.molar_mass {
+                                continue;
+                            }
+                        }
+                    }
+                    best = Some((cand, mass));
+                }
+                if let Some((b, _)) = best {
+                    let updated = unsafe { &mut *sim.updated_cells.ptr };
+                    swap_cells(updated, b, cell);
+                    push_substance_change(sim, b);
+                    push_substance_change(sim, cell);
+                }
+            }
+        }
+        do_sublimation_stub(sim, cell);
+        return;
+    }
+
+    // ===== 固体（原版 L2533-2545）=====
+    if state3 == 3 {
+        if (ppd.state & 0xb) != 0xb {
+            return;
+        }
+        do_unstable_check_stub(sim, cell);
+        return;
+    }
+
+    // ===== 液体（原版 L2546-2863）=====
+    let mass_cell = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        updated.mass.get(cell)
+    };
+    // 原版 L2551-2558：质量 <= 0.01 → 清 flow + Evaporate
+    if mass_cell <= 0.01 && mass_cell != 0.01 {
+        clear_flow(sim, cell);
+        do_evaporate(sim, cell);
+        return;
+    }
+    // 原版 L2559-2562：DoDensityDisplacement(cell, ppd, 0.3)
+    if do_density_displacement(sim, cell, 0.3) {
+        return;
+    }
+    // —— 过压释放（原版 L2566-2704）——
+    let mass_cell = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        updated.mass.get(cell)
+    };
+    if ppd.max_mass < mass_cell {
+        // 原版 L2565-2583：先按压强比 mass/maxMass 尝试 4 方向突破（DoPressureBreak）。
+        // 任一方向突破成功 → 释放超压（worldDamage），不再向下倾倒。
+        // 2026-08-02 实现：此前留桩 → 超压总是向下倾倒，造成上下合并异常。
+        let pressure_ratio = mass_cell / ppd.max_mass;
+        if do_pressure_break(sim, cell, pressure_ratio, -(width as isize)) {
+            return;
+        }
+        if do_pressure_break(sim, cell, pressure_ratio, -1) {
+            return;
+        }
+        if do_pressure_break(sim, cell, pressure_ratio, 1) {
+            return;
+        }
+        if do_pressure_break(sim, cell, pressure_ratio, width as isize) {
+            return;
+        }
+        let below = cell + width;
+        let (mass_below, below_elem) = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            (updated.mass.get(below), updated.element_idx.get(below))
+        };
+        // 原版 L2589：maxMass × 1.5 < mass[cell]；L2597：mass[below] < mass[cell]
+        if ppd.max_mass * 1.5 < mass_cell && mass_below < mass_cell {
+            let below_state = match elements_table::get_element_liquid_data(below_elem) {
+                Some(ld) => ld.state & 3,
+                None => 0,
+            };
+            if below_state == 2 {
+                // 原版 L2606-2613：threshold = max(maxMass, mass_below × 1.01)，
+                // threshold <= mass[cell] 且不等 → DisplaceLiquid 挤走下方液体腾空间。
+                // ⚠️ 2026-08-02 修复：旧实现误用 min——下方快满（below×1.01 > mass[cell]）时
+                // 原版不往下倒（无处容纳），旧实现却挤压下方再倾倒 → 上下合并异常。
+                let threshold = (mass_below * 1.01).max(ppd.max_mass);
+                if threshold <= mass_cell && mass_cell != threshold {
+                    if displace_liquid(sim, below, below_elem) {
+                        // 原版 L2617-2698：转移 mass × 0.49751243（≈ ÷2.01）到下方格
+                        let updated = unsafe { &mut *sim.updated_cells.ptr };
+                        let fvar23 = updated.mass.get(cell);
+                        let fvar24 = fvar23 * 0.49751243;
+                        let d_transfer = (updated.disease_count.get(cell) as f32 * (fvar24 / fvar23)) as i32;
+                        updated.mass.set(below, fvar24);
+                        updated.temperature.set(below, updated.temperature.get(cell));
+                        updated.element_idx.set(below, updated.element_idx.get(cell));
+                        updated.disease_count.set(below, d_transfer);
+                        updated.disease_idx.set(below, updated.disease_idx.get(cell));
+                        updated.disease_infestation_tick_count.set(below, 0);
+                        updated.disease_growth_accumulated_error.set(below, 0.0);
+                        push_substance_change(sim, below);
+                        updated.mass.set(cell, updated.mass.get(cell) - fvar24);
+                        let remain = updated.disease_count.get(cell) - d_transfer;
+                        if remain > 0 {
+                            updated.disease_count.set(cell, remain);
+                            return;
+                        }
+                        clear_disease(updated, cell);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    // DoPartialHeatTransition 4 方向（L2705-2721）—— 留桩
+    // —— DoSublimation（L2722-2863）：相变发射留桩，仅保留 accumulatedFlow 累加（L2831）——
+    if !sim.accumulated_flow.ptr.is_null() {
+        let below = cell + width;
+        let (mass_below, below_elem, props_below) = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            (
+                updated.mass.get(below),
+                updated.element_idx.get(below),
+                updated.properties.get(below),
+            )
+        };
+        // 原版 L2731/2734/2742：前三项前置条件（下方质量 < 1.8、sublimateIndex 有效、下方真空/气体）
+        let below_vac_or_gas = match elements_table::get_element_post_process_data(below_elem) {
+            Some(p) => (p.state & 3) <= 1,
+            None => false,
+        };
+        if mass_below < 1.8 && ppd.sublimate_index != 0xffff && below_vac_or_gas {
+            // 原版 L2746-2747：在 props&1 检查**之前**消耗 randomSeed——
+            // 旧实现把概率门放进 below_ok 的 && 短路里，在 props 检查后才消耗，已对齐。
+            let random = next_random(sim);
+            // 原版 L2752/2755：props&1 检查 + 升华概率门
+            if props_below & 1 == 0 && ppd.sublimate_probability > random {
+                let mass_cell = {
+                    let updated = unsafe { &*sim.updated_cells.ptr };
+                    updated.mass.get(cell)
+                };
+                // 原版 L2765-2769：fVar24 = min(offGasPercentage × mass[cell], 1.0)
+                let mut fvar24 = ppd.off_gas_percentage * mass_cell;
+                if fvar24 >= 1.0 {
+                    fvar24 = 1.0;
+                }
+                // 原版 L2770-2785：**上方格**（cell-width，原版 L2758 local_104 = cell-width）
+                // 同元素且更重 → 用上方质量重算 fVar24。
+                // ⚠️ 修复轮：旧实现误用下方格（below=cell+width），原版读的是 cell-width，已修正。
+                let up = cell.wrapping_sub(width);
+                {
+                    let updated = unsafe { &*sim.updated_cells.ptr };
+                    if updated.element_idx.get(up) == elem {
+                        let mass_up = updated.mass.get(up);
+                        if mass_cell < mass_up {
+                            fvar24 = ppd.off_gas_percentage * mass_up;
+                            if fvar24 >= 1.0 {
+                                fvar24 = 1.0;
+                            }
+                        }
+                    }
+                }
+                // 原版 L2788-2790：剩余质量 >= 0.01 且 fVar24 > 0 才继续
+                if mass_cell - fvar24 >= 0.01 && fvar24 > 0.0 {
+                    // 原版 L2792-2804：下方格元素非升华目标且非真空 → 先 DisplaceGas
+                    // 把下方异类气体挤走；挤不走 → return（不累积，跳过 SpawnFX）。
+                    // ⚠️ 修复轮：此项为原版 L2799 前置（旧实现缺失）。
+                    let below_elem = {
+                        let updated = unsafe { &*sim.updated_cells.ptr };
+                        updated.element_idx.get(below)
+                    };
+                    if below_elem != ppd.sublimate_index {
+                        if below_elem != sim.vacuum_element_idx {
+                            if !displace_gas(sim, below, below_elem) {
+                                return;
+                            }
+                        }
+                    }
+                    // 原版 L2805-2812：(1.8 - mass[below]) / sublimateEfficiency 缩放。
+                    // ⚠️ 修复轮：此项为原版 L2809-2812 修正（旧实现缺失）。
+                    let mass_below_now = {
+                        let updated = unsafe { &*sim.updated_cells.ptr };
+                        updated.mass.get(below)
+                    };
+                    let scaled = fvar24 * ppd.sublimate_efficiency;
+                    let room = 1.8 - mass_below_now;
+                    if room < scaled {
+                        fvar24 = fvar24 * (room / scaled);
+                    }
+                    // 原版 L2831-2832：accumulated_flow[cell] += fVar24
+                    let total = sim.width as usize * sim.height as usize;
+                    let acc = unsafe { std::slice::from_raw_parts_mut(sim.accumulated_flow.ptr, total) };
+                    if cell < total {
+                        acc[cell] += fvar24;
+                    }
+                }
+            }
+        }
+    }
+    do_sublimation_stub(sim, cell);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a_framework::buffer::{BinaryBufferReader, BinaryBufferWriter};
+    use crate::a_framework::sim_data::SimData;
+    use crate::b_elements::element::Element;
+    use crate::b_elements::elements_table::{CreateElementsTable, DestroyElementsTable};
+    use crate::LIB_TESTS_LOCK;
+
+    /// 建一张 3 元素最小表：0=气体(state=1)、1=液体(state=2)、2=固体(state=3)。
+    /// 调用方需持 LIB_TESTS_LOCK，并在测试末尾 DestroyElementsTable() 清理。
+    /// 序列化格式对照 03_elements.c L27-429：
+    /// count + count×164B 元素（连续）+ count×(4B 名称长度 + 名称)。
+    fn create_state_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(3);
+        for (id, state) in [(0i32, 1u8), (1i32, 2u8), (2i32, 3u8)] {
+            let mut elem = Element::default();
+            elem.id = id;
+            elem.state = state;
+            elem.number_of_gradient_colors = 1; // 避免 texture 相关除法异常
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..3 {
+            w.write_int(0); // 空名称（长度=0），全部元素之后读
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// IsLiquidPermeable：真空/气体（state&3 <= 1）可渗透；
+    /// 液体（state&3 == 2）与固体（state&3 == 3）都**不可渗透**（原版 L615: `1 < (state&3)` → false）；
+    /// properties bit1（&2）置位时不可渗透（原版 L607）。
+    #[test]
+    fn is_liquid_permeable_basic() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(0, 0); // 气体 state=1
+            cells.element_idx.set(1, 1); // 液体 state=2
+            cells.element_idx.set(2, 2); // 固体 state=3
+            assert!(is_liquid_permeable(cells, 0), "真空/气体应可渗透");
+            assert!(!is_liquid_permeable(cells, 1), "液体不可渗透（state&3==2）");
+            assert!(!is_liquid_permeable(cells, 2), "固体不可渗透");
+            // properties bit1 置位 → 即使气体元素也不可渗透（原版 L607）
+            cells.element_idx.set(3, 0); // 气体
+            cells.properties.set(3, 2); // 固体标志
+            assert!(!is_liquid_permeable(cells, 3), "properties&2 置位时不可渗透");
+        }
+        DestroyElementsTable();
+    }
+
+    /// IsSolid：固体（state & 3 == 3）被识别；气体不是固体；
+    /// properties bit1（&2）置位时，非固体元素也算固体（原版 L639-644）。
+    #[test]
+    fn is_solid_detects_unobtanium() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(0, 2); // 固体
+            cells.element_idx.set(1, 0); // 气体
+            assert!(is_solid(cells, 0), "固体应被识别");
+            assert!(!is_solid(cells, 1), "气体不是固体");
+            // properties&2 置位的气体 → 固体（原版 L639-644）
+            cells.element_idx.set(2, 0); // 气体
+            cells.properties.set(2, 2); // 固体标志
+            assert!(is_solid(cells, 2), "properties&2 置位时非固体元素也算固体");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 元素表缺失时两函数安全返回 false，不 panic。
+    /// 持 LIB_TESTS_LOCK 并先销毁全局表，确保与并行建表测试无竞态。
+    #[test]
+    fn empty_table_returns_safe_defaults() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        DestroyElementsTable(); // 确保表为空（测试间可能残留）
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &*sd.cells.ptr;
+            assert!(!is_liquid_permeable(cells, 0), "空表下应安全返回 false");
+            assert!(!is_solid(cells, 0), "空表下应安全返回 false");
+            // vacuum/unobtanium 索引字段由 new_for_allocate 设置（任务 2）
+            let _ = sd.vacuum_element_idx;
+            let _ = sd.unobtanium_element_idx;
+        }
+    }
+
+    // ===== 任务 6：UpdateLiquid + UpdateNeighbourLiquidMass =====
+
+    /// 自建 2 元素最小表：0=真空(state=0)，1=液体(state=2, flow=50, max_mass=1000, min_vertical_flow=0)。
+    /// 调用方需持 LIB_TESTS_LOCK，并在测试末尾 DestroyElementsTable() 清理。
+    fn create_liquid_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(2);
+        for elem in [
+            Element::default(), // 0=真空
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2; // 液体
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0; // 流率上限（原版 UpdateLiquid 读 viscosity，2026-08-02 修复后）
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0; // 温度范围放宽（液滴 spawn 温度检查，测试用 300K）
+                e.high_temp = 10000.0;
+                e
+            },
+        ] {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..2 {
+            w.write_int(0); // 空名称
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// 简报基线：空元素表下 update_liquids 不 panic。
+    /// 强行为断言在下方自建表测试中覆盖。
+    #[test]
+    fn update_liquid_moves_mass_down_to_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        DestroyElementsTable(); // 元素表为空
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        update_liquids(&mut sd); // 空表下不应 panic
+    }
+
+    /// 同元素下落 + 左扩散：源格液体(100g) 下方同液体(10g)，左邻真空。
+    /// 向下：fVar22 = max(100*1.01, 1000) - 10 = 990（原版 L725-732 是 max，2026-08-02 修复）；
+    ///       fVar23 = min(min(100, 50), 990*0.5) = 50（viscosity 上限）→ 源格递减到 50。
+    /// 左扩散（原版 L849-945）：left(13) 真空 → fVar23 = min(min(50, 50), 50×0.25) = 12.5；
+    ///       源格再减 12.5 → 最终 37.5；左邻变液体 mass=12.5；flow[LEFT] 累加 12.5。
+    /// 事件：左邻元素 0→1 产生 1 条 substance 事件（sim13 → game 4）。
+    #[test]
+    fn update_liquid_same_element_transfers_mass_and_flow() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                // 源格 (row2,col2)=14：液体 mass=100
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                // 下方格 (row1,col2)=8：液体 mass=10
+                buf.element_idx.set(8, 1);
+                buf.mass.set(8, 10.0);
+                buf.temperature.set(8, 300.0);
+                // cell13（左邻）= 真空（元素 0，质量 0，默认）
+                // cell15（右邻）= 固体（任务 2 修正：右分支实现后真空会触发右扩散，
+                //   源格 40.875 断言会被破坏 → 补固体阻断右分支）
+                buf.element_idx.set(15, 4);
+                buf.mass.set(15, 500.0);
+                buf.temperature.set(15, 300.0);
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            // 向下转移 50 + 左扩散 12.5
+            assert!(
+                (updated.mass.get(14) - 37.5).abs() < 1e-3,
+                "源格质量应 100-50-12.5=37.5，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.mass.get(8) - 60.0).abs() < 1e-3,
+                "下方格质量应 10+50=60，got {}",
+                updated.mass.get(8)
+            );
+            // 左扩散（原版 L849-945）：左邻得 min(min(50,50),50×0.25)=12.5
+            assert_eq!(updated.element_idx.get(13), 1, "左邻应变为液体元素");
+            assert!(
+                (updated.mass.get(13) - 12.5).abs() < 1e-3,
+                "左邻应得 12.5，got {}",
+                updated.mass.get(13)
+            );
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!(
+                (flow[14].z - 50.0).abs() < 1e-3,
+                "flow[DOWN] 应累加 50，got {}",
+                flow[14].z
+            );
+            assert!(
+                (flow[14].x - 12.5).abs() < 1e-3,
+                "flow[LEFT] 应累加 12.5，got {}",
+                flow[14].x
+            );
+            // 左邻元素 0→1 变化 → 1 条 substance 事件（sim13 → game (13%6-1)+(13/6-1)*4 = 4）
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1, "左扩散应产生 1 条事件");
+            assert_eq!(events.substance_change_info.get(0).cell_idx, 4);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 下落压缩修复（2026-08-02）：fVar22 = max(mass×1.01, max_mass) - below_mass。
+    /// ① 上层 100 → 下层 990：f22 = max(101,1000)-990 = 10 → f23 = min(min(100,50),5) = 5
+    ///    （下层逐步逼近满格 1000，而非 0.1kg 滴漏）。
+    /// ② 超满格 1020 → 下层 100：f22 = max(1030.2,1000)-100 = 930.2 → f23 = 50
+    ///    （旧 min 公式 f22 = min(1030.2,1000)-100 = 900 → 也非 0……等下，旧公式在 1020 时
+    ///    min(1030.2,1000)=1000 → 1000-100=900 → 也能排。真正卡住的是"下层已满"场景：
+    ///    1020 上层 + 1000 下层：旧 f22 = min(1030.2,1000)-1000 = 0 → 排不动；新 f22 = 30.2 → 排 15.1）。
+    /// 本测试验证 ①（逼近满格）与 ②（下层满格时超满上层仍可排出）。
+    #[test]
+    fn update_liquid_drains_down_toward_full_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(8, 1);
+                buf.mass.set(8, 990.0); // 下层接近满格
+                buf.temperature.set(8, 300.0);
+                // 左右均固体，隔离水平分支
+                buf.element_idx.set(13, 4);
+                buf.mass.set(13, 500.0);
+                buf.element_idx.set(15, 4);
+                buf.mass.set(15, 500.0);
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(8) - 995.0).abs() < 1e-3,
+                "下层应 +5 到 995（逼近满格），got {}",
+                updated.mass.get(8)
+            );
+            assert!(
+                (updated.mass.get(14) - 95.0).abs() < 1e-3,
+                "上层应 -5，got {}",
+                updated.mass.get(14)
+            );
+        }
+        // ② 超满格上层 1020 + 下层满格 1000 → 仍可向下排出（旧 min 公式 f22=0 卡死）
+        let mut sd2 = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd2.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd2.cells.ptr;
+            let updated = &mut *sd2.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 1020.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(8, 1);
+                buf.mass.set(8, 1000.0);
+                buf.temperature.set(8, 300.0);
+                buf.element_idx.set(13, 4);
+                buf.mass.set(13, 500.0);
+                buf.element_idx.set(15, 4);
+                buf.mass.set(15, 500.0);
+                // cell20（上层）= 固体（隔离上推分支，只验证下落）
+                buf.element_idx.set(20, 4);
+                buf.mass.set(20, 500.0);
+            }
+        }
+        update_liquid(&mut sd2, 14);
+        unsafe {
+            let updated = &*sd2.updated_cells.ptr;
+            // f22 = max(1030.2,1000)-1000 = 30.2 → f23 = min(min(1020,50), 15.1) = 15.1
+            assert!(
+                (updated.mass.get(8) - 1015.1).abs() < 1e-3,
+                "下层满格时上层 1020 仍应排出 15.1（旧 min 公式卡死），got {}",
+                updated.mass.get(8)
+            );
+            assert!(
+                (updated.mass.get(14) - 1004.9).abs() < 1e-3,
+                "上层应 -15.1 到 1004.9，got {}",
+                updated.mass.get(14)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 下方真空格 → SwapCells 交换 + 2 条 substance 事件（原版 L842-845）。
+    #[test]
+    fn update_liquid_vacuum_below_swaps_and_fires_events() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(14, 1); // 源格液体
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(8, 0); // 下方真空
+                buf.mass.set(8, 0.0);
+                buf.temperature.set(8, 0.0);
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 0, "源格应变为真空");
+            assert_eq!(updated.element_idx.get(8), 1, "下方格应获得液体");
+            assert!((updated.mass.get(8) - 100.0).abs() < 1e-3);
+            assert!((updated.mass.get(14) - 0.0).abs() < 1e-3);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 2, "交换应产生 2 条事件");
+            // game cell：sim14 → (2-1)+(2-1)*4 = 5；sim8 → (2-1)+(1-1)*4 = 1
+            let mut cells: Vec<i32> = events
+                .substance_change_info
+                .as_slice()
+                .iter()
+                .map(|e| e.cell_idx)
+                .collect();
+            cells.sort();
+            assert_eq!(cells, vec![1, 5]);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 左扩散（设计测试 1）：液体格 mass=100，左邻真空，下方固体。
+    /// 期望：左邻变液体、mass=25（100×0.25）、flow[cell].x=25、源格减 25。
+    #[test]
+    fn update_liquid_spreads_left_to_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        // 内部格坐标：cell14 = (row2,col2)。下方 cell8 = (row1,col2) 固体。
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1); // 液体元素 1（flow=50, max_mass=1000）
+            cells.mass.set(14, 100.0);
+            cells.temperature.set(14, 300.0);
+            cells.element_idx.set(8, 4); // 固体元素 4
+            cells.mass.set(8, 500.0);
+            // cell15（右邻）= 固体（任务 2 修正：阻断右分支，保持左扩散 25/75 断言）
+            cells.element_idx.set(15, 4);
+            cells.mass.set(15, 500.0);
+            // cell7（左下方对角）= 固体（液滴轨道：阻断液滴路径，保持格子转移断言）
+            cells.element_idx.set(7, 4);
+            cells.mass.set(7, 500.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.mass.set(8, 500.0);
+            updated.element_idx.set(15, 4);
+            updated.mass.set(15, 500.0);
+            updated.element_idx.set(7, 4);
+            updated.mass.set(7, 500.0);
+            // cell13（左邻）= 真空（元素 0，质量 0，默认）
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(13), 1, "左邻应变为液体元素");
+            assert!(
+                (updated.mass.get(13) - 25.0).abs() < 1e-3,
+                "左邻应得 25（100×0.25），got {}",
+                updated.mass.get(13)
+            );
+            assert!(
+                (updated.mass.get(14) - 75.0).abs() < 1e-3,
+                "源格应减 25，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.temperature.get(13) - 300.0).abs() < 1e-3,
+                "温度应随质量转移为 300"
+            );
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!(
+                (flow[14].x - 25.0).abs() < 1e-3,
+                "flow[14].x(LEFT) 应 +25，got {}",
+                flow[14].x
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 左扩散事件（设计测试 6）：左扩散到真空格应产生 substance 事件。
+    #[test]
+    fn update_liquid_spread_left_fires_event() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.element_idx.set(8, 4);
+            // cell15（右邻）= 固体（任务 2 修正：阻断右分支）
+            cells.element_idx.set(15, 4);
+            cells.mass.set(15, 500.0);
+            // cell7（左下方对角）= 固体（液滴轨道：阻断液滴路径，保持 substance 事件断言）
+            cells.element_idx.set(7, 4);
+            cells.mass.set(7, 500.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.element_idx.set(15, 4);
+            updated.mass.set(15, 500.0);
+            updated.element_idx.set(7, 4);
+            updated.mass.set(7, 500.0);
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            // sim13（内部格）→ game 坐标：col=(13%6)-1=0, row=(13/6)-1=1 → game idx = 1*4+0 = 4
+            let has_cell4 = events
+                .substance_change_info
+                .as_slice()
+                .iter()
+                .any(|e| e.cell_idx == 4);
+            assert!(has_cell4, "应产生 sim13（game4）的 substance 事件");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 邻格固体拒绝（设计测试 5）：左邻固体 → 不转移。
+    #[test]
+    fn update_liquid_skips_spread_to_solid_neighbor() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.element_idx.set(8, 4);
+            cells.element_idx.set(13, 4); // 左邻固体
+            cells.mass.set(13, 500.0);
+            // cell15（右邻）= 固体（任务 2 修正：阻断右分支，保持源格 100 断言）
+            cells.element_idx.set(15, 4);
+            cells.mass.set(15, 500.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.element_idx.set(13, 4);
+            updated.mass.set(13, 500.0);
+            updated.element_idx.set(15, 4);
+            updated.mass.set(15, 500.0);
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(13), 4, "左邻固体不应被替换");
+            assert!((updated.mass.get(13) - 500.0).abs() < 1e-3);
+            assert!((updated.mass.get(14) - 100.0).abs() < 1e-3, "源格质量不变");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 右扩散（设计测试 2）：液体格 mass=100，右邻真空，下方固体。
+    /// 任务 2 裁决修正：左邻设为异种液体（元素 2，state=2 但元素 idx 不同），
+    /// 使左分支判定链"== 本格元素 或 state<2"不满足 → 左分支跳过，隔离右扩散。
+    /// 期望：右邻变液体、mass=25、flow[cell].y(RIGHT)=25、源格减 25。
+    #[test]
+    fn update_liquid_spreads_right_to_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.temperature.set(14, 300.0);
+            cells.element_idx.set(8, 4); // 下方固体
+            cells.mass.set(8, 500.0);
+            // 左邻 13 = 异种液体（元素 2，state=2 但 idx≠1）→ 阻断左分支
+            cells.element_idx.set(13, 2);
+            cells.mass.set(13, 0.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.mass.set(8, 500.0);
+            updated.element_idx.set(13, 2);
+            updated.mass.set(13, 0.0);
+            // cell9（右下方对角）= 固体（液滴轨道：阻断右液滴路径，保持右扩散 25/75 断言）
+            cells.element_idx.set(9, 4);
+            cells.mass.set(9, 500.0);
+            updated.element_idx.set(9, 4);
+            updated.mass.set(9, 500.0);
+            // cell15（右邻）= 真空（默认）
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(15), 1, "右邻应变为液体元素");
+            assert!(
+                (updated.mass.get(15) - 25.0).abs() < 1e-3,
+                "右邻应得 25，got {}",
+                updated.mass.get(15)
+            );
+            assert!(
+                (updated.mass.get(14) - 75.0).abs() < 1e-3,
+                "源格应减 25，got {}",
+                updated.mass.get(14)
+            );
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!(
+                (flow[14].y - 25.0).abs() < 1e-3,
+                "flow[14].y(RIGHT) 应 +25，got {}",
+                flow[14].y
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 双向扩散（设计测试 3）：左右都真空 → 左各得 25、右得 (100-25)×0.25=18.75、源格 56.25。
+    /// 注意：fVar25 局部变量在左分支转移后递减（原版 L936 fVar25 -= fVar23），
+    /// 右分支基于剩余质量计算（75×0.25=18.75）——依赖左分支递减后右分支用剩余值。
+    #[test]
+    fn update_liquid_spreads_both_directions() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.element_idx.set(8, 4);
+            cells.mass.set(8, 500.0);
+            // cell7/cell9（左右下方对角）= 固体（液滴轨道：阻断液滴路径，保持双向格子转移断言）
+            cells.element_idx.set(7, 4);
+            cells.mass.set(7, 500.0);
+            cells.element_idx.set(9, 4);
+            cells.mass.set(9, 500.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.mass.set(8, 500.0);
+            updated.element_idx.set(7, 4);
+            updated.mass.set(7, 500.0);
+            updated.element_idx.set(9, 4);
+            updated.mass.set(9, 500.0);
+            // cell13（左）、cell15（右）都真空
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(13), 1);
+            assert_eq!(updated.element_idx.get(15), 1);
+            assert!(
+                (updated.mass.get(13) - 25.0).abs() < 1e-3,
+                "左邻 25，got {}",
+                updated.mass.get(13)
+            );
+            assert!(
+                (updated.mass.get(15) - 18.75).abs() < 1e-3,
+                "右邻 18.75（左分支后剩余 75×0.25），got {}",
+                updated.mass.get(15)
+            );
+            assert!(
+                (updated.mass.get(14) - 56.25).abs() < 1e-3,
+                "源格 56.25，got {}",
+                updated.mass.get(14)
+            );
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!((flow[14].x - 25.0).abs() < 1e-3, "flow.x 应 25");
+            assert!((flow[14].y - 18.75).abs() < 1e-3, "flow.y 应 18.75");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 水平门限（设计测试 4）：左邻同液体、质量差小（f23 < 门限）→ 不转移。
+    /// 语义等价版本：create_displace_table 元素 1 未显式设 min_horizontal_flow（默认 0.0），
+    /// 门限拦截路径在单测中不可达 → 本测试验证"质量差极小仍转移"（对照原版语义）：
+    /// 质量差 1 → f22=0.25，f23=min(min(100,50),0.25)=0.25 ≥ 0 且 > 0 → 转移 0.25。
+    #[test]
+    fn update_liquid_horizontal_flow_threshold() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.element_idx.set(8, 4);
+            cells.element_idx.set(13, 1); // 左邻同液体，质量接近
+            cells.mass.set(13, 99.0);
+            // cell7（左下方对角）= 固体（液滴轨道：阻断液滴路径，保持 0.25 转移断言）
+            cells.element_idx.set(7, 4);
+            cells.mass.set(7, 500.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.element_idx.set(13, 1);
+            updated.mass.set(13, 99.0);
+            updated.element_idx.set(7, 4);
+            updated.mass.set(7, 500.0);
+        }
+        // min_horizontal_flow=0（create_displace_table 元素 1 默认）→ 无门限，质量差 1 也转移 0.25
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(13) - 99.25).abs() < 1e-3,
+                "左邻应 +0.25，got {}",
+                updated.mass.get(13)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 生产环境元素表（liquid.yaml + ElementLoader.CopyEntryToElement + Sim.Element 映射）：
+    /// 液体元素 flow=0（YAML 无 flow 字段 → 默认 0）、viscosity=speed（水=125）、
+    /// min_horizontal_flow=0.01、min_vertical_flow=0.01、max_mass=1000。
+    /// 用于复现 2026-08-02 实测 bug：Rust 实现把 flow（=0）当流率上限 → 水平扩散全死。
+    fn create_production_like_liquid_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(3);
+        for elem in [
+            Element::default(), // 0=真空
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2; // 液体（水）
+                e.number_of_gradient_colors = 1;
+                e.flow = 0.0; // 生产值：YAML 无 flow → 0
+                e.viscosity = 125.0; // 生产值：liquid.yaml speed=125 → viscosity
+                e.max_mass = 1000.0;
+                e.min_horizontal_flow = 0.01;
+                e.min_vertical_flow = 0.01;
+                e.low_temp = 272.5; // 生产值：liquid.yaml Water lowTemp
+                e.high_temp = 372.5; // 生产值：liquid.yaml Water highTemp
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 4;
+                e.state = 3; // 固体
+                e.number_of_gradient_colors = 1;
+                e
+            },
+        ] {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..3 {
+            w.write_int(0); // 空名称
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// 生产复现测试（2026-08-02 实测根因）：真实游戏数据下液体元素 flow=0、viscosity=125。
+    /// 原版 UpdateLiquid 读 +8（viscosity）当流率上限 → 正常扩散；
+    /// Rust 旧实现读 flow（=0）→ f23=0 → 不扩散（用户实测"水堆成柱"）。
+    #[test]
+    fn update_liquid_spreads_with_production_like_viscosity_cap() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_production_like_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.temperature.set(14, 300.0);
+            cells.element_idx.set(8, 2); // 下方固体
+            cells.mass.set(8, 500.0);
+            cells.element_idx.set(15, 2); // 右邻固体（阻断右分支，隔离左扩散）
+            cells.mass.set(15, 500.0);
+            // cell7（左下方对角）= 固体（液滴轨道：阻断液滴路径，保持格子转移断言）
+            cells.element_idx.set(7, 2);
+            cells.mass.set(7, 500.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 2);
+            updated.mass.set(8, 500.0);
+            updated.element_idx.set(15, 2);
+            updated.mass.set(15, 500.0);
+            updated.element_idx.set(7, 2);
+            updated.mass.set(7, 500.0);
+            // cell13（左邻）= 真空（默认）
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(
+                updated.element_idx.get(13),
+                1,
+                "生产 flow=0 时液体仍应水平扩散（原版用 viscosity=speed 当流率上限）"
+            );
+            assert!(
+                (updated.mass.get(13) - 25.0).abs() < 1e-3,
+                "左邻应得 25（100×0.25），got {}",
+                updated.mass.get(13)
+            );
+            assert!(
+                (updated.mass.get(14) - 75.0).abs() < 1e-3,
+                "源格应减 25，got {}",
+                updated.mass.get(14)
+            );
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!(
+                (flow[14].x - 25.0).abs() < 1e-3,
+                "flow[14].x(LEFT) 应 +25，got {}",
+                flow[14].x
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 液滴轨道（左悬崖，2026-08-02）：下方固体 + 左下方对角可渗透 → 边缘液滴事件，
+    /// 质量离开格子（源格扣 25、flow.x+25），左邻保持真空（不再有实体方格滑落）。
+    #[test]
+    fn update_liquid_spawns_droplet_at_left_ledge() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.temperature.set(14, 300.0);
+            cells.element_idx.set(8, 4); // 下方固体
+            cells.mass.set(8, 500.0);
+            cells.element_idx.set(15, 4); // 右邻固体（阻断右分支）
+            cells.mass.set(15, 500.0);
+            // cell7（左下方对角）= 真空（可渗透）→ 触发液滴路径
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.mass.set(8, 500.0);
+            updated.element_idx.set(15, 4);
+            updated.mass.set(15, 500.0);
+            // cell13（左邻）= 真空；cell7 对角 = 真空
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(13), 0, "左邻不应变为液体（液滴轨道）");
+            assert_eq!(updated.mass.get(13), 0.0, "左邻质量应为 0");
+            assert!(
+                (updated.mass.get(14) - 75.0).abs() < 1e-3,
+                "源格应扣 25 给液滴，got {}",
+                updated.mass.get(14)
+            );
+            let events = &*sd.sim_events.ptr;
+            let drop = events
+                .spawn_liquid_info
+                .as_slice()
+                .iter()
+                .find(|e| e.cell_idx == 4); // sim13（左邻）→ game4
+            assert!(drop.is_some(), "应产生左边缘液滴事件（game4）");
+            assert!(
+                (drop.unwrap().mass - 25.0).abs() < 1e-3,
+                "液滴质量应 25，got {}",
+                drop.unwrap().mass
+            );
+            assert_eq!(drop.unwrap().element_idx, 1);
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!((flow[14].x - 25.0).abs() < 1e-3, "flow.x 应 +25");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 液滴轨道（右悬崖，2026-08-02）：与左悬崖对称。
+    /// 左邻设异种液体（元素 2）阻断左分支；右下方对角真空 → 右边缘液滴。
+    #[test]
+    fn update_liquid_spawns_droplet_at_right_ledge() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.temperature.set(14, 300.0);
+            cells.element_idx.set(8, 4); // 下方固体
+            cells.mass.set(8, 500.0);
+            cells.element_idx.set(13, 2); // 左邻异种液体（阻断左分支）
+            cells.mass.set(13, 0.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.mass.set(8, 500.0);
+            updated.element_idx.set(13, 2);
+            updated.mass.set(13, 0.0);
+            // cell15（右邻）= 真空；cell9（右下方对角）= 真空 → 触发液滴路径
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(15), 0, "右邻不应变为液体（液滴轨道）");
+            assert!(
+                (updated.mass.get(14) - 75.0).abs() < 1e-3,
+                "源格应扣 25 给液滴，got {}",
+                updated.mass.get(14)
+            );
+            let events = &*sd.sim_events.ptr;
+            let drop = events
+                .spawn_liquid_info
+                .as_slice()
+                .iter()
+                .find(|e| e.cell_idx == 6); // sim15（右邻）→ game6
+            assert!(drop.is_some(), "应产生右边缘液滴事件（game6）");
+            assert!((drop.unwrap().mass - 25.0).abs() < 1e-3);
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!((flow[14].y - 25.0).abs() < 1e-3, "flow.y 应 +25");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 液滴门控（不可见）：visibleGrid 全 0 且非 debug 编辑 → spawn 失败 → 回退格子转移。
+    #[test]
+    fn update_liquid_invisible_ledge_falls_back_to_cell_transfer() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            // 全部不可见
+            let vg = std::slice::from_raw_parts_mut(sd.visible_grid.ptr, 12);
+            for b in vg.iter_mut() {
+                *b = 0;
+            }
+            let cells = &mut *sd.cells.ptr;
+            cells.element_idx.set(14, 1);
+            cells.mass.set(14, 100.0);
+            cells.temperature.set(14, 300.0);
+            cells.element_idx.set(8, 4);
+            cells.mass.set(8, 500.0);
+            cells.element_idx.set(15, 4);
+            cells.mass.set(15, 500.0);
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.element_idx.set(8, 4);
+            updated.mass.set(8, 500.0);
+            updated.element_idx.set(15, 4);
+            updated.mass.set(15, 500.0);
+            // cell13（左邻）/ cell7（对角）真空
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(13), 1, "不可见时回退格子转移，左邻应变液体");
+            assert!((updated.mass.get(13) - 25.0).abs() < 1e-3);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(
+                events.spawn_liquid_info.len(),
+                0,
+                "不可见时不应产生液滴事件"
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// AddLiquid 同元素合并（原版 L134375-134377）：液滴落在同液体格 → 质量吸收为一格。
+    #[test]
+    fn add_liquid_merges_into_same_element() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+            }
+        }
+        crate::c2_physics::liquid_flow::add_liquid(&mut sd, 14, 1, 25.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1);
+            assert!(
+                (updated.mass.get(14) - 125.0).abs() < 1e-3,
+                "同元素应合并：100+25=125，got {}",
+                updated.mass.get(14)
+            );
+            assert!((updated.temperature.get(14) - 300.0).abs() < 1e-3);
+        }
+        DestroyElementsTable();
+    }
+
+    /// AddLiquid 真空放置（原版 L134426-134431）。
+    #[test]
+    fn add_liquid_places_into_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        // cell14 默认真空
+        crate::c2_physics::liquid_flow::add_liquid(&mut sd, 14, 1, 25.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "真空格应变为液体");
+            assert!((updated.mass.get(14) - 25.0).abs() < 1e-3);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1, "应产生 substance 事件");
+        }
+        DestroyElementsTable();
+    }
+
+    /// AddLiquid 异液体挤压（原版 L134446-134455）：目标格是异液体 → DisplaceLiquid 挤走后放置。
+    #[test]
+    fn add_liquid_displaces_different_liquid() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 2); // 异种液体（元素 2）
+                buf.mass.set(14, 50.0);
+                buf.temperature.set(14, 280.0);
+            }
+        }
+        crate::c2_physics::liquid_flow::add_liquid(&mut sd, 14, 1, 25.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "目标格应变新液体");
+            assert!(
+                (updated.mass.get(14) - 25.0).abs() < 1e-3,
+                "目标格 25，got {}",
+                updated.mass.get(14)
+            );
+            // 原异液体 50 被挤压到四邻真空格（各 12.5）
+            let mut displaced = 0.0f32;
+            for c in [13usize, 15, 8, 20] {
+                displaced += updated.mass.get(c);
+            }
+            assert!(
+                (displaced - 50.0).abs() < 1e-2,
+                "异液体应挤到邻格：合计 50，got {}",
+                displaced
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 超压释放·开放方向（原版 DoPressureBreak L2663-2792）：cell 上方（cell-6）真空 →
+    /// 第一方向突破成功（无 damage，0 格固体）→ 不再向下倾倒。下方格（cell+6）保持原样。
+    #[test]
+    fn post_process_overpressure_releases_through_open_direction() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 2000.0); // > maxMass(1000)×1.5
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1); // 倾倒目标（cell+6），保持较轻
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 300.0);
+                // cell8（cell-6，第一突破方向）= 真空（开放）
+            }
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(14) - 2000.0).abs() < 1e-3,
+                "开放方向释放 → 源格质量不变，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.mass.get(20) - 100.0).abs() < 1e-3,
+                "开放方向释放 → 不倒向 cell20，got {}",
+                updated.mass.get(20)
+            );
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.world_damage_info.len(), 0, "开放方向（0 格固体）无 damage");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 超压倾倒（原版 L2585-2698）：4 方向突破全被挡、下方液体够满 →
+    /// DisplaceLiquid 挤走下方液体后转移 mass×0.49751243。
+    #[test]
+    fn post_process_overpressure_dumps_down_when_all_blocked() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 2000.0);
+                buf.temperature.set(14, 300.0);
+                // 下方（cell+6=20）液体 1100：DoPressureBreak 被其自身压强挡住（ratio 2.0-1.1=0.9 < 1.0）
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 1100.0);
+                buf.temperature.set(20, 300.0);
+                // 上方两格固体 + 越界（8、2）→ 突破失败
+                buf.element_idx.set(8, 4);
+                buf.mass.set(8, 500.0);
+                buf.element_idx.set(2, 4);
+                buf.mass.set(2, 500.0);
+                // 左（13、12、11）右（15、16、17）各 3 格固体 → 突破失败
+                for c in [13usize, 12, 11, 15, 16, 17] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                }
+            }
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            // DisplaceLiquid(20)：1100 均分给 19/21/14/26（各 275）→ 20 清空；
+            // 随后转移 2275×0.49751243 ≈ 1131.84 到 20
+            let expect_dump = 2275.0 * 0.49751243;
+            assert!(
+                (updated.mass.get(20) - expect_dump).abs() < 1.0,
+                "cell20 应得 ~1131.8，got {}",
+                updated.mass.get(20)
+            );
+            assert_eq!(updated.element_idx.get(20), 1);
+            assert!(
+                (updated.mass.get(14) - (2275.0 - expect_dump)).abs() < 1.0,
+                "源格应剩 ~1143.2，got {}",
+                updated.mass.get(14)
+            );
+            // 挤出的 1100 应出现在邻格
+            let mut displaced = 0.0f32;
+            for c in [19usize, 21, 26] {
+                displaced += updated.mass.get(c);
+            }
+            assert!(
+                (displaced - 275.0 * 3.0).abs() < 1.0,
+                "挤压邻格合计应 825，got {}",
+                displaced
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 超压阈值修复（2026-08-02）：下方接近满（below×1.01 > mass[cell]）时**不**倾倒。
+    /// 原版 threshold = max(maxMass, below×1.01)；旧实现 min → 错误倾倒。
+    #[test]
+    fn post_process_overpressure_skips_dump_when_below_nearly_full() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 2000.0);
+                buf.temperature.set(14, 300.0);
+                // 下方 1990：threshold=max(1000, 1990×1.01=2009.9)=2009.9 > 2000 → 不倒
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 1990.0);
+                buf.temperature.set(20, 300.0);
+                for c in [8usize, 2, 13, 12, 11, 15, 16, 17] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                }
+            }
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(14) - 2000.0).abs() < 1e-3,
+                "下方接近满 → 源格不应倾倒，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.mass.get(20) - 1990.0).abs() < 1e-3,
+                "下方接近满 → 目标格不变，got {}",
+                updated.mass.get(20)
+            );
+            assert_eq!(updated.element_idx.get(20), 1);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 上推分支（原版 L1043-1110）：1020 格上方 1000 → threshold = max(1010, 1000) = 1010，
+    /// 超出 10 → 推 5（验证原版 ~1020 封顶原理：三层水底层最多比满格多 ~20kg）。
+    #[test]
+    fn update_liquid_pushes_excess_up() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 1020.0); // 超满格
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1); // 上层液体 1000（cell+width）
+                buf.mass.set(20, 1000.0);
+                buf.temperature.set(20, 300.0);
+                // 下/左/右固体，隔离其他分支
+                for c in [8usize, 13, 15] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                }
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(20) - 1005.0).abs() < 1e-3,
+                "上层应 +5 到 1005，got {}",
+                updated.mass.get(20)
+            );
+            assert!(
+                (updated.mass.get(14) - 1015.0).abs() < 1e-3,
+                "源格应 -5 到 1015，got {}",
+                updated.mass.get(14)
+            );
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert!(
+                (flow[14].w - 5.0).abs() < 1e-3,
+                "flow[UP].w 应 +5，got {}",
+                flow[14].w
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 上推受流速上限约束（原版 L1070-1075）：2000 格上方 1000 → 超出 990×0.5=495，
+    /// 但 mass(2000) < 2×threshold(2020) → min(495, viscosity=50) = 50 → 每次推 50。
+    #[test]
+    fn update_liquid_pushes_excess_up_viscosity_capped() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 2000.0); // 200% 超满
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 1000.0);
+                buf.temperature.set(20, 300.0);
+                for c in [8usize, 13, 15] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                }
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(20) - 1050.0).abs() < 1e-3,
+                "上层应 +50（流速上限），got {}",
+                updated.mass.get(20)
+            );
+            assert!(
+                (updated.mass.get(14) - 1950.0).abs() < 1e-3,
+                "源格应 -50 到 1950，got {}",
+                updated.mass.get(14)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 未超阈值不推：1000 格上方 1000 → threshold = 1010 > 1000 → 无超出。
+    #[test]
+    fn update_liquid_does_not_push_when_under_threshold() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 1000.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 1000.0);
+                buf.temperature.set(20, 300.0);
+                for c in [8usize, 13, 15] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                }
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(20) - 1000.0).abs() < 1e-3,
+                "未超阈值不应上推，got {}",
+                updated.mass.get(20)
+            );
+            assert!((updated.mass.get(14) - 1000.0).abs() < 1e-3);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 蒸发清理（原版 L2551-2558 + Evaporate L2194）：液体质量 ≤0.01（≠0.01）→
+    /// 清成真空 + substance 事件（修复表层 0.0mcg 残留）。
+    #[test]
+    fn post_process_evaporates_tiny_liquid() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 0.005); // 微克级残留
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(8, 4); // 下方固体
+            updated.mass.set(8, 500.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(
+                updated.element_idx.get(14),
+                0,
+                "≤0.01kg 液体应蒸发清空（元素→真空）"
+            );
+            assert_eq!(updated.mass.get(14), 0.0);
+            let events = &*sd.sim_events.ptr;
+            assert!(
+                events.substance_change_info.len() >= 1,
+                "蒸发应产生 substance 事件"
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 原版守卫：质量恰好 0.01 → 不蒸发（`mass <= 0.01 && mass != 0.01`）。
+    #[test]
+    fn post_process_keeps_exact_0_01() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 0.01);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(8, 4);
+            updated.mass.set(8, 500.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "恰好 0.01 不蒸发");
+            assert!((updated.mass.get(14) - 0.01).abs() < 1e-9);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 下方 void → 源格转 vacuum + 清病菌 + 1 条事件（原版 L775-792）。
+    #[test]
+    fn update_liquid_void_below_clears_source_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0; // 下方真空格视作 void
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(14, 1); // 源格液体
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.disease_idx.set(14, 0x05);
+                buf.disease_count.set(14, 42);
+                buf.element_idx.set(8, 0); // 下方 void
+                buf.mass.set(8, 0.0);
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), sd.vacuum_element_idx, "源格应转 vacuum");
+            assert_eq!(updated.mass.get(14), 0.0, "源格质量清零");
+            assert_eq!(updated.temperature.get(14), 0.0, "源格温度清零");
+            assert_eq!(updated.disease_idx.get(14), 0xFF, "源格病菌应清除");
+            assert_eq!(updated.disease_count.get(14), 0);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1, "应产生 1 条事件");
+            assert_eq!(events.substance_change_info.get(0).cell_idx, 5);
+        }
+        DestroyElementsTable();
+    }
+
+    // ===== 任务 7：UpdatePressure（压强平衡）=====
+
+    /// 简报基线：空元素表下 update_pressure 不 panic（函数存在性验证）。
+    /// 元素表为空 → get_element_pressure_data 返回 None → 函数安全返回 0.0。
+    #[test]
+    fn update_pressure_no_panic_on_empty_table() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        DestroyElementsTable(); // 元素表为空
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.mass.set(14, 2000.0);
+            cells.mass.set(15, 100.0);
+        }
+        let r = update_pressure(&mut sd, 14, 15); // 空表 → 0.0，不 panic
+        assert_eq!(r, 0.0, "空元素表下应返回 0.0");
+    }
+
+    /// 两液体格质量平衡：本格(100g) vs 邻格(900g)，flow=50。
+    /// f18 = 50*(100-900) = -40000 → clamp 下限 -900*0.125 = -112.5（负=邻格→本格）
+    /// 实际转移 = min(|-112.5|, 来源质量 900) = 112.5。
+    /// 断言：本格 +112.5、邻格 -112.5、返回 -112.5、同元素液体无事件。
+    #[test]
+    fn update_pressure_balances_neighbor_masses() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                // 本格 cell14 (row2,col2) 液体 mass=100；邻格 cell13 (row2,col1) 液体 mass=900
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(13, 1);
+                buf.mass.set(13, 900.0);
+                buf.temperature.set(13, 300.0);
+            }
+        }
+        let r = update_pressure(&mut sd, 14, 13);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (r - (-112.5)).abs() < 1e-3,
+                "返回转移量应 -112.5，got {}",
+                r
+            );
+            assert!(
+                (updated.mass.get(14) - 212.5).abs() < 1e-3,
+                "本格应得 112.5 → 212.5，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.mass.get(13) - 787.5).abs() < 1e-3,
+                "邻格应减 112.5 → 787.5，got {}",
+                updated.mass.get(13)
+            );
+            // 两液体同元素 → 接收格非真空（bVar12=2≠0）→ 无元素变化事件（原版 L1581-1583）
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 0, "两液体平衡不应产生事件");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 液体本格向真空邻格填充 + 事件：本格（cell=13，液体 mass=900）vs 邻格（cell=14，真空 mass=0）。
+    /// 生产路径（mod.rs 压力循环）由液体格驱动，真空/气体为邻格。
+    /// 系数（K1 方案 A）：邻格真空 state==0 ≠ 1 → 取本格液体 flow=50；
+    /// f18 = 50×(900-0) = 45000 → clamp 上限 900×0.125 = 112.5 → 转移 112.5。
+    /// 邻格真空（bVar12=0）→ 元素变为液体 + 1 条 substance 事件（原版 L1601-1607）。
+    #[test]
+    fn update_pressure_fills_vacuum_cell_with_event() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.void_element_idx = 0xFFFF; // 真空元素 0 不是 void → 走元素变化分支（原版 L1584）
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                // 本格 cell13 液体 mass=900；邻格 cell14 真空 mass=0
+                buf.element_idx.set(13, 1);
+                buf.mass.set(13, 900.0);
+                buf.temperature.set(13, 300.0);
+                buf.element_idx.set(14, 0);
+                buf.mass.set(14, 0.0);
+                buf.temperature.set(14, 0.0);
+            }
+        }
+        let r = update_pressure(&mut sd, 13, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (r - 112.5).abs() < 1e-3,
+                "返回转移量应 112.5，got {}",
+                r
+            );
+            assert!(
+                (updated.mass.get(14) - 112.5).abs() < 1e-3,
+                "真空邻格应得 112.5，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.temperature.get(14) - 300.0).abs() < 1e-3,
+                "温度混合后应 300（源温 300×112.5/112.5），got {}",
+                updated.temperature.get(14)
+            );
+            assert_eq!(updated.element_idx.get(14), 1, "真空邻格应变为液体元素");
+            assert!(
+                (updated.mass.get(13) - 787.5).abs() < 1e-3,
+                "本格应减 112.5 → 787.5，got {}",
+                updated.mass.get(13)
+            );
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1, "真空格被填充应产生 1 条事件");
+            assert_eq!(events.substance_change_info.get(0).cell_idx, 5, "sim14 → game cell 5");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 病菌按质量比例转移：转移 112.5 / 来源 900 = 0.125 → 病菌 1000×0.125 = 125。
+    /// 断言：来源格 1000-125=875、接收格 100+125=225、病菌 idx 不变。
+    #[test]
+    fn update_pressure_transfers_disease() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.disease_idx.set(14, 0x05);
+                buf.disease_count.set(14, 100);
+                buf.element_idx.set(13, 1);
+                buf.mass.set(13, 900.0);
+                buf.temperature.set(13, 300.0);
+                buf.disease_idx.set(13, 0x05);
+                buf.disease_count.set(13, 1000);
+            }
+        }
+        let r = update_pressure(&mut sd, 14, 13);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((r - (-112.5)).abs() < 1e-3, "返回转移量应 -112.5，got {}", r);
+            assert_eq!(updated.disease_count.get(13), 875, "来源格病菌 1000-125");
+            assert_eq!(updated.disease_count.get(14), 225, "接收格病菌 100+125");
+            assert_eq!(updated.disease_idx.get(14), 0x05, "病菌 idx 不变");
+            assert_eq!(updated.disease_idx.get(13), 0x05);
+        }
+        DestroyElementsTable();
+    }
+
+    // ===== 任务 8：PostProcessCell + DoDensityDisplacement + 挤压位移 =====
+
+    /// 自建 6 元素最小表（任务 8 挤压/密度/升华链路）：
+    /// - 0：真空（state=0）
+    /// - 1：重液体（state=2，molar_mass=200，max_mass=1000，flow=50，viscosity=1，
+    ///      sublimate_index=3，sublimate_probability=1.0，off_gas_percentage=0.5，sublimate_efficiency=1.0）
+    /// - 2：轻液体（state=2，molar_mass=18，max_mass=1000）
+    /// - 3：气体（state=1，molar_mass=16）
+    /// - 4：固体（state=3）
+    /// - 5：轻气体（state=1，molar_mass=8）——气体邻居置换/异类气体测试用
+    fn create_displace_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(6);
+        let elems = [
+            Element::default(), // 0=真空
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 200.0;
+                e.flow = 50.0;
+                e.viscosity = 50.0; // 流率上限（原版 UpdateLiquid 读 viscosity，2026-08-02 修复后）
+                e.max_mass = 1000.0;
+                // ppd.max_mass 映射自 elem.max_mass（03_elements.c L305 @0x20 ← elem@0x34，
+                // 2026-08-02 修正；超压/DoPressureBreak 用）。
+                e.solid_surface_area_multiplier = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                // 升华字段（accumulatedFlow 累加测试用，对照 L297-302 映射到 ppd）
+                e.sublimate_index = 3;
+                e.sublimate_probability = 1.0;
+                e.off_gas_percentage = 0.5;
+                e.sublimate_efficiency = 1.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 2;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 18.0;
+                e.max_mass = 1000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 3;
+                e.state = 1;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 16.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 4;
+                e.state = 3;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 1000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 5;
+                e.state = 1;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 8.0; // 比气体 3 更轻，可被置换候选选中
+                e
+            },
+        ];
+        for elem in &elems {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..6 {
+            w.write_int(0); // 空名称
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// 简报基线：空元素表下 post_process_cell 不 panic（函数存在性验证）。
+    #[test]
+    fn post_process_cell_no_panic() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        DestroyElementsTable(); // 元素表为空
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        post_process_cell(&mut sd, 14);
+    }
+
+    /// 挤压链路（用户观察）：液体格被固体挤压 → 质量**平均分配**给上下左右 4 格。
+    /// 对照 DisplaceLiquid L34136 / DisplaceLiquidSimple L34206：
+    /// 4 个候选（右/左/下/上）均为真空 → 各得 100/4 = 25；
+    /// 源格 ClearCell（元素→vacuum、质量/温度清零）；5 条 substance 事件（4 目标 + 1 源）。
+    #[test]
+    fn displace_liquid_evenly_splits_to_4_neighbors() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            // 源格 cell14 (row2,col2)：重液体元素 1，mass=100
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            // 4 邻格（13=左,15=右,8=下,20=上）全为真空
+            for c in [13usize, 15, 8, 20] {
+                updated.element_idx.set(c, 0);
+                updated.mass.set(c, 0.0);
+                updated.temperature.set(c, 0.0);
+            }
+        }
+        let ok = displace_liquid(&mut sd, 14, 1);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(ok, "displace_liquid 应成功");
+            for c in [13usize, 15, 8, 20] {
+                assert!(
+                    (updated.mass.get(c) - 25.0).abs() < 1e-3,
+                    "邻格 {} 应得 100/4=25，got {}",
+                    c,
+                    updated.mass.get(c)
+                );
+                assert_eq!(updated.element_idx.get(c), 1, "邻格 {} 应变为液体元素", c);
+            }
+            // 源格被 ClearCell（L34295：元素→vacuum、质量/温度清零）
+            assert_eq!(updated.element_idx.get(14), 0, "源格应清空为真空");
+            assert_eq!(updated.mass.get(14), 0.0, "源格质量清零");
+            assert_eq!(updated.temperature.get(14), 0.0, "源格温度清零");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 5, "应产生 4 目标 + 1 源 = 5 条事件");
+            let mut cells: Vec<i32> = events
+                .substance_change_info
+                .as_slice()
+                .iter()
+                .map(|e| e.cell_idx)
+                .collect();
+            cells.sort();
+            // game cell：sim13→4, sim15→6, sim8→1, sim20→9, sim14→5
+            assert_eq!(cells, vec![1, 4, 5, 6, 9]);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 挤压链路：部分方向被固体堵塞 → 只分给可容纳格。
+    /// 左格 13 的 properties bit1（&2，固体标志）置位 → 排除；
+    /// 右/下/上（15/8/20）各得 100/3 ≈ 33.333。
+    #[test]
+    fn displace_liquid_splits_to_available_neighbors_only() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            for c in [15usize, 8, 20] {
+                updated.element_idx.set(c, 0);
+                updated.mass.set(c, 0.0);
+            }
+            // 左格 13：真空元素但 properties&2（固体标志）→ DisplaceLiquidSimple L34271 排除
+            updated.element_idx.set(13, 0);
+            updated.mass.set(13, 0.0);
+            updated.properties.set(13, 2);
+        }
+        let ok = displace_liquid(&mut sd, 14, 1);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(ok, "displace_liquid 应成功");
+            for c in [15usize, 8, 20] {
+                assert!(
+                    (updated.mass.get(c) - (100.0 / 3.0)).abs() < 1e-3,
+                    "邻格 {} 应得 100/3，got {}",
+                    c,
+                    updated.mass.get(c)
+                );
+            }
+            assert_eq!(updated.mass.get(13), 0.0, "被堵塞格不应收到质量");
+            assert_eq!(updated.element_idx.get(14), 0, "源格应清空");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 4, "3 目标 + 1 源 = 4 条事件");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 挤压链路（用户观察）：气体被固体挤压 → **随机单方向转移全部质量**。
+    /// 对照 DisplaceGas L34035：候选顺序 [下,左,右,上] 按 tickCount 旋转；
+    /// tick_count=0 时首个候选 = 下方格 20（真空）→ DoDisplacement 全量转移。
+    /// 事件：源格 1 + 目标格 1 = 2 条。
+    #[test]
+    fn displace_gas_moves_all_to_single_direction() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.tick_count = 0; // 候选顺序 [下(20),左(13),右(15),上(8)] 首个 = 20
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            // 源格 cell14：气体元素 3，mass=50
+            updated.element_idx.set(14, 3);
+            updated.mass.set(14, 50.0);
+            updated.temperature.set(14, 300.0);
+            // 下方格 20 真空可接收；其余方向（13/15/8）properties&1 置位 → 排除
+            updated.element_idx.set(20, 0);
+            updated.mass.set(20, 0.0);
+            updated.temperature.set(20, 0.0);
+            for c in [13usize, 15, 8] {
+                updated.element_idx.set(c, 0);
+                updated.mass.set(c, 0.0);
+                updated.properties.set(c, 1);
+            }
+        }
+        let ok = displace_gas(&mut sd, 14, 3);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(ok, "displace_gas 应成功");
+            assert!(
+                (updated.mass.get(20) - 50.0).abs() < 1e-3,
+                "目标格应收到全部 50，got {}",
+                updated.mass.get(20)
+            );
+            assert_eq!(updated.element_idx.get(20), 3, "目标格应变为气体元素");
+            assert!(
+                (updated.temperature.get(20) - 300.0).abs() < 1e-3,
+                "温度应整体转移"
+            );
+            assert_eq!(updated.element_idx.get(14), 0, "源格应清空为真空");
+            assert_eq!(updated.mass.get(14), 0.0, "源格质量清零");
+            // 其余方向不受影响
+            for c in [13usize, 15, 8] {
+                assert_eq!(updated.mass.get(c), 0.0, "{} 不应收到质量", c);
+            }
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 2, "源 + 目标 = 2 条事件");
+            // sim14→game5，sim20→game9
+            let mut cells: Vec<i32> = events
+                .substance_change_info
+                .as_slice()
+                .iter()
+                .map(|e| e.cell_idx)
+                .collect();
+            cells.sort();
+            assert_eq!(cells, vec![5, 9]);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 密度分层：重液体（molar_mass=200）压在轻液体（18）上方 → 交换下沉。
+    /// 对照 DoDensityDisplacement L1791-1797；param_5=0.0 强制跳过随机门
+    /// （原版液体走 0.3 概率门，测试直接调用函数本体）。
+    #[test]
+    fn do_density_displacement_swaps_heavy_above_light() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            // cell14 = 重液体(1)，下方 cell8 = 轻液体(2)
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(8, 2);
+            updated.mass.set(8, 100.0);
+            updated.temperature.set(8, 300.0);
+        }
+        let swapped = do_density_displacement(&mut sd, 14, 0.0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(swapped, "重液体应下沉交换");
+            assert_eq!(updated.element_idx.get(14), 2, "上方应变轻液体");
+            assert_eq!(updated.element_idx.get(8), 1, "下方应变重液体");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 2, "交换产生 2 条事件");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 密度分层：同元素液体，下方更重（mass=200）且更热（400）→ 温度按质量加权合并。
+    /// 对照 DoDensityDisplacement L1816-1831：
+    /// combined = (100×300 + 200×400) / 300 = 366.67，两格同温、元素不变、无事件。
+    #[test]
+    fn do_density_displacement_same_element_combines_temperature() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(8, 1);
+            updated.mass.set(8, 200.0);
+            updated.temperature.set(8, 400.0);
+        }
+        let swapped = do_density_displacement(&mut sd, 14, 0.0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(swapped, "同元素液体温度合并且返回 true（原版 L1828）");
+            let expected = (100.0 * 300.0 + 200.0 * 400.0) / 300.0;
+            assert!(
+                (updated.temperature.get(14) - expected).abs() < 1e-3,
+                "cell14 温度应合并为 {}，got {}",
+                expected,
+                updated.temperature.get(14)
+            );
+            assert!(
+                (updated.temperature.get(8) - expected).abs() < 1e-3,
+                "cell8 温度应合并为 {}，got {}",
+                expected,
+                updated.temperature.get(8)
+            );
+            assert_eq!(updated.element_idx.get(14), 1, "元素不变");
+            assert_eq!(updated.element_idx.get(8), 1, "元素不变");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 0, "同元素温度合并无事件");
+        }
+        DestroyElementsTable();
+    }
+
+    /// accumulatedFlow 累加（原版 L2831）：液体格满足升华路径条件时
+    /// accumulated_flow[cell] += min(offGasPercentage × mass, 1.0)。
+    /// cell14 重液体 mass=100、sublimate_probability=1.0、off_gas_percentage=0.5
+    /// → fVar24 = min(0.5×100, 1.0) = 1.0，下方格 20 真空（mass<1.8）。
+    #[test]
+    fn post_process_cell_accumulates_flow_on_sublimation_path() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1); // 重液体（含升华字段）
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(20, 0); // 下方格（cell+width）真空
+            updated.mass.set(20, 0.0);
+            updated.temperature.set(20, 0.0);
+            updated.element_idx.set(8, 0); // 上方格（cell-width）真空，跳过同元素重算
+            updated.mass.set(8, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!(
+                (acc[14] - 1.0).abs() < 1e-3,
+                "accumulated_flow[14] 应累加 1.0，got {}",
+                acc[14]
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 升华缩放修正（原版 L2809-2812）：fVar25 = 1.8 - mass[below] < fVar24 × sublimateEfficiency
+    /// → fVar24 ×= (1.8 - mass[below]) / (fVar24 × efficiency)。
+    /// 下方格 20 真空 mass=1.0：fVar24 = min(0.5×100,1)=1.0；scaled = 1.0×1.0 = 1.0；
+    /// room = 1.8 - 1.0 = 0.8 < 1.0 → fVar24 = 1.0 × (0.8/1.0) = 0.8 → acc[14] = 0.8。
+    #[test]
+    fn post_process_cell_accumulates_scaled_flow_when_below_mass_high() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(20, 0); // 下方真空，但质量 1.0 → 触发缩放
+            updated.mass.set(20, 1.0);
+            updated.temperature.set(20, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!(
+                (acc[14] - 0.8).abs() < 1e-3,
+                "accumulated_flow[14] 应缩放为 0.8，got {}",
+                acc[14]
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 升华 DisplaceGas 前置（原版 L2799）：下方格是异类气体（非升华目标、非真空）时，
+    /// 先 DisplaceGas 把气体挤走，再累积。cell20 = 轻气体 5（sublimate_index=3 → 异类）。
+    /// tick=0 候选 [下26,左19,右21,上14]，26 真空 → 气体从 20 移到 26；acc[14] 仍 += 1.0。
+    #[test]
+    fn post_process_cell_displaces_heterogeneous_gas_below() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.tick_count = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(20, 5); // 下方异类气体（sublimate 目标=3）
+            updated.mass.set(20, 0.1);
+            updated.temperature.set(20, 300.0);
+            updated.element_idx.set(8, 0); // 上方真空，跳过同元素重算
+            updated.mass.set(8, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!(
+                (acc[14] - 1.0).abs() < 1e-3,
+                "挤走异类气体后仍应累积 1.0，got {}",
+                acc[14]
+            );
+            // 气体被挤到 cell26（下方格 20 的下方），cell20 清空为真空
+            assert_eq!(updated.element_idx.get(26), 5, "异类气体应被挤到 cell26");
+            assert!((updated.mass.get(26) - 0.1).abs() < 1e-3, "cell26 应收到 0.1 质量");
+            assert_eq!(updated.element_idx.get(20), 0, "cell20 应清空为真空");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 升华上方格重算（原版 L2770-2785）：上方格（cell-width）同元素且更重 →
+    /// 用上方质量重算 fVar24。cell14 液体 mass=0.6，上方格 8 同液体 mass=1.0。
+    /// 初始 fVar24 = min(0.5×0.6,1)=0.3；重算后 = min(0.5×1.0,1)=0.5；
+    /// 剩余 = 0.6-0.5 = 0.1 ≥ 0.01 → acc[14] = 0.5（若误用下方格则得 0.3）。
+    #[test]
+    fn post_process_cell_recomputes_flow_from_up_cell_mass() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 0.6);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(8, 1); // 上方格同液体，更重（mass=1.0）
+            updated.mass.set(8, 1.0);
+            updated.temperature.set(8, 300.0);
+            updated.element_idx.set(20, 0); // 下方真空
+            updated.mass.set(20, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!(
+                (acc[14] - 0.5).abs() < 1e-3,
+                "上方格重算后应累积 0.5，got {}",
+                acc[14]
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 气体格 post_process：元素表非空、无异常（气体分支跑 density displacement +
+    /// 随机气体邻居置换，质量 1.0 不在 [1e-9, 0.001) 挤压区间，不蒸发不清格）。
+    #[test]
+    fn post_process_cell_gas_cell_no_corruption() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 3); // 气体
+            updated.mass.set(14, 1.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(8, 0); // 下方真空（density displacement 状态不同 → false）
+            updated.mass.set(8, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 3, "气体格不应被清空");
+            assert!((updated.mass.get(14) - 1.0).abs() < 1e-6, "气体质量不变");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 气体邻居置换门控（原版 L2469-2475）：props&2 置位（固体标志）的气体格**也**进入置换。
+    /// 旧实现 `(props&2)==0` 会把置位格排除（与门控的 OR 语义冲突——审查发现的重要问题）。
+    /// cell14 = 气体(3)，props=2；cell15 = 轻气体(5, molar=8)，mass=0.5。
+    /// displacement_direction=-1 → 候选 [cell-dir=15, cell+dir=13, cell-width=8]；
+    /// random_seed=9020：门控 random=0.9001>0.9、候选 idx0 random=0.9339>0.5。
+    /// idx0=15 是气体且 molar(8)<molar(16) → 交换。断言：cell14→轻气体 5、cell15→气体 3、2 条事件。
+    #[test]
+    fn post_process_cell_gas_with_solid_flag_still_displaces() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.tick_count = 0;
+        sd.random_seed = 9020;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 3); // 气体
+            updated.mass.set(14, 1.0);
+            updated.temperature.set(14, 300.0);
+            updated.properties.set(14, 2); // 固体标志（props&2 置位）
+            updated.element_idx.set(15, 5); // 轻气体（molar=8，比 3 的 16 更轻）
+            updated.mass.set(15, 0.5);
+            updated.temperature.set(15, 300.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 5, "props&2 置位气体格也应进入置换");
+            assert_eq!(updated.element_idx.get(15), 3, "候选轻气体应上移到 gas 格");
+            assert!((updated.mass.get(14) - 0.5).abs() < 1e-3, "交换后 mass[14] 应为 0.5");
+            assert!((updated.mass.get(15) - 1.0).abs() < 1e-3, "交换后 mass[15] 应为 1.0");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 2, "交换产生 2 条事件");
+        }
+        DestroyElementsTable();
+    }
+
+    // ===== 任务 9 修复（K2-A）：update_liquids 生产路径挂接 post_process_cell =====
+
+    /// K2-A 间接验证：update_liquids 帧末应对每个内部格调 post_process_cell，
+    /// 使升华路径（原版 L2831 accumulatedFlow 累加）在生产中真正执行。
+    /// 场景（create_displace_table，液体元素 1 含升华字段 sublimate_index=3/probability=1.0/off_gas=0.5）：
+    /// - cell14 液体 mass=100；update_liquid 视角下方格（cell-width=8）**固体** → 不下落；
+    /// - post_process 视角下方格（cell+width=20）真空 mass=0 → 升华路径累积；
+    ///   同时 cell8 为固体 → 不触发过压 displace 干扰 cell20 的真空条件。
+    /// 期望：update_liquids 返回后 accumulated_flow[14] ≈ 1.0
+    /// （min(offGas×mass, 1.0) = 1.0）。修复前 update_liquids 不调 post_process_cell → 恒 0。
+    #[test]
+    fn update_liquids_hooks_post_process_cell_sublimation_path() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1); // 液体（升华源）
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(8, 4); // update_liquid 视角下方格（cell-width）固体 → 不下落
+                buf.mass.set(8, 500.0);
+                buf.temperature.set(8, 300.0);
+                buf.element_idx.set(20, 0); // post_process 视角下方格（cell+width）真空
+                buf.mass.set(20, 0.0);
+                buf.temperature.set(20, 0.0);
+            }
+        }
+        update_liquids(&mut sd);
+        unsafe {
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!(
+                (acc[14] - 1.0).abs() < 1e-3,
+                "update_liquids 后 accumulated_flow[14] 应累积 1.0（升华路径经 post_process_cell 执行），got {}",
+                acc[14]
+            );
+        }
+        DestroyElementsTable();
+    }
+}
