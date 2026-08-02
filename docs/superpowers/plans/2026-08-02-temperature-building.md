@@ -28,6 +28,13 @@
 - 断言（原版 DebugBreak/崩溃）按项目惯例转 `tracing::error/warn` + 继续。
 - 全部单测须持 `LIB_TESTS_LOCK`（与既有测试一致）；元素表测试用独立元素表（不污染真实表，参照 `c2_physics/mod.rs` 的 `init_pressure_table` 风格）。
 
+## 起飞前勘误（2026-08-02 已核实）
+
+- 任务 2：`add`/`modify` 改走 `build_record_from_msg` 后，既有 5 条单测需补元素表初始化（elem5 ETD）+ 需要的 `LIB_TESTS_LOCK`，否则必挂。
+- 任务 3：`SpawnOreInfo` 首字段是 `cell_idx`（game_data.rs L170 / 原版 C L5968），不是 `callback_idx`；cell14（sim row2,col2）→ game = **5**（非 4），可见性测试用 `offset(5)`。
+- 任务 4：`SpawnFallingLiquidInfo` 字段是 `cell_idx`/`element_idx`（game_data.rs L151-152）；events 字段名 `spawn_liquid_info` 正确（sim_events.rs L161）；`init_phase_table` 索引错位需对齐（元素放 1/2/3，dummy 占 0；显式设 `steam.low_temp_transition_idx = 1`）。
+- 任务 7：`add_building`/`remove_building` 已存在（building_temperature.rs L213/L223），用法无需改。
+
 ---
 
 ### 任务 1：元素表访问器 `get_element_by_idx`
