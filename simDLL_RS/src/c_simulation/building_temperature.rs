@@ -35,6 +35,13 @@ pub struct BuildingTemperatureRecord {
     pub max_x: i32,
     pub max_y: i32,
     pub callback_idx: i32,
+    pub total_heat_capacity: f32,
+    pub per_cell_heat_capacity: f32,
+    pub high_temp: f32,
+    pub sim_min_x: i32,
+    pub sim_min_y: i32,
+    pub sim_max_x: i32,
+    pub sim_max_y: i32,
 }
 
 impl Default for BuildingTemperatureRecord {
@@ -51,11 +58,55 @@ impl Default for BuildingTemperatureRecord {
             max_x: 0,
             max_y: 0,
             callback_idx: -1,
+            total_heat_capacity: 0.0,
+            per_cell_heat_capacity: 0.0,
+            high_temp: 0.0,
+            sim_min_x: 0,
+            sim_min_y: 0,
+            sim_max_x: 0,
+            sim_max_y: 0,
         }
     }
 }
 
 /// 建筑温度管理器（全局单例，非 SimData 成员；仅在 sim 线程访问）。
+/// 由 Add/Modify 消息构建记录并计算派生字段（原版 InitializeFromMessageData L137088-137186）。
+/// 元素表缺失/面积<1/温度越界时返回 None（原版断言/崩溃，本项目转日志 + 拒绝）。
+pub fn build_record_from_msg(msg: &AddBuildingHeatExchangeMsg) -> Option<BuildingTemperatureRecord> {
+    let etd =
+        crate::b_elements::elements_table::get_element_temperature_data(msg.elem_idx)?;
+    let area = (msg.max_x - msg.min_x) * (msg.max_y - msg.min_y);
+    if area < 1 {
+        tracing::error!("Size zero building passed into BuildingHeatExchange");
+        return None;
+    }
+    if !(0.0..=10000.0).contains(&msg.temperature) {
+        tracing::error!("Invalid temperature passed into BuildingHeatExchange");
+        return None;
+    }
+    let total_hc = etd.specific_heat_capacity * msg.mass;
+    Some(BuildingTemperatureRecord {
+        elem_idx: msg.elem_idx,
+        mass: msg.mass,
+        temperature: msg.temperature,
+        thermal_conductivity: etd.thermal_conductivity * msg.thermal_conductivity,
+        overheat_temperature: msg.overheat_temperature,
+        operating_kilowatts: msg.operating_kilowatts,
+        min_x: msg.min_x,
+        min_y: msg.min_y,
+        max_x: msg.max_x,
+        max_y: msg.max_y,
+        callback_idx: msg.callback_idx,
+        total_heat_capacity: total_hc,
+        per_cell_heat_capacity: total_hc / area as f32,
+        high_temp: etd.high_temp,
+        sim_min_x: msg.min_x + 1,
+        sim_min_y: msg.min_y + 1,
+        sim_max_x: msg.max_x + 1,
+        sim_max_y: msg.max_y + 1,
+    })
+}
+
 pub struct BuildingTemperatureManager {
     /// 数据槽（非压缩：释放只标记不复位）
     records: Vec<BuildingTemperatureRecord>,
@@ -86,18 +137,8 @@ impl BuildingTemperatureManager {
 
     /// 分配句柄并存入记录（原版 AddBuildingHeatExchange 处理）。
     pub fn add(&mut self, msg: &AddBuildingHeatExchangeMsg) -> i32 {
-        let record = BuildingTemperatureRecord {
-            elem_idx: msg.elem_idx,
-            mass: msg.mass,
-            temperature: msg.temperature,
-            thermal_conductivity: msg.thermal_conductivity,
-            overheat_temperature: msg.overheat_temperature,
-            operating_kilowatts: msg.operating_kilowatts,
-            min_x: msg.min_x,
-            min_y: msg.min_y,
-            max_x: msg.max_x,
-            max_y: msg.max_y,
-            callback_idx: msg.callback_idx,
+        let Some(record) = build_record_from_msg(msg) else {
+            return -1;
         };
         let record_index = self.records.len();
         let handle = if let Some(h) = self.free_handles.pop() {
@@ -129,8 +170,25 @@ impl BuildingTemperatureManager {
         self.records.get_mut(record_index as usize)
     }
 
+    /// 校验 handle 并返回记录只读引用（测试/只读场景）。
+    pub fn record(&self, handle: i32) -> Option<&BuildingTemperatureRecord> {
+        let index = (handle & 0xffffff) as usize;
+        let version = ((handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return None;
+        }
+        let record_index = self.items[index];
+        if record_index < 0 {
+            return None;
+        }
+        self.records.get(record_index as usize)
+    }
+
     /// 更新记录（原版 ModifyBuildingHeatExchange 处理；msg.callback_idx 即 handle）。
     pub fn modify(&mut self, handle: i32, msg: &AddBuildingHeatExchangeMsg) -> bool {
+        let Some(new_record) = build_record_from_msg(msg) else {
+            return false;
+        };
         let Some(record) = self.get_mut(handle) else {
             tracing::warn!(
                 handle,
@@ -138,16 +196,10 @@ impl BuildingTemperatureManager {
             );
             return false;
         };
-        record.elem_idx = msg.elem_idx;
-        record.mass = msg.mass;
-        record.temperature = msg.temperature;
-        record.thermal_conductivity = msg.thermal_conductivity;
-        record.overheat_temperature = msg.overheat_temperature;
-        record.operating_kilowatts = msg.operating_kilowatts;
-        record.min_x = msg.min_x;
-        record.min_y = msg.min_y;
-        record.max_x = msg.max_x;
-        record.max_y = msg.max_y;
+        // 原版 Modify 消息 data 无 callbackIdx 字段，记录保留 Add 时的 callback（L137245 写回不含 callback）。
+        let callback_idx = record.callback_idx;
+        *record = new_record;
+        record.callback_idx = callback_idx;
         true
     }
 
@@ -241,8 +293,32 @@ mod tests {
     use super::*;
     use crate::a_framework::game_data::GameData;
     use crate::a_framework::sim_events::RemoveBuildingHeatExchangeMsg;
+    use crate::b_elements::element::ElementTemperatureData;
+    use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
     use crate::LIB_TESTS_LOCK;
     use std::mem::size_of;
+
+    /// 建最小元素表：elem5 液态 SHC=2.0、TC=4.0、highTemp=5000、lowTemp=200。
+    /// 调用方需持 LIB_TESTS_LOCK。
+    fn init_temp_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.element_names.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        let mut etd = ElementTemperatureData::default();
+        etd.state = 2;
+        etd.specific_heat_capacity = 2.0;
+        etd.thermal_conductivity = 4.0;
+        etd.high_temp = 5000.0;
+        etd.low_temp = 200.0;
+        table.elements.resize(6, crate::b_elements::element::Element::default());
+        table.temperature_data.resize(6, ElementTemperatureData::default());
+        table.temperature_data[5] = etd;
+    }
 
     fn add_msg(callback_idx: i32, temp: f32) -> AddBuildingHeatExchangeMsg {
         AddBuildingHeatExchangeMsg {
@@ -270,44 +346,51 @@ mod tests {
 
     #[test]
     fn add_allocates_versioned_handles() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
         let h1 = mgr.add(&add_msg(11, 310.0));
         assert_eq!(h0, 0);
         assert_eq!(h1, 1);
-        assert_eq!(mgr.get_mut(h0).unwrap().temperature, 300.0);
-        assert_eq!(mgr.get_mut(h1).unwrap().callback_idx, 11);
+        assert_eq!(mgr.record(h0).unwrap().temperature, 300.0);
+        assert_eq!(mgr.record(h1).unwrap().callback_idx, 11);
     }
 
     #[test]
     fn modify_updates_record() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h = mgr.add(&add_msg(10, 300.0));
         assert!(mgr.modify(h, &add_msg(10, 350.0)));
-        assert_eq!(mgr.get_mut(h).unwrap().temperature, 350.0);
+        assert_eq!(mgr.record(h).unwrap().temperature, 350.0);
     }
 
     #[test]
     fn remove_frees_and_reuses_with_version_bump() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
         let h1 = mgr.add(&add_msg(11, 310.0));
         assert!(mgr.remove(h0));
-        assert!(mgr.get_mut(h0).is_none());
-        assert!(mgr.get_mut(h1).is_some());
+        assert!(mgr.record(h0).is_none());
+        assert!(mgr.record(h1).is_some());
         // 复用 index 0，版本递增
         let h2 = mgr.add(&add_msg(12, 320.0));
         assert_eq!(h2 & 0xffffff, 0);
         assert_ne!(h2, h0);
         assert_eq!((h2 >> 24) & 0xff, 1);
-        assert!(mgr.get_mut(h2).is_some());
+        assert!(mgr.record(h2).is_some());
         // 旧句柄仍无效
-        assert!(mgr.get_mut(h0).is_none());
+        assert!(mgr.record(h0).is_none());
     }
 
     #[test]
     fn write_output_is_indexed_by_handle() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
         let h1 = mgr.add(&add_msg(11, 310.0));
@@ -330,6 +413,7 @@ mod tests {
     #[test]
     fn write_output_freed_slot_is_minus_one() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
         mgr.remove(h0);
@@ -339,5 +423,37 @@ mod tests {
         assert_eq!(slice.len(), 1);
         // 原版 Unregister 把空闲槽温度写 -1.0f（L137245 0xbf800000）
         assert_eq!(slice[0].temperature, -1.0);
+    }
+
+    #[test]
+    fn build_record_derives_fields_from_message() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let msg = add_msg(10, 300.0); // min(1,2) max(2,3) → 面积 1，mass=100
+        let r = build_record_from_msg(&msg).expect("valid building");
+        // totalHC = SHC×mass = 2×100 = 200；perCellHC = 200/1 = 200
+        assert_eq!(r.total_heat_capacity, 200.0);
+        assert_eq!(r.per_cell_heat_capacity, 200.0);
+        // recordTC = 元素TC×消息TC = 4×1 = 4
+        assert_eq!(r.thermal_conductivity, 4.0);
+        assert_eq!(r.high_temp, 5000.0);
+        assert_eq!((r.sim_min_x, r.sim_min_y), (2, 3));
+        assert_eq!((r.sim_max_x, r.sim_max_y), (3, 4));
+        assert_eq!(r.callback_idx, 10);
+    }
+
+    #[test]
+    fn build_record_rejects_zero_area_and_bad_temperature() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let mut zero = add_msg(10, 300.0);
+        zero.min_x = 2;
+        zero.max_x = 2; // 面积 0
+        assert!(build_record_from_msg(&zero).is_none());
+        let mut hot = add_msg(10, 20000.0);
+        assert!(build_record_from_msg(&hot).is_none());
+        let mut bad_elem = add_msg(10, 300.0);
+        bad_elem.elem_idx = 0xffff;
+        assert!(build_record_from_msg(&bad_elem).is_none());
     }
 }
