@@ -103,3 +103,29 @@
 - 液滴轨道设计：docs/superpowers/specs/2026-08-02-liquid-droplet-track-design.md
 - 上推/蒸发设计：docs/superpowers/specs/2026-08-02-liquid-pushup-and-evaporate-design.md
 - 进度账本：.superpowers/sdd/progress-horizontal.md
+
+## [已完成] 温度模块·方案 A 建筑温度链路（2026-08-02 内联执行）
+
+- 规格：docs/superpowers/specs/2026-08-02-temperature-building-design.md（1d005b2）
+- 计划：docs/superpowers/plans/2026-08-02-temperature-building.md（4277bfd + 237370e 勘误）
+- **已实现（严格对照原版 SimDLL_Source.c，未抄神秘版本）**：
+  - 记录派生字段（InitializeFromMessageData L137088）：perCellHC / totalHC / 记录TC=元素TC×消息TC /
+    highTemp / simMin·simMax(+1)，Add/Modify 全量重算；Modify 保留 Add 的 callback；
+  - ModifyBuildingEnergy 消费（L115484-115540，位置 modifies 后 removes 前）：ΔT=ΔQ/(面积×perCellHC)
+    （=ΔQ/SHC×mass），钳制 [minTemp,maxTemp]∩[0,10000]，非法终温告警不写回；
+  - BuildingHeatExchange::Update（L137362-137633）：mass>0 才换热（真空跳过），k=f24×ΔT×元素TC×记录TC
+    ×insulation²×7.68935e-08×dt×scale，能量守恒交叉钳制，min/max_seen 钳制 + operatingKW 产热，
+    三事件（buildingOverheatInfo / buildingNoLongerOverheatedInfo / buildingMeltedInfo），
+    挂载 update_data 末尾（等价原版 L145434 组件阶段）；
+  - Modify 过热事件（L137187-137203）：old≥overheat 且 new<overheat → buildingNoLongerOverheatedInfo
+    （管道审查建议方向有误，以源码为准）；
+  - DoStateTransition（L133261-133737）依赖：高温/低温转变、矿渣（SimEvents::SpawnOre L133682）、
+    cellMeltedInfo+timers、非固态低变液滴（spawnLiquidInfo）；新增 get_element_by_idx 访问器。
+- **勘误记录**：建筑/方格换热公式中字节因子是 insulation²（非 state²），7.68935e-08=1.53787e-05×0.005；
+  DoStateTransition 背墙标记读 updated.properties&0x40、固态上格读 cells.properties&2。
+- 全量 345 测试串行全过；release 构建成功（任务 7 轮）。
+- **待实测**：部署 DLL → ① 水泵/发热建筑产热升温（ModifyBuildingEnergy 生效）；② 建筑周围格子升温、
+  真空房内只升不散；③ 过热度提示（C# 读 buildingOverheatInfo）；④ 管道水珠温度随建筑温度变化。
+- **后续（温度模块下一块）**：方格↔方格 UpdateTemperature（L133737）、背墙换热
+  UpdateTemperatureForBackwallExchange（L134004）、导热板 BuildingToBuildingHeatExchange（L138358）、
+  升华/持续蒸发、ElementEmitter 本体。
