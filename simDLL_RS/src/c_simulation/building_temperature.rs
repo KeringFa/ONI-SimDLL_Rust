@@ -17,6 +17,7 @@
 //! "建筑注册 → 回调 C# → 管道入网" 链路，使 ConduitFlow 能注册管道温度句柄。
 
 use crate::a_framework::game_data::{BuildingTemperatureInfo, GameData, Handle, MeltedInfo};
+use crate::a_framework::sim_data::SimData;
 use crate::a_framework::sim_events::AddBuildingHeatExchangeMsg;
 use crate::a_framework::sim_events::SimEvents;
 use once_cell::sync::Lazy;
@@ -370,10 +371,161 @@ pub fn clear_building_temperature() {
     BUILDING_TEMPERATURE_MANAGER.lock().clear();
 }
 
+/// BuildingHeatExchange::Update（原版 L137362-137633）。每子步由 `update_data` 末尾调用（dt=0.2）。
+///
+/// 逐建筑、逐格换热：mass>0 才参与（真空跳过）；k = f24×ΔT×元素TC×记录TC×insulation²
+/// ×7.68935e-08×dt×buildingTemperatureScale；能量守恒交叉钳制；建筑终温 = Σk/(cellCount×perCellHC)
+/// + bldgT，钳制 [min_seen,max_seen] 后 + dt×operatingKW/(cellCount×perCellHC)；
+/// 推 buildingOverheatInfo / buildingNoLongerOverheatedInfo / buildingMeltedInfo。
+pub fn update_building_heat_exchange(sim_data: &mut SimData) {
+    if sim_data.updated_cells.ptr.is_null() || sim_data.sim_events.ptr.is_null() {
+        return;
+    }
+    let mut mgr = BUILDING_TEMPERATURE_MANAGER.lock();
+    let dt = 0.2f32;
+    let scale = sim_data.debug_properties.building_temperature_scale;
+    let width = sim_data.width as usize;
+
+    for index in 0..mgr.items.len() {
+        let record_index = mgr.items[index];
+        if record_index < 0 {
+            continue;
+        }
+        let handle = ((mgr.versions[index] as i32) << 24) | (index as i32 & 0xffffff);
+        let rec = mgr.records[record_index as usize];
+        if rec.per_cell_heat_capacity <= 0.0 || rec.temperature < 0.0 {
+            continue;
+        }
+        let old_temperature = rec.temperature;
+        let bldg_t = rec.temperature;
+        let per_cell_hc = rec.per_cell_heat_capacity;
+        let record_tc = rec.thermal_conductivity;
+        let operating_kw = rec.operating_kilowatts;
+        let overheat = rec.overheat_temperature;
+        let high_temp = rec.high_temp;
+        let cell_count =
+            (rec.sim_max_y - rec.sim_min_y) * (rec.sim_max_x - rec.sim_min_x);
+        if cell_count < 1 {
+            continue;
+        }
+        let cell_count_f = cell_count as f32;
+        let mut min_seen = bldg_t;
+        let mut max_seen = bldg_t;
+        let mut sum_k = 0.0f32;
+
+        for row in rec.sim_min_y..rec.sim_max_y {
+            for col in rec.sim_min_x..rec.sim_max_x {
+                let cell = row as usize * width + col as usize;
+                let (cell_mass, cell_temp, insul, etd) = {
+                    let u = unsafe { &*sim_data.updated_cells.ptr };
+                    if cell >= u.mass.len() {
+                        continue;
+                    }
+                    let m = u.mass.get(cell);
+                    if m <= 0.0 {
+                        continue;
+                    }
+                    let t = u.temperature.get(cell);
+                    let elem = u.element_idx.get(cell);
+                    let Some(etd) =
+                        crate::b_elements::elements_table::get_element_temperature_data(elem)
+                    else {
+                        continue;
+                    };
+                    (m, t, u.insulation.get(cell), etd)
+                };
+                let cell_hc = cell_mass * etd.specific_heat_capacity;
+                if cell_hc <= 0.0 {
+                    continue;
+                }
+                let f24 = if cell_temp < bldg_t { per_cell_hc } else { cell_hc };
+                let insul_f = insul as f32;
+                let mut k = f24 * (cell_temp - bldg_t) * etd.thermal_conductivity
+                    * record_tc
+                    * insul_f
+                    * insul_f
+                    * 7.68935e-08
+                    * dt
+                    * scale;
+                let low = bldg_t.min(cell_temp);
+                let high = bldg_t.max(cell_temp);
+                let mut new_cell_t = (cell_temp - k / cell_hc).max(low).min(high);
+                let mut new_bldg_t = (k / per_cell_hc + bldg_t).max(low).min(high);
+                if (new_bldg_t - new_cell_t) * (bldg_t - cell_temp) < 0.0 {
+                    // 交叉：能量守恒均衡（原版 L137451-137458）
+                    let inv = 1.0 / (per_cell_hc + cell_hc);
+                    let balanced =
+                        (per_cell_hc * bldg_t + cell_hc * cell_temp) * inv;
+                    let balanced = balanced.max(low).min(high);
+                    k = (balanced - bldg_t) * per_cell_hc;
+                    new_cell_t = balanced;
+                    new_bldg_t = k / per_cell_hc + bldg_t;
+                }
+                if !(low <= new_cell_t && new_cell_t <= high) {
+                    tracing::error!(
+                        cell,
+                        new_cell_t,
+                        low,
+                        high,
+                        "BuildingHeatExchange has invalid values"
+                    );
+                }
+                if !(0.0 <= new_cell_t && new_cell_t <= 10000.0) {
+                    tracing::error!(
+                        cell,
+                        new_cell_t,
+                        "BuildingHeatExchange has generated invalid final temperature"
+                    );
+                }
+                unsafe {
+                    (*sim_data.updated_cells.ptr).temperature.set(cell, new_cell_t);
+                }
+                crate::c2_physics::temperature::do_state_transition(sim_data, cell, &etd);
+                sum_k += k;
+                max_seen = max_seen.max(high);
+                min_seen = min_seen.min(low);
+            }
+        }
+
+        let inv_count_hc = 1.0 / (cell_count_f * per_cell_hc);
+        let mut final_t = inv_count_hc * sum_k + bldg_t;
+        final_t = final_t.min(max_seen);
+        final_t = final_t.max(min_seen);
+        final_t = final_t + dt * operating_kw * inv_count_hc;
+        if !(0.0 <= final_t && final_t <= 10000.0) {
+            tracing::error!(
+                handle,
+                final_t,
+                "Assert failed: 0 <= final_temperature <= SIM_MAX_TEMPERATURE"
+            );
+        }
+        {
+            let events = unsafe { &mut *sim_data.sim_events.ptr };
+            if overheat <= final_t {
+                events.building_overheat_info.push(MeltedInfo {
+                    handle: Handle { value: handle },
+                });
+            }
+            if overheat <= old_temperature && final_t < overheat {
+                events.building_no_longer_overheated_info.push(MeltedInfo {
+                    handle: Handle { value: handle },
+                });
+            }
+            if high_temp <= final_t {
+                events.building_melted_info.push(MeltedInfo {
+                    handle: Handle { value: handle },
+                });
+            }
+        }
+        mgr.records[record_index as usize].temperature = final_t;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::a_framework::game_data::GameData;
+    use crate::a_framework::sim_data::SimData;
     use crate::a_framework::sim_events::RemoveBuildingHeatExchangeMsg;
     use crate::a_framework::sim_events::SimEvents;
     use crate::b_elements::element::ElementTemperatureData;
@@ -593,5 +745,99 @@ mod tests {
         let m3 = add_msg(10, 1800.0);
         assert!(mgr.modify_with_events(h, &m3, &mut events));
         assert_eq!(events.building_no_longer_overheated_info.len(), 1);
+    }
+
+    fn make_exchange_sim() -> SimData {
+        let mut sd = crate::a_framework::sim_data::SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        sd.debug_properties.building_temperature_scale = 1.0;
+        sd
+    }
+
+    #[test]
+    fn building_exchange_skips_vacuum_and_exchanges_with_matter_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table(); // elem5：SHC=2、TC=4、highTemp=5000
+        let mut sd = make_exchange_sim();
+        // 建筑 sim 范围 (2,3)-(3,5)：cell20(row3,col2) 有质量、cell26(row4,col2) 真空
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(20, 5);
+            u.mass.set(20, 100.0);
+            u.temperature.set(20, 300.0);
+            u.insulation.set(20, 1);
+            u.element_idx.set(26, 0);
+            u.mass.set(26, 0.0);
+            u.temperature.set(26, 0.0);
+            u.insulation.set(26, 0);
+        }
+        let mut msg = add_msg(10, 2000.0); // 大温差让单子步换热在 f32 下可观测
+        msg.min_x = 1;
+        msg.min_y = 2;
+        msg.max_x = 2;
+        msg.max_y = 4; // 面积 1×2 → perCellHC = 200/2 = 100
+        let h = add_building(&msg);
+        update_building_heat_exchange(&mut sd);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        // 真空格不换热
+        assert_eq!(u.temperature.get(26), 0.0);
+        // 有质量格从建筑获得热量（cellT 300 < bldgT 2000 → 升温）
+        assert!(u.temperature.get(20) > 300.0, "cell20 应升温，got {}", u.temperature.get(20));
+        // 建筑温度下降
+        assert!(
+            BUILDING_TEMPERATURE_MANAGER.lock().record(h).unwrap().temperature < 2000.0
+        );
+        remove_building(h);
+    }
+
+    #[test]
+    fn building_exchange_emits_overheat_and_melted_events() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let mut sd = make_exchange_sim();
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(20, 5); // 默认建筑覆盖 cell20(row3,col2)
+            u.mass.set(20, 100.0);
+            u.temperature.set(20, 2000.0);
+            u.insulation.set(20, 1);
+        }
+        let mut msg = add_msg(10, 2000.0); // overheat=2000，温度=2000
+        msg.operating_kilowatts = 2000.0;
+        let h = add_building(&msg);
+        update_building_heat_exchange(&mut sd);
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.building_overheat_info.len(), 1, "自热使建筑温度超过 overheat");
+        assert_eq!(
+            events.building_overheat_info.get(0).handle.value,
+            h
+        );
+        // 建筑终温 = 2000 + 0.2×2000/(1×perCellHC=200) = 2002，highTemp=5000 → 无 melted
+        assert_eq!(events.building_melted_info.len(), 0);
+        assert!(
+            (BUILDING_TEMPERATURE_MANAGER.lock().record(h).unwrap().temperature - 2002.0).abs() < 0.01
+        );
+        remove_building(h);
+    }
+
+    #[test]
+    fn building_exchange_emits_no_longer_overheated_when_cooled() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let mut sd = make_exchange_sim();
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(20, 5);
+            u.mass.set(20, 100.0);
+            u.temperature.set(20, 100.0);
+            u.insulation.set(20, 1);
+        }
+        let h = add_building(&add_msg(10, 2000.0)); // overheat=2000，建筑 2000℃，周围 100℃
+        update_building_heat_exchange(&mut sd);
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.building_no_longer_overheated_info.len(), 1);
+        assert!(BUILDING_TEMPERATURE_MANAGER.lock().record(h).unwrap().temperature < 2000.0);
+        remove_building(h);
     }
 }
