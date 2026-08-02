@@ -734,7 +734,7 @@ fn swap_cells(cells: &mut CellSOA, a: usize, b: usize) {
 /// （old/new 填 0xFFFF 占位，由 copy_sim_data_to_game 后处理回填），
 /// 并标记 timers[simCell] |= 0x1F。
 /// 这是 C# 画面刷新的关键：液体转移后格子元素变化必须产生事件。
-fn push_substance_change(sim: &mut crate::a_framework::sim_data::SimData, sim_cell: usize) {
+pub(crate) fn push_substance_change(sim: &mut crate::a_framework::sim_data::SimData, sim_cell: usize) {
     if sim.sim_events.ptr.is_null() {
         return;
     }
@@ -966,7 +966,7 @@ fn next_random(sim: &mut SimData) -> f32 {
 
 /// CellSOA::ClearCell（原版 11_msvcrt_ignored.c L23677-23723）。
 /// 清空格子：元素 → vacuumElementIdx、质量/温度清零、病菌四字段清除。
-fn clear_cell(sim: &SimData, cells: &mut CellSOA, cell: usize) {
+pub(crate) fn clear_cell(sim: &SimData, cells: &mut CellSOA, cell: usize) {
     cells.element_idx.set(cell, sim.vacuum_element_idx);
     cells.mass.set(cell, 0.0);
     cells.temperature.set(cell, 0.0);

@@ -9,6 +9,7 @@ use crate::a_framework::sim_data::SimData;
 
 pub mod liquid_flow;
 pub mod property_texture;
+pub mod temperature;
 
 /// SimBase::UpdateData 的桩实现。
 ///
