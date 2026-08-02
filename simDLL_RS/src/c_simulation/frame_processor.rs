@@ -1019,8 +1019,19 @@ fn process_building_heat_exchange_messages(frame: &mut SimFrameInfo, sim_data: &
                         as *const crate::a_framework::sim_events::AddBuildingHeatExchangeMsg,
                 )
             };
-            let ok =
-                crate::c_simulation::building_temperature::modify_building(msg.callback_idx, &msg);
+            let ok = if sim_data.sim_events.ptr.is_null() {
+                crate::c_simulation::building_temperature::modify_building(
+                    msg.callback_idx,
+                    &msg,
+                )
+            } else {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                crate::c_simulation::building_temperature::modify_building_with_events(
+                    msg.callback_idx,
+                    &msg,
+                    events,
+                )
+            };
             tracing::trace!(
                 handle = msg.callback_idx,
                 ok,

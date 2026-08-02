@@ -16,8 +16,9 @@
 //! 换热本体（建筑 ↔ 周围格）与过热/熔化检测留待后续；本阶段目标是打通
 //! "建筑注册 → 回调 C# → 管道入网" 链路，使 ConduitFlow 能注册管道温度句柄。
 
-use crate::a_framework::game_data::{BuildingTemperatureInfo, GameData, Handle};
+use crate::a_framework::game_data::{BuildingTemperatureInfo, GameData, Handle, MeltedInfo};
 use crate::a_framework::sim_events::AddBuildingHeatExchangeMsg;
+use crate::a_framework::sim_events::SimEvents;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
@@ -239,6 +240,33 @@ impl BuildingTemperatureManager {
         false
     }
 
+    /// Modify + 过热事件（原版 L137187-137203）：old≥overheat 且 new<overheat →
+    /// 推 `buildingNoLongerOverheatedInfo`（条件是 ≥，事件是 no-longer-overheated）。
+    pub fn modify_with_events(
+        &mut self,
+        handle: i32,
+        msg: &AddBuildingHeatExchangeMsg,
+        events: &mut SimEvents,
+    ) -> bool {
+        let Some(new_record) = build_record_from_msg(msg) else {
+            return false;
+        };
+        let Some(record) = self.get_mut(handle) else {
+            return false;
+        };
+        let old_temp = record.temperature;
+        let old_overheat = record.overheat_temperature;
+        let callback_idx = record.callback_idx;
+        if old_temp >= old_overheat && new_record.temperature < old_overheat {
+            events.building_no_longer_overheated_info.push(MeltedInfo {
+                handle: Handle { value: handle },
+            });
+        }
+        *record = new_record;
+        record.callback_idx = callback_idx;
+        true
+    }
+
     /// 释放句柄（原版 RemoveBuildingHeatExchange 处理；swap-remove 数据槽）。
     pub fn remove(&mut self, handle: i32) -> bool {
         let index = (handle & 0xffffff) as usize;
@@ -307,6 +335,17 @@ pub fn modify_building(handle: i32, msg: &AddBuildingHeatExchangeMsg) -> bool {
     BUILDING_TEMPERATURE_MANAGER.lock().modify(handle, msg)
 }
 
+/// 处理 ModifyBuildingHeatExchange 消息（带 no-longer-overheated 事件）。
+pub fn modify_building_with_events(
+    handle: i32,
+    msg: &AddBuildingHeatExchangeMsg,
+    events: &mut SimEvents,
+) -> bool {
+    BUILDING_TEMPERATURE_MANAGER
+        .lock()
+        .modify_with_events(handle, msg, events)
+}
+
 /// 处理 ModifyBuildingEnergy 消息（建筑产热）。
 pub fn modify_building_energy(handle: i32, delta_kj: f32, min_temp: f32, max_temp: f32) -> bool {
     BUILDING_TEMPERATURE_MANAGER
@@ -336,6 +375,7 @@ mod tests {
     use super::*;
     use crate::a_framework::game_data::GameData;
     use crate::a_framework::sim_events::RemoveBuildingHeatExchangeMsg;
+    use crate::a_framework::sim_events::SimEvents;
     use crate::b_elements::element::ElementTemperatureData;
     use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
     use crate::LIB_TESTS_LOCK;
@@ -531,5 +571,27 @@ mod tests {
         // 钳到 [0,10000] 上界 → 非法温度 → 不写回
         assert!(mgr.modify_building_energy(h, 1e10, 0.0, 10000.0));
         assert!((mgr.record(h).unwrap().temperature - 300.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn modify_pushes_no_longer_overheated_at_boundary() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let mut events = SimEvents::default();
+        let mut mgr = BuildingTemperatureManager::new();
+        let msg = add_msg(10, 2000.0); // overheat = 2000，温度 = 2000
+        let h = mgr.add(&msg);
+        // old=2000 >= overheat=2000，new=1999 < 2000 → 事件
+        let m2 = add_msg(10, 1999.0);
+        assert!(mgr.modify_with_events(h, &m2, &mut events));
+        assert_eq!(events.building_no_longer_overheated_info.len(), 1);
+        assert_eq!(
+            events.building_no_longer_overheated_info.get(0).handle.value,
+            h
+        );
+        // old=1999 < overheat → 无事件
+        let m3 = add_msg(10, 1800.0);
+        assert!(mgr.modify_with_events(h, &m3, &mut events));
+        assert_eq!(events.building_no_longer_overheated_info.len(), 1);
     }
 }
