@@ -633,6 +633,15 @@ pub extern "C" fn CreateElementInteractionsLocked(reader: *mut BinaryBufferReade
     })
 }
 
+/// 查询完整元素记录（gElements，0xa4B）。DoStateTransition 低温非固态分支读 low_temp/high_temp。
+pub fn get_element_by_idx(elem_idx: u16) -> Option<Element> {
+    let idx = elem_idx as usize;
+    match G_ELEMENTS_TABLE.lock() {
+        Ok(table) => table.elements.get(idx).copied(),
+        Err(e) => e.into_inner().elements.get(idx).copied(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +666,24 @@ mod tests {
         let mut t = ElementsTable::default();
         t.element_indices.insert(42, 5);
         assert_eq!(get_element_index_inner(&t, 42), 5);
+    }
+
+    #[test]
+    fn get_element_by_idx_returns_element_or_none() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        let mut e = Element::default();
+        e.id = 0x12345678;
+        e.low_temp = 100.0;
+        e.high_temp = 500.0;
+        table.elements.push(e);
+        drop(table);
+        let got = get_element_by_idx(0).expect("elem 0 exists");
+        assert_eq!(got.id, 0x12345678);
+        assert_eq!(got.low_temp, 100.0);
+        assert_eq!(got.high_temp, 500.0);
+        assert!(get_element_by_idx(0xffff).is_none());
     }
 
     #[test]
