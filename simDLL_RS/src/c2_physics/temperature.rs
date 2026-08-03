@@ -247,6 +247,103 @@ pub(crate) fn calculate_temperature_exchange_precise(
     (new_a as f32, new_b as f32)
 }
 
+/// 合并导率（原版 UpdateTemperature L133833-133847）：任一侧 insulation 值
+/// （ins²×1.53787e-05）<1.0 → min(k_a,k_b)；否则几何平均。
+/// 注：ins=255 时 f32 下 iv 舍入为 1.0（非 <1）→ 几何平均分支可达。
+fn combine_conductivity(ins_a: u8, tc_a: f32, ins_b: u8, tc_b: f32) -> f32 {
+    let ins_a = ins_a as f32;
+    let ins_b = ins_b as f32;
+    let iv_a = ins_a * ins_a * 1.53787e-05;
+    let iv_b = ins_b * ins_b * 1.53787e-05;
+    let k_a = iv_a * tc_a;
+    let k_b = iv_b * tc_b;
+    if iv_a < 1.0 || iv_b < 1.0 {
+        k_a.min(k_b)
+    } else {
+        (k_a * k_b).sqrt() // 原版 logf+logf+expf = 几何平均
+    }
+}
+
+/// 表面倍率（邻格路径，原版 L133801-133823 内联）：state&3==0 时保持 1.0（无分支命中）。
+fn surface_multiplier_pair(this: &ElementTemperatureData, other_state: u8) -> f32 {
+    match other_state & 3 {
+        1 => this.gas_surface_area_multiplier,
+        2 => this.liquid_surface_area_multiplier,
+        3 => this.solid_surface_area_multiplier,
+        _ => 1.0,
+    }
+}
+
+/// 表面倍率（背墙路径，原版 GetSurfaceAreaMultiplier L133620）：state&3==0 落 liquid 倍率。
+fn surface_multiplier_backwall(this: &ElementTemperatureData, other_state: u8) -> f32 {
+    match other_state & 3 {
+        1 => this.gas_surface_area_multiplier,
+        2 => this.liquid_surface_area_multiplier,
+        3 => this.solid_surface_area_multiplier,
+        _ => this.liquid_surface_area_multiplier,
+    }
+}
+
+/// UpdateTemperature（原版 L133737-134004）：读 `cells` 稳定缓冲，写 `updatedCells` 增量 + [1,10000] 钳制。
+pub(crate) fn update_temperature_pair(sim: &mut SimData, cell_a: usize, cell_b: usize) {
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let (t_a, t_b, hc_a, hc_b, k_total) = {
+        let c = unsafe { &*sim.cells.ptr };
+        if cell_a >= c.temperature.len() || cell_b >= c.temperature.len() {
+            return;
+        }
+        let (elem_a, elem_b) = (c.element_idx.get(cell_a), c.element_idx.get(cell_b));
+        let (Some(etd_a), Some(etd_b)) = (
+            get_element_temperature_data(elem_a),
+            get_element_temperature_data(elem_b),
+        ) else {
+            return;
+        };
+        let (hc_a, hc_b) = (
+            c.mass.get(cell_a) * etd_a.specific_heat_capacity,
+            c.mass.get(cell_b) * etd_b.specific_heat_capacity,
+        );
+        if hc_a <= 0.0 || hc_b <= 0.0 {
+            return;
+        }
+        let k = combine_conductivity(
+            c.insulation.get(cell_a),
+            etd_a.thermal_conductivity,
+            c.insulation.get(cell_b),
+            etd_b.thermal_conductivity,
+        );
+        let mult_a = surface_multiplier_pair(&etd_a, etd_b.state);
+        let mult_b = surface_multiplier_pair(&etd_b, etd_a.state);
+        (
+            c.temperature.get(cell_a),
+            c.temperature.get(cell_b),
+            hc_a,
+            hc_b,
+            k * mult_a * mult_b,
+        )
+    };
+    // 原版约定：冷侧在前（T_a ≤ T_b）调用 precise；否则 swapped 后映射回 (new_cell, new_neighbor)
+    let (new_a, new_b) = if t_a <= t_b {
+        calculate_temperature_exchange_precise(0.25, k_total, 0.2, t_a, hc_a, t_b, hc_b)
+    } else {
+        let (nb, na) =
+            calculate_temperature_exchange_precise(0.25, k_total, 0.2, t_b, hc_b, t_a, hc_a);
+        (na, nb)
+    };
+    unsafe {
+        let u = &mut *sim.updated_cells.ptr;
+        let c = &*sim.cells.ptr;
+        let mut va = (new_a - c.temperature.get(cell_a)) + u.temperature.get(cell_a);
+        va = va.max(1.0).min(10000.0);
+        u.temperature.set(cell_a, va);
+        let mut vb = (new_b - c.temperature.get(cell_b)) + u.temperature.get(cell_b);
+        vb = vb.max(1.0).min(10000.0);
+        u.temperature.set(cell_b, vb);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +535,94 @@ mod tests {
         assert!((na2 - 325.0).abs() < 1e-3, "got {na2}");
         assert!((nb2 - 375.0).abs() < 1e-3, "got {nb2}");
         assert!(na2 <= 350.0 && nb2 >= 350.0);
+    }
+
+    /// 元素表：elem1 液态水（SHC=4.179、TC=0.609）、elem2 固态砖（SHC=0.8、TC=2.0）。
+    fn init_pair_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.temperature_data.clear();
+        let mut water = ElementTemperatureData::default();
+        water.state = 2;
+        water.specific_heat_capacity = 4.179;
+        water.thermal_conductivity = 0.609;
+        water.gas_surface_area_multiplier = 1.0;
+        water.liquid_surface_area_multiplier = 1.0;
+        water.solid_surface_area_multiplier = 1.0;
+        let mut rock = ElementTemperatureData::default();
+        rock.state = 3;
+        rock.specific_heat_capacity = 0.8;
+        rock.thermal_conductivity = 2.0;
+        rock.gas_surface_area_multiplier = 1.0;
+        rock.liquid_surface_area_multiplier = 1.0;
+        rock.solid_surface_area_multiplier = 1.0;
+        table.temperature_data.push(ElementTemperatureData::default()); // 0 dummy
+        table.temperature_data.push(water); // 1
+        table.temperature_data.push(rock); // 2
+    }
+
+    fn fill_pair_cells(sd: &mut SimData, cells: &[(usize, u16, f32, f32, u8)]) {
+        unsafe {
+            let c = &mut *sd.cells.ptr;
+            let u = &mut *sd.updated_cells.ptr;
+            for &(cell, elem, mass, temp, ins) in cells {
+                c.element_idx.set(cell, elem);
+                c.mass.set(cell, mass);
+                c.temperature.set(cell, temp);
+                c.insulation.set(cell, ins);
+                u.element_idx.set(cell, elem);
+                u.mass.set(cell, mass);
+                u.temperature.set(cell, temp);
+                u.insulation.set(cell, ins);
+            }
+        }
+    }
+
+    #[test]
+    fn update_temperature_pair_exchanges_and_conserves_energy() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pair_table();
+        let mut sd = make_sim();
+        // ins=255：f32 下 iv = 255²×1.53787e-05 舍入为 1.0（非 <1）→ 几何平均路径
+        fill_pair_cells(&mut sd, &[(14, 1, 100.0, 300.0, 255), (15, 2, 200.0, 400.0, 255)]);
+        update_temperature_pair(&mut sd, 14, 15);
+        unsafe {
+            let c = &*sd.cells.ptr;
+            let u = &*sd.updated_cells.ptr;
+            let new_a = u.temperature.get(14);
+            let new_b = u.temperature.get(15);
+            assert!(new_a > 300.0 && new_b < 400.0, "热格降温冷格升温：{new_a} / {new_b}");
+            // 能量守恒：HC_a=417.9，HC_b=160
+            let da = (new_a - c.temperature.get(14)) * 417.9;
+            let db = (new_b - c.temperature.get(15)) * 160.0;
+            assert!((da + db).abs() < 1e-2, "能量不守恒：{da} + {db}");
+            // 数值核对：几何平均 k = sqrt(0.609×2.0)（iv=1.0），heat = 100×k×0.2
+            let iv = 255f32 * 255f32 * 1.53787e-05;
+            assert!(iv >= 1.0, "f32 下 iv 应舍入为 ≥1.0，got {iv}");
+            let k = (iv * 0.609 * iv * 2.0).sqrt();
+            let heat = 100.0 * k * 0.2;
+            assert!((new_a - (300.0 + heat / 417.9)).abs() < 1e-2, "got {new_a}");
+        }
+    }
+
+    #[test]
+    fn update_temperature_pair_applies_surface_multiplier() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pair_table();
+        let mut sd = make_sim();
+        fill_pair_cells(&mut sd, &[(14, 1, 100.0, 300.0, 255), (15, 2, 200.0, 400.0, 255)]);
+        update_temperature_pair(&mut sd, 14, 15);
+        let d1 = unsafe { (*sd.updated_cells.ptr).temperature.get(14) } - 300.0;
+        // 把水的 solid 倍率调高到 10 → 换热应放大约 10 倍
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data[1].solid_surface_area_multiplier = 10.0;
+        }
+        let mut sd2 = make_sim();
+        fill_pair_cells(&mut sd2, &[(14, 1, 100.0, 300.0, 255), (15, 2, 200.0, 400.0, 255)]);
+        update_temperature_pair(&mut sd2, 14, 15);
+        let d2 = unsafe { (*sd2.updated_cells.ptr).temperature.get(14) } - 300.0;
+        assert!(d1 > 0.0 && d2 > 0.0);
+        assert!((d2 / d1 - 10.0).abs() < 0.5, "倍率未生效：d1={d1} d2={d2}");
     }
 }
