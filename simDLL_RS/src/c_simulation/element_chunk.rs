@@ -286,6 +286,16 @@ pub fn remove_element_chunk(handle: i32) -> bool {
     ELEMENT_CHUNK_MANAGER.lock().remove(handle)
 }
 
+/// 测试/诊断：当前活跃碎片数。
+pub fn element_chunk_count() -> usize {
+    ELEMENT_CHUNK_MANAGER.lock().items.iter().filter(|&&ri| ri >= 0).count()
+}
+
+/// 测试：清空管理器（避免跨测试污染）。
+pub fn reset_for_test() {
+    ELEMENT_CHUNK_MANAGER.lock().clear();
+}
+
 /// ExchangeHeatEnergyWithWorld（原版 L139789-139890）。返回热流（正 = 碎片失热给格子）。
 pub(crate) fn exchange_heat_energy_with_world(
     sim: &mut SimData,

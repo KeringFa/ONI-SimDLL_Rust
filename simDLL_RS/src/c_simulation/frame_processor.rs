@@ -55,6 +55,7 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     // 步骤 13: ElementConsumer 消息（Register/Modify/Unregister，2026-08-02 实现）
     process_element_consumer_messages(frame, sim_data);
     process_building_heat_exchange_messages(frame, sim_data);
+    process_element_chunk_messages(frame, sim_data);
 
     // 步骤 14+: 其他 Component 消息处理（C2 桩）
     process_component_messages_stubs(frame, sim_data);
@@ -1162,6 +1163,115 @@ fn find_reachable_state(sim: &SimData, x: usize, y: usize, radius: usize, target
     None
 }
 
+/// 原版 ProcessFrame ElementChunk 段（L116653-116682）：adds → modifies → modifyEnergy →
+/// modifyAdjuster → move → removes。
+fn process_element_chunk_messages(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    use crate::c_simulation::element_chunk::*;
+    let width = sim_data.width;
+    // adds（32B）{gameCell, callbackIdx, mass, temperature, surfaceArea, thickness, groundTransferScale, elementIdx, pad}
+    {
+        let adds = frame.element_chunk_messages.adds.as_slice();
+        let n = adds.len() / 32;
+        for i in 0..n {
+            let off = i * 32;
+            let msg = AddElementChunkMsg {
+                game_cell: i32::from_le_bytes(adds[off..off + 4].try_into().unwrap()),
+                callback_idx: i32::from_le_bytes(adds[off + 4..off + 8].try_into().unwrap()),
+                mass: f32::from_le_bytes(adds[off + 8..off + 12].try_into().unwrap()),
+                temperature: f32::from_le_bytes(adds[off + 12..off + 16].try_into().unwrap()),
+                surface_area: f32::from_le_bytes(adds[off + 16..off + 20].try_into().unwrap()),
+                thickness: f32::from_le_bytes(adds[off + 20..off + 24].try_into().unwrap()),
+                ground_transfer_scale: f32::from_le_bytes(adds[off + 24..off + 28].try_into().unwrap()),
+                element_idx: u16::from_le_bytes(adds[off + 28..off + 30].try_into().unwrap()),
+                pad: [adds[off + 30], adds[off + 31]],
+            };
+            let h = add_element_chunk(width, &msg);
+            if msg.callback_idx != -1 && !sim_data.sim_events.ptr.is_null() {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events.component_state_changed_messages.push(
+                    crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: msg.callback_idx,
+                        sim_handle: h,
+                    },
+                );
+            }
+        }
+        frame.element_chunk_messages.adds.clear_keep_capacity();
+    }
+    // modifies（12B）{handle, temperature, heatCapacity}
+    {
+        let mods = frame.element_chunk_messages.modifies.as_slice();
+        let n = mods.len() / 12;
+        for i in 0..n {
+            let off = i * 12;
+            let handle = i32::from_le_bytes(mods[off..off + 4].try_into().unwrap());
+            let t = f32::from_le_bytes(mods[off + 4..off + 8].try_into().unwrap());
+            let hc = f32::from_le_bytes(mods[off + 8..off + 12].try_into().unwrap());
+            modify_element_chunk(handle, t, hc);
+        }
+        frame.element_chunk_messages.modifies.clear_keep_capacity();
+    }
+    // modifyEnergy（8B）{handle, deltaKJ}
+    {
+        let bytes = frame.modify_element_chunk_energy_messages.as_slice();
+        let n = bytes.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let handle = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let dk = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            modify_element_chunk_energy(handle, dk);
+        }
+        frame.modify_element_chunk_energy_messages.clear_keep_capacity();
+    }
+    // modifyAdjuster（16B）{handle, temperature, heatCapacity, thermalConductivity}
+    {
+        let bytes = frame.modify_element_chunk_adjuster_messages.as_slice();
+        let n = bytes.len() / 16;
+        for i in 0..n {
+            let off = i * 16;
+            let handle = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let t = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            let hc = f32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+            let tc = f32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap());
+            modify_element_chunk_adjuster(handle, t, hc, tc);
+        }
+        frame.modify_element_chunk_adjuster_messages.clear_keep_capacity();
+    }
+    // move（8B）{handle, gameCell}
+    {
+        let bytes = frame.move_element_chunk_messages.as_slice();
+        let n = bytes.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let handle = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let gc = i32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            move_element_chunk(handle, gc, width);
+        }
+        frame.move_element_chunk_messages.clear_keep_capacity();
+    }
+    // removes（8B）{handle, callbackIdx}
+    {
+        let removes = frame.element_chunk_messages.removes.as_slice();
+        let n = removes.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let handle = i32::from_le_bytes(removes[off..off + 4].try_into().unwrap());
+            let cb = i32::from_le_bytes(removes[off + 4..off + 8].try_into().unwrap());
+            remove_element_chunk(handle);
+            if cb != -1 && !sim_data.sim_events.ptr.is_null() {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events.component_state_changed_messages.push(
+                    crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: cb,
+                        sim_handle: -1,
+                    },
+                );
+            }
+        }
+        frame.element_chunk_messages.removes.clear_keep_capacity();
+    }
+}
+
 /// ElementConsumer::Update（原版 L140776）：逐帧对每个注册消费者 BFS 消费，
 /// 结果填入 elementConsumer.consumedMassInfo（供 C# 泵/涡轮取用）。
 pub(crate) fn process_element_consumers(sim: &mut SimData) {
@@ -1408,6 +1518,54 @@ mod tests {
         assert_eq!(sd.debug_properties.building_temperature_scale, 100.0);
         assert_eq!(sd.debug_properties.building_to_building_temperature_scale, 100.0);
         assert!(sd.debug_properties.is_debug_editing);
+    }
+
+    #[test]
+    fn process_element_chunk_add_message_registers_chunk() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        crate::c_simulation::element_chunk::reset_for_test();
+        // 元素表：elem5 水（SHC=2、TC=4）
+        {
+            use crate::b_elements::element::ElementTemperatureData;
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.clear();
+            table.temperature_data.resize(6, ElementTemperatureData::default());
+            let mut water = ElementTemperatureData::default();
+            water.state = 2;
+            water.specific_heat_capacity = 2.0;
+            water.thermal_conductivity = 4.0;
+            table.temperature_data[5] = water;
+        }
+        // 构造 32B Add 消息字节（gameCell=5, callbackIdx=7, mass=100, temp=300, area=2, thickness=0.5, ground=0.5, elem=5, pad）
+        let mut bytes = Vec::new();
+        for v in [5i32, 7, 100, 300] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [2.0f32, 0.5, 0.5] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&5u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8, 0]);
+        assert_eq!(bytes.len(), 32);
+
+        let mut frame = SimFrameInfo::default();
+        for b in &bytes {
+            frame.element_chunk_messages.adds.push(*b);
+        }
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, true);
+        process_element_chunk_messages(&mut frame, &mut sd);
+        assert_eq!(
+            crate::c_simulation::element_chunk::element_chunk_count(),
+            1,
+            "Add 消息应注册一个碎片"
+        );
+        // 回调发出（callbackIdx=7 → component_state_changed）
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.component_state_changed_messages.len(), 1);
+        assert_eq!(
+            events.component_state_changed_messages.get(0).callback_idx,
+            7
+        );
     }
     use crate::LIB_TESTS_LOCK;
 
