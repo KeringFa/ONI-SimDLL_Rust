@@ -230,8 +230,18 @@ fn combine_conductivity(ins_a: u8, tc_a: f32, ins_b: u8, tc_b: f32) -> f32 {
     }
 }
 
-/// 表面倍率：this_etd 按对方 state&3 取 gas/liquid/solid 倍率（state 0 落 liquid）。
-fn surface_multiplier(this: &ElementTemperatureData, other_state: u8) -> f32 {
+/// 表面倍率（邻格路径，原版 L1338xx 内联）：state 0 保持 1.0（无分支命中）。
+fn surface_multiplier_pair(this: &ElementTemperatureData, other_state: u8) -> f32 {
+    match other_state & 3 {
+        1 => this.gas_surface_area_multiplier,
+        2 => this.liquid_surface_area_multiplier,
+        3 => this.solid_surface_area_multiplier,
+        _ => 1.0,
+    }
+}
+
+/// 表面倍率（背墙路径，原版 GetSurfaceAreaMultiplier L133620）：state 0 落 liquid 倍率。
+fn surface_multiplier_backwall(this: &ElementTemperatureData, other_state: u8) -> f32 {
     match other_state & 3 {
         1 => this.gas_surface_area_multiplier,
         2 => this.liquid_surface_area_multiplier,
@@ -270,8 +280,8 @@ pub(crate) fn update_temperature_pair(sim: &mut SimData, cell_a: usize, cell_b: 
             c.insulation.get(cell_b),
             etd_b.thermal_conductivity,
         );
-        let mult_a = surface_multiplier(&etd_a, etd_b.state);
-        let mult_b = surface_multiplier(&etd_b, etd_a.state);
+        let mult_a = surface_multiplier_pair(&etd_a, etd_b.state);
+        let mult_b = surface_multiplier_pair(&etd_b, etd_a.state);
         (
             c.temperature.get(cell_a),
             c.temperature.get(cell_b),
@@ -429,8 +439,8 @@ pub(crate) fn update_temperature_for_backwall(sim: &mut SimData, cell: usize) {
         } else {
             (k_cell * etd_back.thermal_conductivity).sqrt()
         };
-        let mult_cell = surface_multiplier(&etd_cell, etd_back.state);
-        let mult_back = surface_multiplier(&etd_back, etd_cell.state);
+        let mult_cell = surface_multiplier_backwall(&etd_cell, etd_back.state);
+        let mult_back = surface_multiplier_backwall(&etd_back, etd_cell.state);
         (
             cell_elem,
             c.temperature.get(cell),
