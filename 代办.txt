@@ -129,3 +129,28 @@
 - **后续（温度模块下一块）**：方格↔方格 UpdateTemperature（L133737）、背墙换热
   UpdateTemperatureForBackwallExchange（L134004）、导热板 BuildingToBuildingHeatExchange（L138358）、
   升华/持续蒸发、ElementEmitter 本体。
+
+## [已完成] 温度模块·方格↔方格换热（2026-08-03 内联执行）
+
+- 规格：docs/superpowers/specs/2026-08-02-temperature-cell-exchange-design.md（502945c）
+- 计划：docs/superpowers/plans/2026-08-02-temperature-cell-exchange.md（0e38f4c）
+- **已实现（严格对照原版 SimDLL_Source.c，未抄神秘版本）**：
+  - CalculateTemperatureExchange_precise（L133110）：heat=min(ΔT×k×dt, ΔT×0.25×HC_a, ΔT×0.25×HC_b)，
+    不越过加权均衡，能量守恒；
+  - UpdateTemperature（L133737）：读 cells 写 updatedCells 增量 + [1,10000] 钳制；导率合并
+    （insulation 值 <1 → min，否则几何平均）、表面倍率（邻格路径 state0→1.0，背墙路径→liquid）、
+    冷侧在前调用约定；
+  - UpdateTemperatureForBackwallExchange（L134004）：因子 0.01，背墙温度直接写，
+    越 [low−3, high+3] → backwallShouldTransitionInfo；
+  - 温度任务循环（L144205）：逐格背墙换热 → 右/下邻换热（|ΔT|≥1、TC>0、无 TemperatureInsulated 0x10）
+    → DoStateTransition（复用）；
+  - **缓冲语义严格忠实原版（用户强制）**：update_data 每子步开头 CopyFrom（L144415）→ 温度任务
+    → 温度后 CopyFrom（L144548）→ 现有液体/压力/建筑换热阶段不变；多子步帧换热速率与原版一致。
+- **勘误记录**：表面倍率邻格路径 state0=1.0（背墙路径 GetSurfaceAreaMultiplier state0=liquid，
+  两条路径不同）；背墙合并导率门控按 iv≥1.0（非 k_cell）；ins=255 时 f32 下 iv 舍入为 1.0 → 几何平均路径可达。
+- 全量 355 测试串行全过；release 构建成功（任务 5 轮）。
+- **待实测**：部署 DLL → ① 相邻液体/气体/液体↔砖块温度逐渐均衡（|ΔT|≥1 才换热）；
+  ② 真空格仍不换热；③ Drywall 背墙与该格内容物换热（0.01 因子，慢于邻格）；
+  ④ 建筑↔格子与背墙路径互不干扰。
+- **后续（温度模块下一块）**：导热板 BuildingToBuildingHeatExchange（L138358）、升华/持续蒸发、
+  ElementEmitter 本体、辐射。
