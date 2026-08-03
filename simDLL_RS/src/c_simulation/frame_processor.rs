@@ -1198,6 +1198,18 @@ fn process_element_chunk_messages(frame: &mut SimFrameInfo, sim_data: &mut SimDa
         }
         frame.element_chunk_messages.adds.clear_keep_capacity();
     }
+    // move（8B）{handle, gameCell}——原版 ProcessElementChunkMessages 顺序：move 在 modifies 之前（L116132-116223）
+    {
+        let bytes = frame.move_element_chunk_messages.as_slice();
+        let n = bytes.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let handle = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let gc = i32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            move_element_chunk(handle, gc, width);
+        }
+        frame.move_element_chunk_messages.clear_keep_capacity();
+    }
     // modifies（12B）{handle, temperature, heatCapacity}
     {
         let mods = frame.element_chunk_messages.modifies.as_slice();
@@ -1236,18 +1248,6 @@ fn process_element_chunk_messages(frame: &mut SimFrameInfo, sim_data: &mut SimDa
             modify_element_chunk_adjuster(handle, t, hc, tc);
         }
         frame.modify_element_chunk_adjuster_messages.clear_keep_capacity();
-    }
-    // move（8B）{handle, gameCell}
-    {
-        let bytes = frame.move_element_chunk_messages.as_slice();
-        let n = bytes.len() / 8;
-        for i in 0..n {
-            let off = i * 8;
-            let handle = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-            let gc = i32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
-            move_element_chunk(handle, gc, width);
-        }
-        frame.move_element_chunk_messages.clear_keep_capacity();
     }
     // removes（8B）{handle, callbackIdx}
     {
