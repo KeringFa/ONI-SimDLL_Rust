@@ -4,6 +4,7 @@
 //! C2 阶段：真实物理模拟（温度/液体/气体/辐射/疾病）。
 
 pub mod building_temperature;
+pub mod building_to_building;
 pub mod conduit_temperature;
 pub mod element_chunk;
 pub mod frame_processor;

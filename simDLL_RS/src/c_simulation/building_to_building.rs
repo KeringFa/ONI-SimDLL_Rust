@@ -1,0 +1,290 @@
+//! BuildingToBuildingHeatExchange（导热板）——原版 L138358-138640。
+//! C# 侧 StructureToStructureTemperature 注册/增删接触；sim 侧做建筑↔建筑换热与过热事件。
+//! 任务 1：注册表（Register/AddContact/RemoveContact/Unregister）；任务 3：Update 换热。
+use crate::a_framework::sim_data::SimData;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
+/// 接触条目：{buildingInContact handle, cellsInContact}（原版 InContactBuildingData，8B）。
+#[derive(Clone, Copy, Debug)]
+pub struct ContactEntry {
+    pub handle: i32,
+    pub cells_in_contact: i32,
+}
+
+/// 单条导热板记录（原版 BuildingToBuildingHeatExchangeData 40B）：
+/// heatExchange_handle 关联建筑温度句柄；contacts 为接触建筑列表。
+#[derive(Clone, Debug)]
+pub struct BuildingToBuildingRecord {
+    pub heat_exchange_handle: i32,
+    pub contacts: Vec<ContactEntry>,
+}
+
+/// 导热板管理器（全局单例，非 SimData 成员；仅 sim 线程访问）。
+/// 注册表模式同 BuildingTemperatureManager：版本句柄、free list、swap-remove。
+pub struct BuildingToBuildingManager {
+    records: Vec<BuildingToBuildingRecord>,
+    items: Vec<i32>,
+    versions: Vec<u8>,
+    free_handles: Vec<i32>,
+}
+
+impl BuildingToBuildingManager {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            items: Vec::new(),
+            versions: Vec::new(),
+            free_handles: Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.items.clear();
+        self.versions.clear();
+        self.free_handles.clear();
+    }
+
+    /// 校验 handle 并返回只读记录。
+    pub fn record(&self, handle: i32) -> Option<&BuildingToBuildingRecord> {
+        let index = (handle & 0xffffff) as usize;
+        let version = ((handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return None;
+        }
+        let ri = self.items[index];
+        if ri < 0 {
+            return None;
+        }
+        self.records.get(ri as usize)
+    }
+
+    fn get_mut(&mut self, handle: i32) -> Option<&mut BuildingToBuildingRecord> {
+        let index = (handle & 0xffffff) as usize;
+        let version = ((handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return None;
+        }
+        let ri = self.items[index];
+        if ri < 0 {
+            return None;
+        }
+        self.records.get_mut(ri as usize)
+    }
+
+    /// Register（原版 L138121）：校验建筑句柄 → 分配空记录。
+    pub fn register(&mut self, callback_idx: i32, heat_exchange_handle: i32) -> i32 {
+        if crate::c_simulation::building_temperature::record(heat_exchange_handle).is_none() {
+            return -1;
+        }
+        let ri = self.records.len();
+        let handle = if let Some(h) = self.free_handles.pop() {
+            let index = (h & 0xffffff) as usize;
+            self.items[index] = ri as i32;
+            h
+        } else {
+            let index = self.items.len();
+            self.items.push(ri as i32);
+            self.versions.push(0);
+            index as i32
+        };
+        self.records.push(BuildingToBuildingRecord {
+            heat_exchange_handle,
+            contacts: Vec::new(),
+        });
+        let _ = callback_idx;
+        handle
+    }
+
+    /// Add（原版 L137831）：追加接触 {buildingInContact, cellsInContact}。
+    pub fn add_contact(
+        &mut self,
+        self_handle: i32,
+        building_in_contact: i32,
+        cells_in_contact: i32,
+    ) -> bool {
+        let Some(rec) = self.get_mut(self_handle) else {
+            return false;
+        };
+        rec.contacts.push(ContactEntry {
+            handle: building_in_contact,
+            cells_in_contact,
+        });
+        true
+    }
+
+    /// RemoveInContact（原版 L138193）：从接触列表移除。
+    pub fn remove_contact(&mut self, self_handle: i32, building_in_contact: i32) -> bool {
+        let Some(rec) = self.get_mut(self_handle) else {
+            return false;
+        };
+        rec.contacts.retain(|c| c.handle != building_in_contact);
+        true
+    }
+
+    /// Unregister（原版 L138337）：版本+1、free list、swap-remove。
+    pub fn unregister(&mut self, handle: i32) -> bool {
+        let index = (handle & 0xffffff) as usize;
+        let version = ((handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return false;
+        }
+        let ri = self.items[index];
+        if ri < 0 {
+            return false;
+        }
+        let new_version = version.wrapping_add(1);
+        self.versions[index] = new_version;
+        self.free_handles
+            .push(((new_version as i32) << 24) | (index as i32 & 0xffffff));
+        self.items[index] = -1;
+        let ri = ri as usize;
+        let last = self.records.len() - 1;
+        if ri != last {
+            self.records.swap(ri, last);
+            for it in self.items.iter_mut() {
+                if *it == last as i32 {
+                    *it = ri as i32;
+                    break;
+                }
+            }
+        }
+        self.records.pop();
+        true
+    }
+}
+
+impl Default for BuildingToBuildingManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===== 全局单例 =====
+
+static B2B_MANAGER: Lazy<Mutex<BuildingToBuildingManager>> =
+    Lazy::new(|| Mutex::new(BuildingToBuildingManager::new()));
+
+/// 清空全部状态（CleanUp 时调用）。
+pub fn clear_building_to_building() {
+    B2B_MANAGER.lock().clear();
+}
+
+/// 处理 RegisterBuildingToBuildingHeatExchange 消息（原版 L138121）。
+pub fn register_building_to_building(callback_idx: i32, heat_exchange_handle: i32) -> i32 {
+    B2B_MANAGER
+        .lock()
+        .register(callback_idx, heat_exchange_handle)
+}
+
+/// 处理 AddInContactBuildingToBuildingToBuildingHeatExchange 消息（原版 L137831）。
+pub fn add_building_to_building_contact(
+    self_handle: i32,
+    building_in_contact: i32,
+    cells_in_contact: i32,
+) -> bool {
+    B2B_MANAGER
+        .lock()
+        .add_contact(self_handle, building_in_contact, cells_in_contact)
+}
+
+/// 处理 RemoveBuildingInContactFromBuildingToBuildingHeatExchange 消息（原版 L138193）。
+pub fn remove_building_in_contact(self_handle: i32, building_in_contact: i32) -> bool {
+    B2B_MANAGER
+        .lock()
+        .remove_contact(self_handle, building_in_contact)
+}
+
+/// 处理 RemoveBuildingToBuildingHeatExchange 消息（原版 L138337）。
+pub fn remove_building_to_building(handle: i32) -> bool {
+    B2B_MANAGER.lock().unregister(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a_framework::sim_data::SimData;
+    use crate::a_framework::sim_events::AddBuildingHeatExchangeMsg;
+    use crate::b_elements::element::{Element, ElementTemperatureData};
+    use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
+    use crate::c_simulation::building_temperature::{add_building, record};
+    use crate::LIB_TESTS_LOCK;
+
+    /// 元素表：elem5 SHC=2.0、TC=4.0、highTemp=5000、lowTemp=200（同 building_temperature::tests）。
+    /// 注册 9 个建筑（句柄 0..8）。
+    fn init_building_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.element_names.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        let mut etd = ElementTemperatureData::default();
+        etd.state = 2;
+        etd.specific_heat_capacity = 2.0;
+        etd.thermal_conductivity = 4.0;
+        etd.high_temp = 5000.0;
+        etd.low_temp = 200.0;
+        table.elements.resize(6, Element::default());
+        table.temperature_data.resize(6, ElementTemperatureData::default());
+        table.temperature_data[5] = etd;
+        drop(table);
+        for _ in 0..9 {
+            add_building(&bldg_msg(300.0, 1000.0, 4.0));
+        }
+    }
+
+    /// 面积 1：mass=total_hc/2（SHC=2）→ totalHC 精确；msgTC=tc/4（元素 TC=4）→ 记录 TC 精确。
+    fn bldg_msg(temp: f32, total_hc: f32, tc: f32) -> AddBuildingHeatExchangeMsg {
+        AddBuildingHeatExchangeMsg {
+            callback_idx: -1,
+            elem_idx: 5,
+            pad0: 0,
+            pad1: 0,
+            mass: total_hc / 2.0,
+            temperature: temp,
+            thermal_conductivity: tc / 4.0,
+            overheat_temperature: 2000.0,
+            operating_kilowatts: 0.0,
+            min_x: 1,
+            min_y: 2,
+            max_x: 2,
+            max_y: 3,
+        }
+    }
+
+    fn make_sim() -> SimData {
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        sd.debug_properties.building_to_building_temperature_scale = 100.0;
+        sd
+    }
+
+    #[test]
+    fn register_and_contacts_and_unregister() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_building_table();
+        let mut mgr = BuildingToBuildingManager::new();
+        // Register：校验建筑句柄存在（callbackIdx 回调由 frame_processor 负责，见任务 4）
+        let h = mgr.register(-1, 7);
+        assert_eq!(h & 0xffffff, 0);
+        assert_eq!(mgr.record(h).unwrap().heat_exchange_handle, 7);
+        // AddContact
+        assert!(mgr.add_contact(h, 8, 3));
+        assert_eq!(mgr.record(h).unwrap().contacts.len(), 1);
+        assert_eq!(mgr.record(h).unwrap().contacts[0].handle, 8);
+        assert_eq!(mgr.record(h).unwrap().contacts[0].cells_in_contact, 3);
+        // RemoveContact
+        assert!(mgr.remove_contact(h, 8));
+        assert_eq!(mgr.record(h).unwrap().contacts.len(), 0);
+        // Unregister
+        assert!(mgr.unregister(h));
+        assert!(mgr.record(h).is_none());
+        // 无效建筑句柄 → 注册失败
+        assert_eq!(mgr.register(-1, 0x12345678), -1);
+    }
+}

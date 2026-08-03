@@ -331,6 +331,11 @@ pub fn add_building(msg: &AddBuildingHeatExchangeMsg) -> i32 {
     BUILDING_TEMPERATURE_MANAGER.lock().add(msg)
 }
 
+/// 只读访问建筑温度记录快照（供 BuildingToBuilding 等校验/读取）。
+pub fn record(handle: i32) -> Option<BuildingTemperatureRecord> {
+    BUILDING_TEMPERATURE_MANAGER.lock().record(handle).copied()
+}
+
 /// 处理 ModifyBuildingHeatExchange 消息。
 pub fn modify_building(handle: i32, msg: &AddBuildingHeatExchangeMsg) -> bool {
     BUILDING_TEMPERATURE_MANAGER.lock().modify(handle, msg)
