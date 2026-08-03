@@ -1,4 +1,4 @@
-# simDLL_RS 重写模块全量分类（2026-08-02）
+# simDLL_RS 重写模块全量分类（2026-08-02 初版，2026-08-03 修订）
 
 分类依据：模块在模拟链路中的职责层次。
 
@@ -48,7 +48,16 @@
 | c_simulation/building_temperature.rs | 建筑温度句柄（AddBuildingHeatExchange 注册链） | 完成（2026-08-02 20:40） |
 | c_simulation/conduit_temperature.rs | 管道温度管理器（水珠/气珠温度权威 + 换热 + 相变句柄） | 完成（2026-08-02 20:14） |
 | ElementConsumer（sim_data.rs/frame_processor.rs） | 水泵吸水链（注册→BFS 消费→consumedMassInfo） | 完成（2026-08-02 17:49） |
-| ElementEmitter（部分） | emittedMassInfo 容器已建 | 本体未实现 |
+| c_simulation/element_chunk.rs | 碎片组件（注册表/消息/ExchangeHeatEnergyWithWorld/Update/输出） | 完成（2026-08-03） |
+| c_simulation/building_to_building.rs | 导热板（BuildingToBuildingHeatExchange 注册+接触+Update） | 完成（2026-08-03） |
+| ElementEmitter（部分） | emittedMassInfo 容器已建 | 本体未实现（剩余清单 #1） |
+
+### 组件层子系统归属（2026-08-03 修订）
+
+管道子系统（conduit/building 温度管理器 + ElementConsumer）与碎片（ElementChunk）、导热板
+（BuildingToBuilding）同属 **C1**——它们全是"C# 与格子物理之间的接线"：注册表/句柄/消息路由/
+温度权威，不直接迭代格子状态。完整索引见
+`docs/superpowers/2026-08-03-module-index.md`。
 
 ### 管道子系统为何归 C1
 
@@ -66,26 +75,29 @@
 
 | 模块 | 内容 | 状态 |
 |------|------|------|
-| c2_physics/liquid_flow.rs | 液体流动全套（扩散/液滴/超压/蒸发/Flood/挤压/分层） | 完成 |
+| c2_physics/liquid_flow.rs | 液体流动全套（扩散/液滴/超压/蒸发/Flood/挤压/分层/offgas/升华挂接） | 完成 |
 | c2_physics/property_texture.rs | 液体/流动/日照纹理 | 完成 |
-| 温度更新（原版 04_temperature.c） | 格子温度演化 | 未实现 |
-| 气体流动（原版 14_liquid_gas_flow.c 气体侧） | 气体物理 | 未实现 |
-| 相变（原版 15_phase_change.c） | 沸腾/冻结/升华/熔融 | 未实现 |
+| c2_physics/temperature.rs | 温度域全套（建筑换热/方格↔方格/背墙/相变/升华/部分沸腾/部分熔化/加载修正） | 完成（2026-08-03） |
+| 气体流动（原版 14_liquid_gas_flow.c 气体侧） | 气体物理（PostProcessCell 气体分支部分就绪） | 未实现 |
 | 辐射 | 辐射吸收/衰减 | 未实现 |
-| 疾病模拟 | 病菌传播 | 简化 |
+| 疾病模拟 | 病菌传播 | 简化（已知偏差） |
+| add_solid 垂直位移（排液口/网格砖机制） | DoVerticalDisplacement | 用户裁决暂不做 |
 
-## 液体剩余项（截至 2026-08-02）
+## 剩余清单（2026-08-03 修订）
 
 已完成并经用户实测：水平扩散、液滴轨道、超压（DoPressureBreak + 上下分支）、满格过压、
 蒸发清理、Flood 系列、超压破坏漏水、建砖挤压、密度分层、合并/沉降、0.0mcg 残留修复、
-液体纹理、管道输送。
+液体纹理、管道输送、温度域全闭合（建筑/方格/背墙/碎片/导热板换热 + 相变 + 升华/offgas +
+分批沸腾/熔化 + 加载修正 + Emitting 显示链路）。
 
 剩余：
 1. ElementEmitter 组件本体（喷口/排液口类建筑逐帧发射 + emittedMassInfo）——排液口滴液
    正常是因为走 C# vent→世界路径；该组件服务其他建筑类型。
-2. 温度→格子级相变（液体沸腾/冻结；管道内容相变 frozen/melted 已实现）。
-3. 升华/持续蒸发（post_process_data 的 sublimate_rate / off_gas_percentage 路径）。
-4. add_solid 垂直位移（排液口/网格砖机制）——用户裁决暂不做。
-5. 已知偏差：病菌混合简化、powf alpha、压力循环门控、post_process NaN 防御、
+2. 气体流动（14_liquid_gas_flow.c 气体侧）——PostProcessCell 气体分支（密度置换、
+   DoPartialMelt、DoSublimation 挂接）已就绪，UpdateGas 等主体未实现。
+3. 辐射。
+4. 疾病传播全量（当前简化：无 gDisease 表）。
+5. add_solid 垂直位移——用户裁决暂不做。
+6. 已知偏差：病菌混合简化、powf alpha、压力循环门控、post_process NaN 防御、
    visible_grid 屏幕外开销、元素表每格加锁性能、液体-液体压差（原版同款）。
-6. 气体分层行为（DoDensityDisplacement 对气体生效）——用户判定保留。
+7. 气体分层行为（DoDensityDisplacement 对气体生效）——用户判定保留。

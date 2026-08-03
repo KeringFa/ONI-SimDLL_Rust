@@ -285,3 +285,11 @@
   （上/左/右与下方液/气不换热）、变温板无法均温、导热板中心格无法换热。
 - **后续（温度域至此闭合）**：ElementEmitter 本体（C1 组件）、气体物理、碎片 disease/辐射；
   另按约定在温度域收尾后做一次 A/B/C1/C2 分类整理 + "模块→文件→原版行号"索引。
+
+## [已完成] A/B/C1/C2 分类整理 + 模块索引（2026-08-03）
+
+- 分类表修订：docs/superpowers/2026-08-02-module-classification.md（温度域/碎片/导热板/
+  升华/offgas/Emitting 链路全部归位；剩余清单更新为 7 项）。
+- 新增索引：docs/superpowers/2026-08-03-module-index.md —— 模块→项目文件→原版位置
+  （split 文件:行号 + SimDLL_Source.c 行号），A/B/C1/C2 四类全覆盖 + 已知偏差维护提醒。
+- 后续（剩余清单 #1）：ElementEmitter 本体（04_temperature.c L1609-2000）。
