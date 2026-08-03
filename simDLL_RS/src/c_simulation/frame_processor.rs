@@ -560,7 +560,76 @@ fn process_cell_world_zone_modifications(frame: &mut SimFrameInfo, sim_data: &mu
 
 // ===== C2 桩子函数 =====
 
-fn process_cell_energy_modifications(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+/// ProcessCellEnergyModifications（原版 06_process_messages.c L134-211）。
+/// 每条 16B：cellIdx i32 / kilojoules f32 / maxTemperature f32 / id i32（id 仅日志）。
+/// ΔT = kilojoules/(mass×SHC)；new = min(旧+ΔT, max(旧, maxT))；钳制 [1,10000]；写后 DoStateTransition。
+fn process_cell_energy_modifications(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    let game_w = sim_data.width - 2;
+    if game_w <= 0 {
+        frame.cell_energy_modifications.clear_keep_capacity();
+        return;
+    }
+    if sim_data.updated_cells.ptr.is_null() || sim_data.sim_events.ptr.is_null() {
+        frame.cell_energy_modifications.clear_keep_capacity();
+        return;
+    }
+    let slice = frame.cell_energy_modifications.as_slice();
+    let n = slice.len() / 16;
+    for i in 0..n {
+        let base = i * 16;
+        let cell_idx =
+            i32::from_le_bytes([slice[base], slice[base + 1], slice[base + 2], slice[base + 3]]);
+        let kj = f32::from_le_bytes([
+            slice[base + 4],
+            slice[base + 5],
+            slice[base + 6],
+            slice[base + 7],
+        ]);
+        let max_temp = f32::from_le_bytes([
+            slice[base + 8],
+            slice[base + 9],
+            slice[base + 10],
+            slice[base + 11],
+        ]);
+        let internal = (cell_idx % game_w + 1) + (cell_idx / game_w + 1) * sim_data.width;
+        let cell = internal as usize;
+        let updated = unsafe { &*sim_data.updated_cells.ptr };
+        if cell >= updated.mass.len() || cell >= updated.temperature.len() {
+            continue;
+        }
+        let elem = updated.element_idx.get(cell);
+        let Some(etd) = crate::b_elements::elements_table::get_element_temperature_data(elem) else {
+            continue;
+        };
+        if (etd.state & 3) == 0 {
+            continue; // 真空
+        }
+        let mass = updated.mass.get(cell);
+        if mass <= 0.001 || kj <= 0.0 {
+            continue;
+        }
+        let temp = updated.temperature.get(cell);
+        let cap = temp.max(max_temp);
+        let mut new_temp = temp + kj / (mass * etd.specific_heat_capacity);
+        new_temp = new_temp.min(cap);
+        if new_temp <= 0.0 || new_temp > 10000.0 {
+            tracing::warn!(
+                cell,
+                kj,
+                max_temp,
+                mass,
+                temp,
+                new_temp,
+                "ProcessCellEnergyModifications: invalid temperature"
+            );
+            new_temp = new_temp.clamp(1.0, 10000.0);
+        }
+        if new_temp > 0.0 {
+            let updated = unsafe { &mut *sim_data.updated_cells.ptr };
+            updated.temperature.set(cell, new_temp);
+            crate::c2_physics::temperature::do_state_transition(sim_data, cell, &etd);
+        }
+    }
     frame.cell_energy_modifications.clear_keep_capacity();
 }
 
@@ -1622,6 +1691,98 @@ mod tests {
         assert_eq!(insulation_u8(0.01), 2); // 0.01×255 = 2.55 → 2（隔热砖）
         assert_eq!(insulation_u8(0.5), 127); // 127.5 → 127
         assert_eq!(insulation_u8(-1.0), 0); // 负值截断为 0
+    }
+
+    #[test]
+    fn cell_energy_modification_heats_cell_and_caps() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.resize(4, Default::default());
+            table.temperature_data[1].state = 2; // 液体
+            table.temperature_data[1].specific_heat_capacity = 4.179;
+            table.temperature_data[1].low_temp = 0.0;
+            table.temperature_data[1].high_temp = 1000.0; // 避免 do_state_transition 立即转换
+        }
+        // gameCell 0 → sim cell 7；50kg 液体 300K
+        let mut sd = make_test_sim_data();
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(7, 1);
+            u.mass.set(7, 50.0);
+            u.temperature.set(7, 300.0);
+        }
+        let mut frame = SimFrameInfo::default();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&500.0f32.to_le_bytes());
+        buf.extend_from_slice(&3200.0f32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        for b in buf {
+            frame.cell_energy_modifications.push(b);
+        }
+        process_cell_energy_modifications(&mut frame, &mut sd);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert!(
+            (u.temperature.get(7) - 302.39).abs() < 0.05,
+            "ΔT=500/(50×4.179)≈2.39 → 302.39，got {}",
+            u.temperature.get(7)
+        );
+        // cap 生效：maxT=301 → 302.39 被压到 301
+        let mut frame = SimFrameInfo::default();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&500.0f32.to_le_bytes());
+        buf.extend_from_slice(&301.0f32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        for b in buf {
+            frame.cell_energy_modifications.push(b);
+        }
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.temperature.set(7, 300.0);
+        }
+        process_cell_energy_modifications(&mut frame, &mut sd);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert!(
+            (u.temperature.get(7) - 301.0).abs() < 1e-4,
+            "cap 生效，got {}",
+            u.temperature.get(7)
+        );
+    }
+
+    #[test]
+    fn cell_energy_modification_skips_vacuum_and_tiny_mass() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.resize(4, Default::default());
+            table.temperature_data[1].state = 2;
+            table.temperature_data[1].specific_heat_capacity = 4.179;
+            table.temperature_data[1].low_temp = 0.0;
+            table.temperature_data[1].high_temp = 1000.0;
+        }
+        let mut sd = make_test_sim_data();
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(7, 0); // 真空
+            u.mass.set(7, 0.0);
+            u.temperature.set(7, 300.0);
+        }
+        let mut frame = SimFrameInfo::default();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&500.0f32.to_le_bytes());
+        buf.extend_from_slice(&3200.0f32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        for b in buf {
+            frame.cell_energy_modifications.push(b);
+        }
+        process_cell_energy_modifications(&mut frame, &mut sd);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.temperature.get(7), 300.0, "真空不应加热");
     }
 
     #[test]
