@@ -263,3 +263,25 @@
   C# 侧元素表数据（offGasPercentage 等）；本项目收到的元素字节与原版逐字节一致，无需处理。
 - **残留待清理**：temperature.rs L522 有一条一次性 "temperature task diagnostic (first run)"
   诊断日志（此前调试遗留，仅首次运行输出，无害）；确认后即可删除。
+
+## [待实测] 温度模块补全（2026-08-03）
+
+- 规格：docs/superpowers/specs/2026-08-03-temperature-completion-design.md（cb58b4f）
+- 计划：docs/superpowers/plans/2026-08-03-temperature-completion.md（ceab18c）
+- ① DoLoadTimeStateTransition（L7-73，57410fe）：加载温度越界 [low−3, high+3] 时 ±1.5 换元素，
+  save_load 逐格已接线，删除旧空桩。
+- ② DoPartialHeatTransition（L2105-2471，12cafb9）：大格≥5kg 遇极热邻格分批沸腾 5kg
+  （气体→下方格 DisplaceGas；液体→SpawnFallingLiquid 液滴，失败就地转化；失败全额恢复）；
+  PostProcessCell 液体分支四方向接线（L2705-2721）。
+- ③ DoPartialMelt（L2471-2662，54a9664）：极热气体格真实熔化相邻固体 5kg
+  （液滴/就地转化 + 双方温度质量病菌变化，扣尽 Evaporate）；气体分支置换门控改接完整版
+  （短路副作用与原版一致），删除旧判定近似。
+- ④ 透气砖/网格砖换热：**simDLL 通用原理**——SimTemperatureTransfer→AddElementChunk→
+  ElementChunk::Update 本格1.0 + 下方固体 groundTransferScale 0.0625；C# 仅注册不特判；
+  本项目 ElementChunk 已实现 → 无 sim 改动，纯验证。
+- 全量 407 测试串行全过；release 构建成功。
+- **待实测**：① 加载越界存档格被修正；② 大质量水/污染水被火山气体加热分批沸腾（5kg/批）；
+  ③ 热气体熔化固体（液滴 + 双方变化）；④ 真空透气砖/网格砖仅与下方密实方块换热
+  （上/左/右与下方液/气不换热）、变温板无法均温、导热板中心格无法换热。
+- **后续（温度域至此闭合）**：ElementEmitter 本体（C1 组件）、气体物理、碎片 disease/辐射；
+  另按约定在温度域收尾后做一次 A/B/C1/C2 分类整理 + "模块→文件→原版行号"索引。
