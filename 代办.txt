@@ -219,3 +219,47 @@
 - **待实测**：部署 DLL → ① 导热板中心格在真空与任何事物换热；② 出入口只与方块换热；
   ③ 两导热板相邻互通；④ 温度收敛与原版一致。
 - **后续**：升华/持续蒸发、ElementEmitter 本体、透气砖/网格砖特殊换热、碎片 disease/辐射。
+
+## [已完成] 升华/持续蒸发（offgas）（2026-08-03 内联执行，用户实测验收）
+
+- 规格：docs/superpowers/specs/2026-08-03-sublimation-design.md（cfd8c85）
+- 计划：docs/superpowers/plans/2026-08-03-sublimation.md（04636fe）
+- **已实现（严格对照原版 SimDLL_Source.c，未抄神秘版本）**：
+  - DoSublimation（L148591-148880，自然格/气体/真空格）：四邻 [下,右,左,上] 固体砖 +
+    sublimateIndex 有效才消耗 randomSeed；概率门；rate×0.2/格；1.8kg 上限缩放（room<f20 →
+    f21 等比缩放）；病菌按比例转移；异种气体 DisplaceGas；入口元素快照（sVar4 读一次）；
+    bVar16 fall-through 怪癖（displace 失败但先前有成功 → 仍扣质量不产气）；整格消耗就地转气体；
+    accumulatedFlow[nb] += f21 + SpawnFX 方位角（-90/180/90/0）；
+  - 液体 offgas 内联段（PostProcessCell L2722-2863 / L149677-149834）：下方格条件
+    （mass<1.8、sublimateIndex≠0xffff、下方真空/气体）、props&1 门、randomSeed 消耗顺序、
+    上方格更重重算 fVar24（bVar9）、DisplaceGas 前置、1.8-efficiency 缩放、病菌合并判定、
+    主路径 emit_sublimate_gas + accumulatedFlow[cell] += fVar24；耗尽路径（就地转化 +
+    cell-width 差额补足，**不累积** flow）+ SpawnFX。
+- **250kg bug 根因**（已修复，5cfe12d）：update_pressure 缺少异元素门控，f18=flow×(mass_cell
+  −mass_neighbor) 把液体质量加进异元素气体格 → 水直接变污染氧直到 250/250。修复：接收格
+  元素≠源格且非真空 → 返回 0（对照原版 L144628-144655）。
+- **Emitting 显示 bug 根因**（已修复，e32af10，用户坚持研究后定位）：
+  C# 悬停显示 "Emitting {Element}: {FlowRate}" = Grid.AccumulatedFlow/3
+  （SelectToolHoverTextCard L745），读的是 **GameData.accumulatedFlow**；DoSublimation 写
+  **SimData.accumulatedFlow**。原版 CopySimDataToGame 每帧按行（去边界）memcpy SimData→
+  GameData，并用局部静态 tick_count 每 15 帧 memset 清零 SimData 源（3s 窗口 = 15×0.2s，
+  与 /3 折算每秒速率一致；原版 166.7g/s = 0.5kg 窗口 ÷ 3）。我们此前从未同步 → 恒显示 0。
+  已实现：copy_sim_data_to_game 增加按行去边界拷贝 + 15 帧清零（11_msvcrt_ignored.c
+  L32491-32498 镜像），含 2 条回归测试。
+- 全量 398 测试串行全过；release 构建成功；用户实测：氧石自然格持续出氧、500kg 污染水
+  出 0.5kg 污染氧且停在 499.5kg、250/250 转换不再出现。
+- **待实测**：部署 e32af10 DLL → 悬停污染水/氧石格应短暂显示 "Emitting Polluted Oxygen:
+  166.7"（挥发动画前 1 帧级闪现，与原版窗口语义一致）。
+- **后续**：ElementEmitter 本体、透气砖/网格砖特殊换热、碎片 disease/辐射。
+
+## [已完成] 升华/offgas 模块对照审查（2026-08-03 内联）
+
+- DoSublimation（自然格）+ PostProcessCell 液体 offgas 内联段逐行对照 SimDLL_Source.c，
+  无 Critical/Important 差异；bVar16 怪癖、randomSeed 消耗顺序、1.8 上限缩放、病菌比例、
+  DisplaceGas 前置、耗尽路径不累积、SpawnFX 方位角全部吻合。
+- 累积流两条写点（L148766 自然格 / L149803 液体主路径）均已在 sim 侧镜像；缺口仅在
+  SimData→GameData 同步（上条已修）。
+- 眼冒金星 DLC 与单星差异不在 sim 代码分支（DoSublimation 无 DLC 分支），差异来自
+  C# 侧元素表数据（offGasPercentage 等）；本项目收到的元素字节与原版逐字节一致，无需处理。
+- **残留待清理**：temperature.rs L522 有一条一次性 "temperature task diagnostic (first run)"
+  诊断日志（此前调试遗留，仅首次运行输出，无害）；确认后即可删除。
