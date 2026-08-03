@@ -198,3 +198,24 @@
 - ⑥ 碎片 maxEnergyScale 除零防御（thickness=0 → factor=0，原版 inf/nan）。
 
 > 以上均为无害等价差异；若日后出现相关异常，回归原版原理时先检查这些位置。
+
+## [已完成] 温度模块·导热板 BuildingToBuildingHeatExchange（2026-08-03 内联执行）
+
+- 规格：docs/superpowers/specs/2026-08-03-building-to-building-design.md（1eb865f）
+- 计划：docs/superpowers/plans/2026-08-03-building-to-building.md（c09378e）
+- **已实现（严格对照原版 SimDLL_Source.c，未抄神秘版本）**：
+  - 注册表（版本句柄 + free list + swap-remove）：BuildingToBuildingRecord 40B
+    （heatExchange_handle + contacts Vec<{buildingInContact, cellsInContact}>）；
+    消息 Register 8B（callbackIdx≠-1 → componentStateChanged，注册失败推 sim_handle=-1）、
+    RemoveInContact 8B、AddInContact 12B（原 8B 修正）、Remove 8B（回调恒推 -1）；
+    ProcessFrame 顺序 adds→modifies→addInContact→removes（L116540-116650）；
+  - Update（L138358-138640）：building 数据经 heatExchange_handle 查；min/max_seen 遍历接触；
+    k=dt×scale×contactTC×bldgTC×(contactT−bldgT)×暖侧HC×0.005；能量守恒取 min(|Δ|×HC)
+    （带 k 符号）+ 交叉热容加权平均钳制；过热事件只发接触方（buildingOverheatInfo /
+    buildingNoLongerOverheatedInfo）；写回经 change_building_temperature（L136853）；
+  - 挂载 update_data 组件阶段末尾（与原版 L145434 同一组件循环）。
+- **勘误记录**：测试能量守恒容差取 0.1（f32 舍入：量级 ~6.7e4，守恒偏差 ~0.03，相对 <5e-7）。
+- 全量 376 测试串行全过；release 构建成功（任务 5 轮）。
+- **待实测**：部署 DLL → ① 导热板中心格在真空与任何事物换热；② 出入口只与方块换热；
+  ③ 两导热板相邻互通；④ 温度收敛与原版一致。
+- **后续**：升华/持续蒸发、ElementEmitter 本体、透气砖/网格砖特殊换热、碎片 disease/辐射。
