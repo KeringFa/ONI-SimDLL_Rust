@@ -1026,9 +1026,179 @@ pub(crate) fn push_spawn_fx(sim: &mut SimData, sim_cell: usize, fx_id: i32, rota
     }
 }
 
-/// DoSublimation 的相变发射部分（原版 L2722-2863）—— 相变留桩，
-/// 但 accumulatedFlow 累加（L2831）在 post_process_cell 内单独实现。
-fn do_sublimation_stub(_sim: &mut SimData, _cell: usize) {}
+/// DoSublimation（原版 SimDLL_Source.c L148591-148880）——自然固体格升华。
+/// 由真空/气体格驱动（PostProcessCell 真空/气体分支末尾调用）：检查四邻固体砖
+/// （上/右/左/下），概率门通过后把砖块质量以升华产物气体形式转移到调用格。
+fn do_sublimation(sim: &mut SimData, cell: usize) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim.width as usize;
+    let height = sim.height as usize;
+    if width < 3 || height < 3 || cell < width {
+        return;
+    }
+    let total = width * height;
+    // 入口（L148633）：调用格质量 < 1.8（mass <= 1.8 && mass != 1.8）
+    let entry_mass = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        if cell >= updated.mass.len() {
+            return;
+        }
+        updated.mass.get(cell)
+    };
+    if entry_mass >= 1.8 {
+        return;
+    }
+    // 入口快照（L148650 sVar4 读一次；param_4->state 用入口 ppd）
+    let (entry_elem, entry_state) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        let elem = updated.element_idx.get(cell);
+        match elements_table::get_element_post_process_data(elem) {
+            Some(p) => (elem, p.state & 3),
+            None => return,
+        }
+    };
+    let mut bvar16 = false;
+    // 四邻顺序 [cell+width, cell+1, cell-1, cell-width]（L148649-148652）
+    let neighbors = [
+        cell + width,
+        cell + 1,
+        cell.wrapping_sub(1),
+        cell.wrapping_sub(width),
+    ];
+    for &nb in &neighbors {
+        if nb >= total {
+            continue;
+        }
+        // 邻格：固体（state&3==3）且 sublimateIndex 有效才消耗 randomSeed（L148656-148662）
+        let nb_ppd = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            if nb >= updated.element_idx.len() {
+                continue;
+            }
+            match elements_table::get_element_post_process_data(updated.element_idx.get(nb)) {
+                Some(p) => p,
+                None => continue,
+            }
+        };
+        if (nb_ppd.state & 3) != 3 || nb_ppd.sublimate_index == 0xffff {
+            continue;
+        }
+        let rnd = next_random(sim);
+        if rnd > nb_ppd.sublimate_probability {
+            continue; // 原版 random <= probability（fVar18 < p || fVar18 == p）
+        }
+        let f3 = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            updated.mass.get(nb)
+        };
+        let f18 = nb_ppd.sublimate_rate * 0.2;
+        let mut f21 = f18.min(f3);
+        if f18 <= f3 - f21 {
+            // —— 部分转移分支（L148666-148791）——
+            let (disease_nb, temp_nb, disease_idx_nb) = {
+                let updated = unsafe { &*sim.updated_cells.ptr };
+                (
+                    updated.disease_count.get(nb),
+                    updated.temperature.get(nb),
+                    updated.disease_idx.get(nb),
+                )
+            };
+            let mut i15 = ((f21 / f3) * disease_nb as f32) as i32;
+            if entry_elem == nb_ppd.sublimate_index {
+                // 同种气体：1.8 上限缩放（L148681-148702）
+                let mut f20 = f21 * nb_ppd.sublimate_efficiency;
+                let room = {
+                    let updated = unsafe { &*sim.updated_cells.ptr };
+                    1.8 - updated.mass.get(cell)
+                };
+                if room < f20 {
+                    f21 = (room / f20) * f21;
+                    i15 = ((f21 / f3) * disease_nb as f32) as i32;
+                    f20 = room;
+                }
+                let updated = unsafe { &mut *sim.updated_cells.ptr };
+                add_mass_and_update_temperature(updated, cell, f20, temp_nb, disease_idx_nb, i15);
+                bvar16 = true;
+            } else {
+                // 异种/真空目标（L148705-148758）
+                let mut set_element = false;
+                if entry_state == 0 {
+                    set_element = true;
+                } else {
+                    let cur_elem = {
+                        let updated = unsafe { &*sim.updated_cells.ptr };
+                        updated.element_idx.get(cell)
+                    };
+                    if displace_gas(sim, cell, cur_elem) {
+                        set_element = true;
+                    }
+                }
+                if !set_element && !bvar16 {
+                    continue; // 无先前成功：跳过该邻格（L148758）
+                }
+                if set_element {
+                    // 换元素段（L148719-148753）
+                    let updated = unsafe { &mut *sim.updated_cells.ptr };
+                    updated.element_idx.set(cell, nb_ppd.sublimate_index);
+                    updated.mass.set(
+                        cell,
+                        updated.mass.get(cell) + f21 * nb_ppd.sublimate_efficiency,
+                    );
+                    updated.temperature.set(cell, temp_nb);
+                    updated.disease_idx.set(cell, disease_idx_nb);
+                    updated.disease_count.set(cell, i15);
+                    push_substance_change(sim, cell);
+                    bvar16 = true;
+                }
+                // 怪癖（L148758 fall-through）：displace 失败但 bvar16==true →
+                // 仍执行下方扣减段，目标格不产气（逐行镜像）。
+            }
+            // —— 共同扣减段（L148761-148791）——
+            {
+                let updated = unsafe { &mut *sim.updated_cells.ptr };
+                updated.mass.set(nb, updated.mass.get(nb) - f21);
+                let remain = updated.disease_count.get(nb) - i15;
+                if remain < 1 {
+                    clear_disease(updated, nb);
+                } else {
+                    updated.disease_count.set(nb, remain);
+                }
+            }
+            if !sim.accumulated_flow.ptr.is_null() {
+                let acc = unsafe { std::slice::from_raw_parts_mut(sim.accumulated_flow.ptr, total) };
+                acc[nb] += f21;
+            }
+            let dir = if nb == cell + width {
+                180.0
+            } else if nb == cell + 1 {
+                90.0
+            } else if nb == cell.wrapping_sub(1) {
+                -90.0
+            } else {
+                0.0
+            };
+            push_spawn_fx(sim, nb, nb_ppd.sublimate_fx, dir);
+            {
+                let updated = unsafe { &*sim.updated_cells.ptr };
+                if updated.mass.get(nb) <= 1e-09 {
+                    do_evaporate(sim, nb);
+                }
+            }
+        } else {
+            // —— 整格消耗分支（L148848-148866）：砖块就地转气体 ——
+            {
+                let updated = unsafe { &mut *sim.updated_cells.ptr };
+                updated.element_idx.set(nb, nb_ppd.sublimate_index);
+                updated.mass.set(nb, f3 * nb_ppd.sublimate_efficiency);
+            }
+            push_substance_change(sim, nb);
+            push_spawn_fx(sim, nb, nb_ppd.sublimate_fx, 0.0);
+            bvar16 = true;
+        }
+    }
+}
 
 /// DoUnstableCheck（塌方/下落检查，原版 L2537-2545）—— 留桩。
 fn do_unstable_check_stub(_sim: &mut SimData, _cell: usize) {}
@@ -1861,7 +2031,7 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
         if props_cell & 1 != 0 {
             return;
         }
-        do_sublimation_stub(sim, cell);
+        do_sublimation(sim, cell);
         return;
     }
 
@@ -1977,7 +2147,7 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                 }
             }
         }
-        do_sublimation_stub(sim, cell);
+        do_sublimation(sim, cell);
         return;
     }
 
@@ -2157,7 +2327,6 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
             }
         }
     }
-    do_sublimation_stub(sim, cell);
 }
 
 #[cfg(test)]
@@ -3720,6 +3889,110 @@ mod tests {
         assert!(!result.is_null(), "CreateElementsTable should succeed");
     }
 
+    /// 自建 8 元素升华表：
+    /// - 0：真空（state=0）
+    /// - 1：固体 A（state=3，sublimate_index=4→气体4，rate=0.4，eff=0.5，prob=1.0，fx=101）
+    /// - 2：固体 B（state=3，sublimate_index=5→气体5，rate=0.1，eff=0.2，prob=1.0，fx=102）
+    /// - 3：气体 X（state=1，molar=16）
+    /// - 4：气体 Y（state=1，molar=44）
+    /// - 5：气体 Z（state=1，molar=28）
+    /// - 6：普通固体（state=3，sublimate_index=0xFFFF，不升华）
+    /// - 7：液体（state=2，sublimate_index=5，prob=1.0，off_gas=0.5，eff=1.0，fx=107）
+    fn create_sublimate_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(8);
+        let elems = [
+            Element::default(),
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 3;
+                e.number_of_gradient_colors = 1;
+                e.sublimate_index = 4;
+                e.sublimate_rate = 0.4;
+                e.sublimate_efficiency = 0.5;
+                e.sublimate_probability = 1.0;
+                e.sublimate_fx = 101;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 2;
+                e.state = 3;
+                e.number_of_gradient_colors = 1;
+                e.sublimate_index = 5;
+                e.sublimate_rate = 0.1;
+                e.sublimate_efficiency = 0.2;
+                e.sublimate_probability = 1.0;
+                e.sublimate_fx = 102;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 3;
+                e.state = 1;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 16.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 4;
+                e.state = 1;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 44.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 5;
+                e.state = 1;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 28.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 6;
+                e.state = 3;
+                e.number_of_gradient_colors = 1;
+                e.sublimate_index = 0xffff;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 7;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e.sublimate_index = 5;
+                e.sublimate_probability = 1.0;
+                e.off_gas_percentage = 0.5;
+                e.sublimate_efficiency = 1.0;
+                e.sublimate_fx = 107;
+                e
+            },
+        ];
+        for elem in &elems {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..8 {
+            w.write_int(0);
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
     /// 简报基线：空元素表下 post_process_cell 不 panic（函数存在性验证）。
     #[test]
     fn post_process_cell_no_panic() {
@@ -3727,6 +4000,160 @@ mod tests {
         DestroyElementsTable(); // 元素表为空
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         post_process_cell(&mut sd, 14);
+    }
+
+    /// DoSublimation 入口（L148633）：调用格质量 >= 1.8 → 整函数跳过，randomSeed 不消耗。
+    #[test]
+    fn do_sublimation_skips_when_target_full() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 4);
+                buf.mass.set(14, 1.8);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1); // 有效升华邻格
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 300.0);
+            }
+        }
+        let seed_before = sd.random_seed;
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(20) - 100.0).abs() < 1e-4);
+        }
+        assert_eq!(sd.random_seed, seed_before, "满格不消耗 randomSeed");
+        DestroyElementsTable();
+    }
+
+    /// 同种气体合并（L148681-148702）：cell14=气体4 mass 1.0，上方砖 A（rate0.4→f18=0.08，eff0.5）。
+    /// 目标 += 0.08×0.5=0.04；砖格 -= 0.08；accumulated_flow[砖] += 0.08；
+    /// SpawnFX(砖, fx=101, rotation=180 上方)；同元素合并无 substance 事件；温度质量加权。
+    #[test]
+    fn do_sublimation_merges_same_element() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 4);
+                buf.mass.set(14, 1.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 250.0);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(14) - 1.04).abs() < 1e-4, "目标 += 0.04");
+            assert!((updated.mass.get(20) - 99.92).abs() < 1e-4, "砖格 -= 0.08");
+            assert!((updated.temperature.get(14) - 298.0769).abs() < 1e-3, "温度加权");
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!((acc[20] - 0.08).abs() < 1e-4, "accumulated_flow 累积在砖格");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 0, "同元素合并无 substance 事件");
+            assert_eq!(events.spawn_fx_info.len(), 1);
+            let fx = events.spawn_fx_info.get(0);
+            assert_eq!(fx.cell_idx, 9, "sim20 → game 9");
+            assert_eq!(fx.fx_id, 101);
+            assert_eq!(fx.rotation, 180.0, "上方邻格方向角");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 1.8 上限缩放（L148692-148702）：目标 1.79，room=0.01 < f20=0.04 →
+    /// f21 = 0.08×(0.01/0.04) = 0.02；目标恰好到 1.8，砖格只扣 0.02。
+    #[test]
+    fn do_sublimation_caps_at_1_8() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 4);
+                buf.mass.set(14, 1.79);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 300.0);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(14) - 1.8).abs() < 1e-5, "目标恰好 1.8");
+            assert!((updated.mass.get(20) - 99.98).abs() < 1e-4, "砖格扣缩放后的 0.02");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 真空换元素（L148719-148753）：cell14 真空 → 元素=4、质量 += 0.04、温度/病菌拷贝、
+    /// substance 事件；砖格扣 0.08、acc[20]+=0.08、SpawnFX 方向 180。
+    #[test]
+    fn do_sublimation_sets_element_in_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 0);
+                buf.mass.set(14, 0.0);
+                buf.temperature.set(14, 0.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 250.0);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 4, "真空格换成升华产物");
+            assert!((updated.mass.get(14) - 0.04).abs() < 1e-5);
+            assert!((updated.temperature.get(14) - 250.0).abs() < 1e-4, "温度拷贝自砖格");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1);
+            assert_eq!(events.substance_change_info.get(0).cell_idx, 5, "sim14 → game 5");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 病菌按比例（L148676-148679）：砖格 mass=0.5、病菌 100 → i15 = (0.08/0.5)×100 = 16。
+    /// 目标得病菌 idx 拷贝 + count=16；砖格病菌剩 84。
+    #[test]
+    fn do_sublimation_transfers_disease_proportionally() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 0);
+                buf.mass.set(14, 0.0);
+                buf.temperature.set(14, 0.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 0.5);
+                buf.temperature.set(20, 250.0);
+                buf.disease_idx.set(20, 3);
+                buf.disease_count.set(20, 100);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(20) - 0.42).abs() < 1e-5);
+            assert_eq!(updated.disease_count.get(20), 84);
+            assert_eq!(updated.disease_idx.get(14), 3, "病菌 idx 拷贝");
+            assert_eq!(updated.disease_count.get(14), 16, "病菌按比例转移");
+        }
+        DestroyElementsTable();
     }
 
     /// 挤压链路（用户观察）：液体格被固体挤压 → 质量**平均分配**给上下左右 4 格。
