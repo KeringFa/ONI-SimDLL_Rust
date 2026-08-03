@@ -632,7 +632,7 @@ fn update_neighbour_liquid_mass(
 /// AddMassAndUpdateTemperature（原版 11_msvcrt_ignored.c L33887-33994）。
 /// 目标格质量 += amount；温度按质量加权混合并钳制到 [min, max]；
 /// 病菌按 disease_idx/disease_count 转移（AddDiseaseToCell）。
-fn add_mass_and_update_temperature(
+pub(crate) fn add_mass_and_update_temperature(
     cells: &mut CellSOA,
     cell: usize,
     amount: f32,
@@ -983,7 +983,7 @@ pub(crate) fn clear_cell(sim: &SimData, cells: &mut CellSOA, cell: usize) {
 
 /// FastCalculateCombinedTemperature（原版 DoDensityDisplacement L1820 调用）——
 /// 两格同元素液体质量加权平均温度。
-fn fast_combined_temperature(mass_a: f32, temp_a: f32, mass_b: f32, temp_b: f32) -> f32 {
+pub(crate) fn fast_combined_temperature(mass_a: f32, temp_a: f32, mass_b: f32, temp_b: f32) -> f32 {
     (mass_a * temp_a + mass_b * temp_b) / (mass_a + mass_b)
 }
 
