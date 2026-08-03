@@ -294,7 +294,7 @@
   （split 文件:行号 + SimDLL_Source.c 行号），A/B/C1/C2 四类全覆盖 + 已知偏差维护提醒。
 - 后续（剩余清单 #1）：ElementEmitter 本体（04_temperature.c L1609-2000）。
 
-## [待实测] ElementEmitter + 火箭热 + AddSolid 垂直位移（2026-08-03）
+## [已完成] ElementEmitter + 火箭热 + AddSolid 垂直位移（2026-08-03 用户实测验收）
 
 - 规格：docs/superpowers/specs/2026-08-03-emitter-energy-addsolid-design.md（80cc55a）
 - 计划：docs/superpowers/plans/2026-08-03-emitter-energy-addsolid.md（e3fb04d）
@@ -308,6 +308,16 @@
   流星/AddRemoveSubstance 固体默认） / Type 1 OnlyIfSameElement / 其他 no-op；
   frame_processor 传 entry.flags；删除"四邻搜索混合版"。
 - 全量 418 测试串行全过；release 构建成功。
-- **待实测**：① 化肥机持续出天然气 + "Emitting" 状态 + 压力满 blocked 切换；
-  ② 火箭发射/降落地面 3×9 区域升温；③ 流星撞击生成固体方块（垂直位移落点）；
-  ④ 反应堆融毁核废料流星 + 3000°C 核废液 AddLiquid。
+- **用户实测验收**：石油发电机排污染水/CO2 正常；肥料合成器正常排天然气（甲烷 76°C，
+  偏移 (2,2) 位置）；加载/建造无崩溃。
+- **本批修复记录**：
+  1. 加载恢复瞬间 BuildingElementEmitter NRE（a7ba1aa 初修 + f5fd1af 根治）：
+     根因是 emitted_mass_info 的 copy_sim_data_to_game 用了 swap+clear_keep_capacity
+     （长度缩 0），无时间帧后 game 向量变空 → GDU emittedMassEntries=null → C# 无条件读取
+     NRE。原版是 resize game→sim 长度 + 拷贝 + sim 条目原地重置（保持长度），已镜像。
+  2. ElementEmitter Update row/col 转置（cf6df31）：modify 存 [row,col]，update 却按
+     col×width+row 计算且 BFS 参数反了，非对称发射格（肥料合成器 offset(2,2)）发错位置。
+     已修正 + 非对称格回归测试。
+- 全量 422 测试串行全过；release 构建成功。
+- **剩余清单更新**：ElementEmitter（#1）与 add_solid 垂直位移（#5）已闭合；
+  下一位是**气体流动**（#2，14_liquid_gas_flow.c 气体侧）。
