@@ -10,7 +10,9 @@ use crate::a_framework::sim_data::SimData;
 use crate::b_elements::element::{ElementTemperatureData, INVALID_ELEMENT_INDEX};
 use crate::b_elements::elements_table::{get_element_by_idx, get_element_temperature_data};
 use crate::c2_physics::liquid_flow::{clear_cell, push_substance_change};
-use crate::a_framework::game_data::{CellMeltedInfo, SpawnFallingLiquidInfo};
+use crate::a_framework::game_data::{
+    BackwallShouldTransitionInfo, CellMeltedInfo, SpawnFallingLiquidInfo,
+};
 
 /// SimEvents::SpawnOre（原版 L133682-133737）。只推事件，不扣质量/疾病（调用方扣）。
 ///
@@ -344,6 +346,113 @@ pub(crate) fn update_temperature_pair(sim: &mut SimData, cell_a: usize, cell_b: 
     }
 }
 
+/// UpdateTemperatureForBackwallExchange（原版 L134004-134079）。
+/// 格子内容物 ↔ 背墙层元素，因子 0.01；cell 写 updatedCells 增量、背墙温度直接写；
+/// 背墙温度越 [low−3, high+3] → backwallShouldTransitionInfo。
+pub(crate) fn update_temperature_for_backwall(sim: &mut SimData, cell: usize) {
+    if sim.cells.ptr.is_null()
+        || sim.updated_cells.ptr.is_null()
+        || sim.backwall.ptr.is_null()
+        || sim.sim_events.ptr.is_null()
+    {
+        return;
+    }
+    let (back_elem, t_cell, hc_cell, t_back, hc_back, k_total) = {
+        let c = unsafe { &*sim.cells.ptr };
+        let bw = unsafe { &*sim.backwall.ptr };
+        if cell >= c.element_idx.len() || cell >= bw.element_idx.len() {
+            return;
+        }
+        let cell_elem = c.element_idx.get(cell);
+        let back_elem = bw.element_idx.get(cell);
+        // 双方元素非真空/void（原版 L134024-134033）
+        if cell_elem == sim.vacuum_element_idx
+            || cell_elem == sim.void_element_idx
+            || back_elem == sim.vacuum_element_idx
+            || back_elem == sim.void_element_idx
+        {
+            return;
+        }
+        let (Some(etd_cell), Some(etd_back)) = (
+            get_element_temperature_data(cell_elem),
+            get_element_temperature_data(back_elem),
+        ) else {
+            return;
+        };
+        let hc_cell = c.mass.get(cell) * etd_cell.specific_heat_capacity;
+        let hc_back = bw.mass.get(cell) * etd_back.specific_heat_capacity;
+        if hc_cell <= 0.0 || hc_back <= 0.0 {
+            return;
+        }
+        let ins = c.insulation.get(cell) as f32;
+        let iv = ins * ins * 1.53787e-05;
+        let k_cell = iv * etd_cell.thermal_conductivity;
+        // 原版 L134045-134053：iv ≥ 1.0 → 几何平均；否则 min(k_cell, backTC)
+        let k = if iv >= 1.0 {
+            (k_cell * etd_back.thermal_conductivity).sqrt()
+        } else {
+            k_cell.min(etd_back.thermal_conductivity)
+        };
+        let mult_cell = surface_multiplier_backwall(&etd_cell, etd_back.state);
+        let mult_back = surface_multiplier_backwall(&etd_back, etd_cell.state);
+        (
+            back_elem,
+            c.temperature.get(cell),
+            hc_cell,
+            bw.temperature.get(cell),
+            hc_back,
+            k * mult_cell * mult_back,
+        )
+    };
+    // 原版 wrapper CalculateTemperatureExchange（L133079）自动按温度排序，返回 (new_back, new_cell)
+    let (new_back, new_cell) = if t_cell <= t_back {
+        let (nb, nc) = calculate_temperature_exchange_precise(
+            0.01,
+            k_total,
+            0.2,
+            t_cell,
+            hc_cell,
+            t_back,
+            hc_back,
+        );
+        (nb, nc)
+    } else {
+        let (nc, nb) = calculate_temperature_exchange_precise(
+            0.01,
+            k_total,
+            0.2,
+            t_back,
+            hc_back,
+            t_cell,
+            hc_cell,
+        );
+        (nb, nc)
+    };
+    unsafe {
+        let u = &mut *sim.updated_cells.ptr;
+        let c = &*sim.cells.ptr;
+        let mut v = (new_cell - c.temperature.get(cell)) + u.temperature.get(cell);
+        v = v.max(1.0).min(10000.0);
+        u.temperature.set(cell, v);
+        let bw = &mut *sim.backwall.ptr;
+        bw.temperature.set(cell, new_back);
+        // 背墙相变：越 [low−3, high+3] → backwallShouldTransitionInfo
+        if let Some(etd_back) = get_element_temperature_data(back_elem) {
+            if new_back < etd_back.low_temp - 3.0 || new_back > etd_back.high_temp + 3.0 {
+                let w = sim.width as usize;
+                let game_cell =
+                    ((cell / w) as i32 - 1) * (w as i32 - 2) + (cell % w) as i32 - 1;
+                if game_cell >= 0 && game_cell < sim.num_game_cells {
+                    let events = unsafe { &mut *sim.sim_events.ptr };
+                    events.backwall_should_transition_info.push(BackwallShouldTransitionInfo {
+                        game_cell: game_cell as u32,
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +733,71 @@ mod tests {
         let d2 = unsafe { (*sd2.updated_cells.ptr).temperature.get(14) } - 300.0;
         assert!(d1 > 0.0 && d2 > 0.0);
         assert!((d2 / d1 - 10.0).abs() < 0.5, "倍率未生效：d1={d1} d2={d2}");
+    }
+
+    #[test]
+    fn backwall_exchange_writes_both_and_emits_transition() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pair_table();
+        let mut sd = make_sim();
+        unsafe {
+            let c = &mut *sd.cells.ptr;
+            let u = &mut *sd.updated_cells.ptr;
+            let bw = &mut *sd.backwall.ptr;
+            // 格 14：液态水 300°C；背墙：固态砖 500°C（elem2，默认 highTemp=0 → 越界触发事件）
+            c.element_idx.set(14, 1);
+            c.mass.set(14, 100.0);
+            c.temperature.set(14, 300.0);
+            c.insulation.set(14, 255);
+            u.element_idx.set(14, 1);
+            u.mass.set(14, 100.0);
+            u.temperature.set(14, 300.0);
+            bw.element_idx.set(14, 2);
+            bw.mass.set(14, 200.0);
+            bw.temperature.set(14, 500.0);
+        }
+        update_temperature_for_backwall(&mut sd, 14);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            let bw = &*sd.backwall.ptr;
+            let new_cell = u.temperature.get(14);
+            let new_back = bw.temperature.get(14);
+            assert!(new_cell > 300.0, "格升温（背墙更热），got {new_cell}");
+            assert!(new_back < 500.0, "背墙降温，got {new_back}");
+            assert!(new_back > 300.0);
+            // 背墙温度被直接写（非增量）
+            assert_eq!(bw.temperature.get(14), new_back);
+            // elem2 默认 highTemp=0 → 背墙 500°C 越 high+3 → 相变事件
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.backwall_should_transition_info.len(), 1);
+        }
+    }
+
+    #[test]
+    fn backwall_exchange_skips_vacuum_or_void() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pair_table();
+        let mut sd = make_sim();
+        unsafe {
+            let c = &mut *sd.cells.ptr;
+            let u = &mut *sd.updated_cells.ptr;
+            let bw = &mut *sd.backwall.ptr;
+            c.element_idx.set(14, 0); // 真空
+            c.mass.set(14, 0.0);
+            c.temperature.set(14, 0.0);
+            u.element_idx.set(14, 0);
+            u.mass.set(14, 0.0);
+            u.temperature.set(14, 0.0);
+            bw.element_idx.set(14, 2);
+            bw.mass.set(14, 200.0);
+            bw.temperature.set(14, 500.0);
+        }
+        update_temperature_for_backwall(&mut sd, 14);
+        unsafe {
+            let bw = &*sd.backwall.ptr;
+            assert_eq!(bw.temperature.get(14), 500.0, "真空格不换热");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.backwall_should_transition_info.len(), 0);
+        }
     }
 }
