@@ -17,6 +17,14 @@ pub mod temperature;
 /// 原版调用 UpdateTemperature/UpdatePressure/UpdateLiquid 等物理更新。
 /// C1 桩：不执行任何物理计算，cell 状态保持不变。
 pub fn update_data(sim_data: &mut SimData) {
+    // 原版 UpdateData L144415：每子步开头 CopyFrom(cells, updatedCells)
+    crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+    // 温度任务（原版 L144430-144548：读 cells 稳定缓冲、写 updatedCells 增量；
+    // 含背墙换热、右/下邻换热、逐格 DoStateTransition）
+    crate::c2_physics::temperature::run_temperature_task(sim_data);
+    // 原版 L144548：温度后 CopyFrom，供后续压力/液体阶段读取新温度
+    crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+
     // C2 阶段实现：液体流动
     crate::c2_physics::liquid_flow::update_liquids(sim_data);
     // ElementConsumer 逐帧消费（2026-08-02：水泵/涡轮取水；原版 UpdateData 调组件 Update）
@@ -112,7 +120,10 @@ pub fn consolidate_events(_sim_data: &mut SimData) {
 mod tests {
     use super::*;
     use crate::a_framework::sim_data::{CellSOA, SimData};
-    use crate::b_elements::element::{Element, ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData};
+    use crate::b_elements::element::{
+        Element, ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData,
+        ElementTemperatureData, INVALID_ELEMENT_INDEX,
+    };
     use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
     use crate::LIB_TESTS_LOCK;
 
@@ -148,6 +159,39 @@ mod tests {
             // post_process 字段默认：sublimate_index=0xffff → 升华路径不触发
             table.post_process_data.push(ElementPostProcessData { state, ..Default::default() });
         }
+    }
+
+    /// 同 init_pressure_table，另补安全 temperature_data（elem1 水、elem2 砖，相变惰性）。
+    /// 调用方需持 LIB_TESTS_LOCK。
+    fn init_temp_task_table() {
+        init_pressure_table();
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        let mut water = ElementTemperatureData::default();
+        water.state = 2;
+        water.specific_heat_capacity = 4.179;
+        water.thermal_conductivity = 0.609;
+        water.gas_surface_area_multiplier = 1.0;
+        water.liquid_surface_area_multiplier = 1.0;
+        water.solid_surface_area_multiplier = 1.0;
+        water.low_temp = 0.0;
+        water.high_temp = 1000.0;
+        water.low_temp_transition_idx = INVALID_ELEMENT_INDEX;
+        water.high_temp_transition_idx = INVALID_ELEMENT_INDEX;
+        let mut rock = ElementTemperatureData::default();
+        rock.state = 3;
+        rock.specific_heat_capacity = 0.8;
+        rock.thermal_conductivity = 2.0;
+        rock.gas_surface_area_multiplier = 1.0;
+        rock.liquid_surface_area_multiplier = 1.0;
+        rock.solid_surface_area_multiplier = 1.0;
+        rock.low_temp = 0.0;
+        rock.high_temp = 1000.0;
+        rock.low_temp_transition_idx = INVALID_ELEMENT_INDEX;
+        rock.high_temp_transition_idx = INVALID_ELEMENT_INDEX;
+        table.temperature_data.clear();
+        table.temperature_data.push(ElementTemperatureData::default()); // 0
+        table.temperature_data.push(water); // 1
+        table.temperature_data.push(rock); // 2
     }
 
     /// 6×6（内部 4×4）SimData，cells/updated_cells/flow/accumulated_flow/backwall/sim_events 已分配。
@@ -268,5 +312,46 @@ mod tests {
             let events = &*sd.sim_events.ptr;
             assert_eq!(events.substance_change_info.len(), 0, "全固体邻格不应产生转移事件");
         }
+    }
+
+    #[test]
+    fn update_data_syncs_cells_before_temperature_each_substep() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_task_table();
+        let mut sd = make_sim_data();
+        // cell14 水 300、cell15 砖 400（相邻换热）；两者四周全是同温固体 → 液体流/压力惰性，
+        // 隔离验证"温度任务基于上一子步结果"（原版 L144415 每子步开头 CopyFrom）。
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(14, 1);
+            b.mass.set(14, 100.0);
+            b.temperature.set(14, 300.0);
+            b.insulation.set(14, 255);
+            b.element_idx.set(15, 2);
+            b.mass.set(15, 200.0);
+            b.temperature.set(15, 400.0);
+            b.insulation.set(15, 255);
+            for (cell, temp) in [(8usize, 300.0f32), (20usize, 300.0f32), (13usize, 300.0f32)] {
+                b.element_idx.set(cell, 2);
+                b.mass.set(cell, 1000.0);
+                b.temperature.set(cell, temp);
+                b.insulation.set(cell, 255);
+            }
+            for (cell, temp) in [(9usize, 400.0f32), (21usize, 400.0f32), (16usize, 400.0f32)] {
+                b.element_idx.set(cell, 2);
+                b.mass.set(cell, 1000.0);
+                b.temperature.set(cell, temp);
+                b.insulation.set(cell, 255);
+            }
+        });
+        update_data(&mut sd);
+        let after_1 = unsafe { (*sd.updated_cells.ptr).temperature.get(14) };
+        update_data(&mut sd); // 第二个子步
+        let after_2 = unsafe { (*sd.updated_cells.ptr).temperature.get(14) };
+        // opening CopyFrom 使第二子步基于第一子步结果：温度继续收敛（而非重复相同 delta 过冲）
+        assert!(
+            after_2 > after_1,
+            "第二子步应继续升温收敛：{after_1} → {after_2}"
+        );
+        assert!(after_2 < 400.0, "不得越过热侧 400：{after_2}");
     }
 }
