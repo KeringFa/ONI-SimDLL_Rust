@@ -422,13 +422,18 @@ impl ConduitTemperatureManager {
             let entry = &mut self.data[i];
 
             // 跳过条件（原版 L95504-95513）：
-            // handle index 越界 / 内容物热容不足 / 结构热容不足
-            let mut skip = handle_index >= HANDLE_INDEX_MAX
+            // 建筑温度句柄 index 越界 / 内容物热容不足 / 结构热容不足。
+            // 注意：dest_temp 用 entry.conduit_building_temperature_handle 索引
+            // buildingTemps（原版 L95510-95519），不是 conduit 自身句柄索引——
+            // 两个句柄空间独立分配，索引必然错位。
+            let building_handle = entry.conduit_building_temperature_handle;
+            let building_index = (building_handle & 0xffffff) as usize;
+            let mut skip = building_index >= HANDLE_INDEX_MAX
                 || entry.heat_capacity <= HEAT_CAPACITY_EPSILON
                 || entry.conduit_heat_capacity <= HEAT_CAPACITY_EPSILON;
             if !skip {
                 if let Some(bt) = building_temps {
-                    if handle_index >= bt.len() {
+                    if building_index >= bt.len() {
                         skip = true;
                     }
                 } else {
@@ -444,7 +449,7 @@ impl ConduitTemperatureManager {
             }
 
             let bt = building_temps.unwrap();
-            let dest_temp = bt[handle_index].temperature;
+            let dest_temp = bt[building_index].temperature;
             // 原版 L95515：结构温度 <= 0 → 无有效温度，仅复制
             if dest_temp <= 0.0 {
                 if handle_index < self.temperatures.len() {
@@ -1054,5 +1059,37 @@ mod tests {
         assert!(mgr.free_handles.is_empty());
         assert!(mgr.temperatures.is_empty());
         assert!(mgr.get(0).is_none());
+    }
+
+    #[test]
+    fn update_indexes_building_temps_by_building_handle_not_conduit_handle() {
+        // 原版 L95510-95519：dest_temp = buildingTemps[entry.conduit_building_temperature_handle & 0xffffff]
+        // （conduit 句柄与建筑温度句柄是独立分配空间，索引必然错位）。
+        let mut mgr = ConduitTemperatureManager::new();
+        let mut data = make_water_data(95.0, 10.0);
+        data.conduit_building_temperature_handle = 7; // 本管道的建筑温度句柄 index = 7
+        data.conduit_heat_capacity = 80.0;
+        data.conduit_thermal_conductivity = 2.0;
+        let h = mgr.add(data);
+        assert_eq!(h & 0xffffff, 0); // conduit 句柄 index = 0
+
+        // buildingTemps：index 0 是"别的建筑"（900°C），index 7 才是本管道（20°C）
+        let mut bts: Vec<BuildingTemperatureInfo> = (0..8)
+            .map(|i| BuildingTemperatureInfo {
+                handle: crate::a_framework::game_data::Handle { value: i as i32 },
+                temperature: 900.0,
+            })
+            .collect();
+        bts[7].temperature = 20.0;
+
+        mgr.update(0.2, Some(&bts));
+
+        // 正确语义：dest = 管道 20°C → 内容物 95°C 应略降温
+        let after = mgr.get(h).unwrap().temperature;
+        assert!(
+            after < 95.0,
+            "内容物应从 95°C 向管道 20°C 降温（got {after}；若按 conduit 句柄 0 读到 900°C 会升温）"
+        );
+        assert!(after > 20.0);
     }
 }
