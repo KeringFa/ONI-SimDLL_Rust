@@ -695,7 +695,7 @@ fn modify_disease_count(cells: &mut CellSOA, cell: usize, delta: i32) {
 }
 
 /// CellSOA::ClearDisease（原版 11_msvcrt_ignored.c L43186-43214）。
-fn clear_disease(cells: &mut CellSOA, cell: usize) {
+pub(crate) fn clear_disease(cells: &mut CellSOA, cell: usize) {
     cells.disease_idx.set(cell, 0xFF);
     cells.disease_count.set(cell, 0);
     cells.disease_infestation_tick_count.set(cell, 0);
@@ -763,7 +763,7 @@ pub(crate) fn push_substance_change(sim: &mut crate::a_framework::sim_data::SimD
 /// 液体从壁边下落时产生 spawn_liquid_info 事件（下落粒子效果）。
 /// headless 模式返回 false；visible_grid 为 null（未分配）时保守返回 false。
 #[allow(clippy::too_many_arguments)]
-fn spawn_falling_liquid(
+pub(crate) fn spawn_falling_liquid(
     sim: &mut crate::a_framework::sim_data::SimData,
     cell: usize,
     elem_idx: u16,
@@ -1001,7 +1001,7 @@ fn clear_flow(sim: &mut SimData, cell: usize) {
 /// Evaporate（原版 05_liquid_flow.c L2194-2208）：清空格子 + substance 事件。
 /// 调用 SimData::ClearCell（11_msvcrt L23677：元素→真空、质量/温度清零、病菌四字段）。
 /// 2026-08-02 实现：此前留桩 → 表层微克级残水（≤0.01kg / 气体 <1e-9）永不清理。
-fn do_evaporate(sim: &mut SimData, cell: usize) {
+pub(crate) fn do_evaporate(sim: &mut SimData, cell: usize) {
     if sim.updated_cells.ptr.is_null() {
         return;
     }
@@ -2306,8 +2306,15 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
             }
         }
     }
-    // DoPartialHeatTransition 4 方向（L2705-2721）—— 留桩
-    // —— DoSublimation（L2722-2863）：相变发射留桩，仅保留 accumulatedFlow 累加（L2831）——
+    // DoPartialHeatTransition 4 方向（原版 L2705-2721）：任一成功 → 提前返回
+    if crate::c2_physics::temperature::do_partial_heat_transition(sim, cell, cell.wrapping_sub(width))
+        || crate::c2_physics::temperature::do_partial_heat_transition(sim, cell, cell.wrapping_sub(1))
+        || crate::c2_physics::temperature::do_partial_heat_transition(sim, cell, cell + 1)
+        || crate::c2_physics::temperature::do_partial_heat_transition(sim, cell, cell + width)
+    {
+        return;
+    }
+    // —— DoSublimation（L2722-2863）：液体 offgas 主路径 + 耗尽路径 ——
     if !sim.accumulated_flow.ptr.is_null() {
         let below = cell + width;
         let (mass_below, below_elem, props_below) = {

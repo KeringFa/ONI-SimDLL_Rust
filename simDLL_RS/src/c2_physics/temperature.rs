@@ -113,6 +113,171 @@ pub(crate) fn do_load_time_state_transition(sim: &mut SimData, cell: usize) {
     }
 }
 
+/// DoPartialHeatTransition — 部分沸腾/分批相变（原版 04_temperature.c L2105-2471）。
+/// 大质量格（≥5kg）被极热邻格加热：抽邻格热量 heat=(high+3−本格温)×TC×5，
+/// 把恰好 5kg 转化为高温相变目标（气体→排下方格；液体→SpawnFallingLiquid）；
+/// 失败全额恢复（质量/病菌/邻格温度）并返回 false。
+pub(crate) fn do_partial_heat_transition(sim: &mut SimData, cell: usize, neighbor: usize) -> bool {
+    let width = sim.width as usize;
+    let total = width * sim.height as usize;
+    if cell >= total || neighbor >= total {
+        return false;
+    }
+    if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
+        return false;
+    }
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    // 原版 L2138：mass < 5.0 → false（== 5.0 放行）
+    let mass_cell = updated.mass.get(cell);
+    if mass_cell < 5.0 {
+        return false;
+    }
+    let cell_elem = updated.element_idx.get(cell);
+    let neigh_elem = updated.element_idx.get(neighbor);
+    let (Some(cell_el), Some(neigh_el)) = (
+        get_element_by_idx(cell_elem),
+        get_element_by_idx(neigh_elem),
+    ) else {
+        return false;
+    };
+    // 原版 L2146：cell 高温转换目标（Element offset 6）
+    let target = cell_el.high_temp_transition_idx;
+    if target == INVALID_ELEMENT_INDEX {
+        return false;
+    }
+    let Some(target_el) = get_element_by_idx(target) else {
+        return false;
+    };
+    let cell_high = cell_el.high_temp;
+    let neigh_low = neigh_el.low_temp;
+    let cell_tc = cell_el.thermal_conductivity;
+    let neigh_tc = neigh_el.thermal_conductivity;
+    let cell_temp = updated.temperature.get(cell);
+    let neigh_temp = updated.temperature.get(neighbor);
+    let f22 = cell_high + 3.0;
+    // 原版 L2147-2152：邻格温度 > cell_high+3；邻格温度 >= neigh_low+13；本格温度 < cell_high−3
+    if neigh_temp <= f22 {
+        return false;
+    }
+    if neigh_temp < neigh_low + 13.0 {
+        return false;
+    }
+    if cell_high - 3.0 <= cell_temp {
+        return false;
+    }
+    // 原版 L2156：heat = (f22 − cell_temp) × cell_tc × 5.0
+    let heat = (f22 - cell_temp) * cell_tc * 5.0;
+    // 原版 L2158-2162：f21 = mass[neighbor] × neigh_tc；f21×10 < heat → false
+    let mass_neigh = updated.mass.get(neighbor);
+    let mut f21 = mass_neigh * neigh_tc;
+    if f21 * 10.0 < heat {
+        return false;
+    }
+    // 原版 L2165：邻格新温度
+    f21 = (neigh_temp * f21 - heat) / f21;
+    let disease_cell = updated.disease_count.get(cell);
+    let disease_idx_cell = updated.disease_idx.get(cell);
+    let i16 = (disease_cell as f32 * (5.0 / mass_cell)) as i32;
+    let target_state = target_el.state & 3;
+
+    // —— 目标为气体（原版 L2171-2290）——
+    if target_state == 1 {
+        // 扣减段：本格 −5kg、病菌按比例、邻格降温
+        {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.mass.set(cell, mass_cell - 5.0);
+            let remain = disease_cell - i16;
+            if remain < 1 {
+                crate::c2_physics::liquid_flow::clear_disease(updated, cell);
+            } else {
+                updated.disease_count.set(cell, remain);
+            }
+            updated.temperature.set(neighbor, f21);
+        }
+        let below = cell + width;
+        let below_elem = if below < total {
+            unsafe { (*sim.updated_cells.ptr).element_idx.get(below) }
+        } else {
+            INVALID_ELEMENT_INDEX
+        };
+        let below_is_gas = matches!(
+            get_element_by_idx(below_elem),
+            Some(e) if (e.state & 3) == 1
+        );
+        if below_is_gas {
+            if crate::c2_physics::liquid_flow::displace_gas(sim, below, below_elem) {
+                let updated = unsafe { &mut *sim.updated_cells.ptr };
+                updated.element_idx.set(below, target);
+                updated.mass.set(below, 5.0);
+                updated.temperature.set(below, f22);
+                crate::c2_physics::liquid_flow::push_substance_change(sim, below);
+                return true;
+            }
+            // 原版此处进崩溃标签（L2286）；安全镜像：走恢复分支
+        } else if crate::c2_physics::liquid_flow::displace_liquid(sim, cell, cell_elem) {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.element_idx.set(cell, target);
+            updated.mass.set(cell, 5.0);
+            updated.temperature.set(cell, f22);
+            crate::c2_physics::liquid_flow::push_substance_change(sim, cell);
+            return true;
+        }
+        // 恢复段（原版 L2264-2268 同款：质量/病菌/邻格温度还原）
+        {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.mass.set(cell, mass_cell);
+            updated.disease_count.set(cell, disease_cell);
+            updated.temperature.set(neighbor, neigh_temp);
+        }
+        return false;
+    }
+
+    // —— 目标为液体（原版 L2291-2370）——
+    if target_state == 2 {
+        {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.mass.set(cell, mass_cell - 5.0);
+            let remain = disease_cell - i16;
+            if remain < 1 {
+                crate::c2_physics::liquid_flow::clear_disease(updated, cell);
+            } else {
+                updated.disease_count.set(cell, remain);
+            }
+            updated.temperature.set(neighbor, f21);
+        }
+        if crate::c2_physics::liquid_flow::displace_liquid(sim, cell, cell_elem) {
+            if crate::c2_physics::liquid_flow::spawn_falling_liquid(
+                sim,
+                cell,
+                target,
+                5.0,
+                f22,
+                disease_idx_cell,
+                i16,
+            ) {
+                return true;
+            }
+            // 液滴失败 → 就地转化（原版 L2342-2350）
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.element_idx.set(cell, target);
+            updated.mass.set(cell, 5.0);
+            updated.temperature.set(cell, f22);
+            crate::c2_physics::liquid_flow::push_substance_change(sim, cell);
+            return true;
+        }
+        {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.mass.set(cell, mass_cell);
+            updated.disease_count.set(cell, disease_cell);
+            updated.temperature.set(neighbor, neigh_temp);
+        }
+        return false;
+    }
+
+    tracing::warn!(target_state, "DoPartialHeatTransition: unexpected target state");
+    false
+}
+
 /// DoStateTransition（原版 L133261-133737）。每格换热/升温后调用，返回是否发生转变。
 ///
 /// - 高温侧（T ≥ highTemp+3 且 highTempTransitionIdx 有效）：温度= max(0,T-1.5)，元素切换，
@@ -770,6 +935,153 @@ mod tests {
         let u = unsafe { &*sd.updated_cells.ptr };
         assert_eq!(u.element_idx.get(14), 2);
         assert_eq!(u.temperature.get(14), -100.0);
+    }
+
+    /// 部分沸腾测试表：dummy(0) / 水 water(1, state2, high=100, high_trans=3) /
+    /// 冰 ice(2) / 蒸汽 steam(3, state1) / 热固体 hot(4, state3, tc=1, low=-100, high=500) /
+    /// 熔岩 lava(5, state2, tc=1)。
+    fn init_partial_heat_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.temperature_data.clear();
+        let mut mk = |state: u8, low: f32, high: f32, tc: f32, high_trans: u16| {
+            let mut e = Element::default();
+            e.state = state;
+            e.low_temp = low;
+            e.high_temp = high;
+            e.thermal_conductivity = tc;
+            e.high_temp_transition_idx = high_trans;
+            e
+        };
+        table.elements.push(Element::default()); // 0 dummy
+        table.elements.push(mk(2, 0.0, 100.0, 1.0, 3)); // 1 水 → 蒸汽
+        table.elements.push(Element::default()); // 2 冰
+        table.elements.push(mk(1, 100.0, 999.0, 1.0, 0)); // 3 蒸汽
+        table.elements.push(mk(3, -100.0, 500.0, 1.0, 0xFFFF)); // 4 热固体
+        table.elements.push(mk(2, 0.0, 500.0, 1.0, 0)); // 5 熔岩
+        // temperature_data 与 elements 同序（液滴温度范围检查会读 low/high）
+        let td = [
+            (0.0f32, 0.0f32),   // 0 dummy
+            (0.0, 100.0),       // 1 水
+            (0.0, 0.0),         // 2 冰
+            (100.0, 999.0),     // 3 蒸汽
+            (-100.0, 500.0),    // 4 热固体
+            (0.0, 500.0),       // 5 熔岩
+        ];
+        for (low, high) in td {
+            let mut d = crate::b_elements::element::ElementTemperatureData::default();
+            d.low_temp = low;
+            d.high_temp = high;
+            table.temperature_data.push(d);
+        }
+        // post_process_data / liquid_data / state_data 补齐 state（displace 系列检查用）
+        let states = [0u8, 2, 3, 1, 3, 2];
+        table.post_process_data.clear();
+        table.liquid_data.clear();
+        table.state_data.clear();
+        for &s in &states {
+            let mut ppd = crate::b_elements::element::ElementPostProcessData::default();
+            ppd.state = s;
+            table.post_process_data.push(ppd);
+            let mut ld = crate::b_elements::element::ElementLiquidData::default();
+            ld.state = s;
+            table.liquid_data.push(ld);
+            let mut sd = crate::b_elements::element::ElementStateData::default();
+            sd.state = s;
+            table.state_data.push(sd);
+        }
+    }
+
+    #[test]
+    fn partial_heat_gas_target_places_below() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_partial_heat_table();
+        let mut sd = make_sim();
+        // cell14=水 10kg 20℃；neighbor15=热固体 100kg 600℃；below20=蒸汽
+        fill(&mut sd, 14, 1, 10.0, 20.0);
+        fill(&mut sd, 15, 4, 100.0, 600.0);
+        fill(&mut sd, 20, 3, 1.0, 300.0);
+        assert!(do_partial_heat_transition(&mut sd, 14, 15));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert!(
+            (u.mass.get(14) - 5.0).abs() < 1e-4,
+            "本格应剩 5kg，got {}",
+            u.mass.get(14)
+        );
+        assert_eq!(u.element_idx.get(14), 1, "本格仍是水");
+        assert_eq!(u.element_idx.get(20), 3, "下方格变蒸汽");
+        assert!((u.mass.get(20) - 5.0).abs() < 1e-4);
+        assert!(
+            (u.temperature.get(20) - 103.0).abs() < 1e-4,
+            "下方蒸汽应 103℃（high+3）"
+        );
+        assert!(
+            (u.temperature.get(15) - 595.85).abs() < 1e-2,
+            "热固体应降温，got {}",
+            u.temperature.get(15)
+        );
+    }
+
+    #[test]
+    fn partial_heat_liquid_target_spawns_droplet() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_partial_heat_table();
+        let mut sd = make_sim();
+        // 水 → 目标改为熔岩(5)：水(1).high_trans=5
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements[1].high_temp_transition_idx = 5;
+        }
+        fill(&mut sd, 14, 1, 10.0, 20.0);
+        fill(&mut sd, 15, 4, 100.0, 600.0);
+        assert!(do_partial_heat_transition(&mut sd, 14, 15));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert!(
+            u.mass.get(14) < 0.01,
+            "液体目标分支 DisplaceLiquid 后排空本格，got {}",
+            u.mass.get(14)
+        );
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.spawn_liquid_info.len(), 1, "应生成 1 条液滴事件");
+        let drop = events.spawn_liquid_info.get(0);
+        assert_eq!(drop.element_idx, 5);
+        assert!((drop.mass - 5.0).abs() < 1e-4);
+        assert!((drop.temperature - 103.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn partial_heat_precondition_gates_and_restore() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_partial_heat_table();
+        let mut sd = make_sim();
+        // 质量 < 5 → false
+        fill(&mut sd, 14, 1, 4.0, 20.0);
+        fill(&mut sd, 15, 4, 100.0, 600.0);
+        assert!(!do_partial_heat_transition(&mut sd, 14, 15));
+        // 邻格不够热（neigh_temp > high+3 不满足）→ false
+        fill(&mut sd, 14, 1, 10.0, 20.0);
+        fill(&mut sd, 15, 4, 100.0, 102.0);
+        assert!(!do_partial_heat_transition(&mut sd, 14, 15));
+        // 无高温转换目标（冰）→ false
+        fill(&mut sd, 14, 2, 10.0, 20.0);
+        assert!(!do_partial_heat_transition(&mut sd, 14, 15));
+        // displace 候选 [右15, 左13, 下20, 上8] 全固体 → DisplaceLiquid 失败 → 恢复并返回 false
+        fill(&mut sd, 14, 1, 10.0, 20.0);
+        fill(&mut sd, 15, 4, 100.0, 600.0);
+        for n in [8usize, 13, 20] {
+            fill(&mut sd, n, 4, 100.0, 300.0); // 固体邻居（8/13/20 = 上/左/下）
+        }
+        assert!(!do_partial_heat_transition(&mut sd, 14, 15));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert!(
+            (u.mass.get(14) - 10.0).abs() < 1e-4,
+            "失败应恢复质量，got {}",
+            u.mass.get(14)
+        );
+        assert!(
+            (u.temperature.get(15) - 600.0).abs() < 1e-4,
+            "失败应恢复邻格温度"
+        );
     }
 
     #[test]
