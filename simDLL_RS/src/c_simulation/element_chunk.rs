@@ -7,6 +7,7 @@
 
 use crate::a_framework::game_data::{ElementChunkInfo, Handle, MeltedInfo};
 use crate::a_framework::sim_data::SimData;
+use crate::a_framework::stl_shim::MsvcVector;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
@@ -88,7 +89,7 @@ pub struct ElementChunkManager {
     versions: Vec<u8>,
     free_handles: Vec<i32>,
     /// 每帧输出 {temperature, delta_kj}（按 handle index；copy_sim_data_to_game swap 消费）。
-    pub(crate) output: Vec<ElementChunkInfo>,
+    pub(crate) output: MsvcVector<ElementChunkInfo>,
 }
 
 impl ElementChunkManager {
@@ -98,7 +99,7 @@ impl ElementChunkManager {
             items: Vec::new(),
             versions: Vec::new(),
             free_handles: Vec::new(),
-            output: Vec::new(),
+            output: MsvcVector::new(),
         }
     }
 
@@ -256,9 +257,12 @@ impl ElementChunkManager {
 
     /// 测试/输出访问。
     pub fn output_snapshot(&self) -> &[ElementChunkInfo] {
-        &self.output
+        self.output.as_slice()
     }
 }
+
+// MsvcVector 含裸指针 → 非自动 Send；sim 线程单线程访问（与 ConduitTemperatureManager 同模式）。
+unsafe impl Send for ElementChunkManager {}
 
 static ELEMENT_CHUNK_MANAGER: Lazy<Mutex<ElementChunkManager>> =
     Lazy::new(|| Mutex::new(ElementChunkManager::new()));
@@ -284,6 +288,19 @@ pub fn move_element_chunk(handle: i32, game_cell: i32, width: i32) -> bool {
 }
 pub fn remove_element_chunk(handle: i32) -> bool {
     ELEMENT_CHUNK_MANAGER.lock().remove(handle)
+}
+
+/// 顶层 Update（update_data 组件阶段调用）。
+pub fn update_element_chunks(sim: &mut SimData, dt: f32, width: i32) {
+    let mut mgr = ELEMENT_CHUNK_MANAGER.lock();
+    update_element_chunks_inner(&mut mgr, sim, dt, width);
+}
+
+/// 每帧输出交换（原版 CopySimDataToGame elementChunkInfo 交换）。
+pub fn swap_element_chunk_output(game_data: &mut crate::a_framework::game_data::GameData) {
+    let mut mgr = ELEMENT_CHUNK_MANAGER.lock();
+    std::mem::swap(&mut game_data.element_chunk_info, &mut mgr.output);
+    mgr.output.clear_keep_capacity();
 }
 
 /// 测试/诊断：当前活跃碎片数。
@@ -690,5 +707,25 @@ mod tests {
         let events = unsafe { &*sd.sim_events.ptr };
         assert_eq!(events.element_chunk_melted_info.len(), 1);
         assert_eq!(events.element_chunk_melted_info.get(0).handle.value, h);
+    }
+
+    #[test]
+    fn element_chunk_output_swaps_into_game_data() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        reset_for_test();
+        {
+            let mut mgr = ELEMENT_CHUNK_MANAGER.lock();
+            mgr.output.push(ElementChunkInfo {
+                temperature: 300.0,
+                delta_kj: 1.0,
+            });
+        }
+        let mut gd: crate::a_framework::game_data::GameData = unsafe { std::mem::zeroed() };
+        swap_element_chunk_output(&mut gd);
+        assert_eq!(gd.element_chunk_info.len(), 1);
+        assert_eq!(gd.element_chunk_info.get(0).temperature, 300.0);
+        assert_eq!(gd.element_chunk_info.get(0).delta_kj, 1.0);
+        assert_eq!(ELEMENT_CHUNK_MANAGER.lock().output.len(), 0);
     }
 }

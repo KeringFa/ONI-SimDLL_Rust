@@ -96,6 +96,8 @@ pub fn update_data(sim_data: &mut SimData) {
 
     // BuildingHeatExchange::Update（原版 L145434 组件阶段：建筑↔格子换热，dt=0.2）
     crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data);
+    // ElementChunk::Update（原版 L145434 同一组件阶段：物质碎片换热）
+    crate::c_simulation::element_chunk::update_element_chunks(sim_data, 0.2, sim_data.width);
 }
 
 /// SimData::UpdateComponentsDataListOnly 的桩实现。

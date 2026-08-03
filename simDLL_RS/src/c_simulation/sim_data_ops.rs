@@ -169,6 +169,9 @@ pub fn copy_sim_data_to_game(
     );
     sim_data.element_emitter.emitted_mass_info.clear_keep_capacity();
 
+    // ElementChunk 每帧输出（原版 CopySimDataToGame elementChunkInfo 交换）
+    crate::c_simulation::element_chunk::swap_element_chunk_output(game_data);
+
     // 3. 搬移 sim_events 的 20 个事件 vector（swap 后清空 sim_events 源）
     // 对照源码 L31791-L32174（搬移）+ L132195-132214（源清空，end=begin）
     if sim_data.sim_events.ptr.is_null() {
