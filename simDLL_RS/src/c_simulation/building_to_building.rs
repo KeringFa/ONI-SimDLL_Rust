@@ -1,7 +1,9 @@
 //! BuildingToBuildingHeatExchange（导热板）——原版 L138358-138640。
 //! C# 侧 StructureToStructureTemperature 注册/增删接触；sim 侧做建筑↔建筑换热与过热事件。
 //! 任务 1：注册表（Register/AddContact/RemoveContact/Unregister）；任务 3：Update 换热。
+use crate::a_framework::game_data::{Handle, MeltedInfo};
 use crate::a_framework::sim_data::SimData;
+use crate::c_simulation::building_temperature::BuildingTemperatureRecord;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 
@@ -201,6 +203,110 @@ pub fn remove_building_to_building(handle: i32) -> bool {
     B2B_MANAGER.lock().unregister(handle)
 }
 
+/// BuildingToBuildingHeatExchange::Update（原版 L138358-138640）。
+/// 逐记录：building 数据经 heatExchange_handle 查询；遍历接触求 min/max_seen；
+/// k = dt×scale×contactTC×bldgTC×(contactT−bldgT)×暖侧HC×0.005；
+/// 能量守恒取 min(|Δ|×HC)（带 k 符号）→ 交叉则热容加权平均钳制；
+/// 过热事件只发接触方；写回经 change_building_temperature。
+pub(crate) fn update_building_to_building_inner(
+    mgr: &mut BuildingToBuildingManager,
+    sim: &mut SimData,
+    dt: f32,
+) {
+    if sim.sim_events.ptr.is_null() {
+        return;
+    }
+    let scale = sim.debug_properties.building_to_building_temperature_scale;
+    for index in 0..mgr.items.len() {
+        let ri = mgr.items[index];
+        if ri < 0 {
+            continue;
+        }
+        let rec = mgr.records[ri as usize].clone();
+        let Some(bldg) =
+            crate::c_simulation::building_temperature::record(rec.heat_exchange_handle)
+        else {
+            continue;
+        };
+        // min/max_seen 遍历接触（含自身）
+        let mut min_seen = bldg.temperature;
+        let mut max_seen = bldg.temperature;
+        let mut contacts: Vec<(i32, BuildingTemperatureRecord)> = Vec::new();
+        for c in &rec.contacts {
+            if let Some(b) = crate::c_simulation::building_temperature::record(c.handle) {
+                min_seen = min_seen.min(b.temperature);
+                max_seen = max_seen.max(b.temperature);
+                contacts.push((c.handle, b));
+            }
+        }
+        let bldg_hc = bldg.total_heat_capacity;
+        let bldg_tc = bldg.thermal_conductivity;
+        for (ch, c) in contacts {
+            let c_hc = c.total_heat_capacity;
+            if c_hc <= 0.0 {
+                continue;
+            }
+            // 暖侧 HC：contactT < bldgT → bldgHC，否则 contactHC
+            let f21 = if c.temperature < bldg.temperature {
+                bldg_hc
+            } else {
+                c_hc
+            };
+            let mut k = dt
+                * scale
+                * c.thermal_conductivity
+                * bldg_tc
+                * (c.temperature - bldg.temperature)
+                * f21
+                * 0.005;
+            let mut new_b = k / bldg_hc + bldg.temperature;
+            new_b = new_b.max(min_seen).min(max_seen);
+            let mut new_c = c.temperature - k / c_hc;
+            new_c = new_c.max(min_seen).min(max_seen);
+            // 能量守恒：min(|Δbldg|×bldgHC, |Δcontact|×contactHC)，带 k 符号
+            let e1 = (new_b - bldg.temperature).abs() * bldg_hc;
+            let e2 = (new_c - c.temperature).abs() * c_hc;
+            let mut ec = e1.min(e2);
+            if k < 0.0 {
+                ec = -ec;
+            }
+            new_b = ec / bldg_hc + bldg.temperature;
+            new_c = c.temperature - ec / c_hc;
+            // 交叉（方向反转）→ 热容加权平均钳制
+            if (new_b - new_c) * (bldg.temperature - c.temperature) < 0.0 {
+                new_b = (c.temperature * c_hc + bldg.temperature * bldg_hc) / (c_hc + bldg_hc);
+                new_b = new_b.max(min_seen).min(max_seen);
+                new_c = new_b;
+            }
+            // 事件（接触方）
+            if c.overheat_temperature <= new_c {
+                let events = unsafe { &mut *sim.sim_events.ptr };
+                events
+                    .building_overheat_info
+                    .push(MeltedInfo { handle: Handle { value: ch } });
+            }
+            if c.overheat_temperature <= c.temperature && new_c < c.overheat_temperature {
+                let events = unsafe { &mut *sim.sim_events.ptr };
+                events
+                    .building_no_longer_overheated_info
+                    .push(MeltedInfo { handle: Handle { value: ch } });
+            }
+            // 写回（contact 先、building 后，与原版一致）
+            crate::c_simulation::building_temperature::change_building_temperature(ch, new_c);
+            crate::c_simulation::building_temperature::change_building_temperature(
+                rec.heat_exchange_handle,
+                new_b,
+            );
+        }
+    }
+}
+
+/// 顶层：update_data 组件阶段调用。
+pub fn update_building_to_building(sim: &mut SimData, dt: f32) {
+    let mut mgr = B2B_MANAGER.lock();
+    update_building_to_building_inner(&mut mgr, sim, dt);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +392,62 @@ mod tests {
         assert!(mgr.record(h).is_none());
         // 无效建筑句柄 → 注册失败
         assert_eq!(mgr.register(-1, 0x12345678), -1);
+    }
+
+    #[test]
+    fn update_exchanges_between_building_and_contact() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_building_table();
+        // 建筑 A：totalHC=1000、TC=4、300°C；接触 B：totalHC=2000、TC=2、400°C
+        let a = add_building(&bldg_msg(300.0, 1000.0, 4.0));
+        let b = add_building(&bldg_msg(400.0, 2000.0, 2.0));
+        let mut mgr = BuildingToBuildingManager::new();
+        let h = mgr.register(-1, a);
+        mgr.add_contact(h, b, 1);
+        let mut sd = make_sim();
+        update_building_to_building_inner(&mut mgr, &mut sd, 0.2);
+        // 建筑 A 升温、B 降温，能量守恒
+        assert!(record(a).unwrap().temperature > 300.0);
+        assert!(record(b).unwrap().temperature < 400.0);
+        let da = (record(a).unwrap().temperature - 300.0) * 1000.0;
+        let db = (record(b).unwrap().temperature - 400.0) * 2000.0;
+        // f32 舍入：能量量级 ~6.7e4，守恒偏差 ~0.03（相对 < 5e-7），容差取 0.1
+        assert!((da + db).abs() < 0.1);
+    }
+
+    #[test]
+    fn update_emits_overheat_on_contact() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_building_table();
+        let a = add_building(&bldg_msg(300.0, 1000.0, 4.0));
+        let mut bmsg = bldg_msg(400.0, 2000.0, 2.0);
+        bmsg.overheat_temperature = 350.0; // scale=100 单子步平衡至 366.67°C ≥ 350 → 过热
+        let b = add_building(&bmsg);
+        let mut mgr = BuildingToBuildingManager::new();
+        let h = mgr.register(-1, a);
+        mgr.add_contact(h, b, 1);
+        let mut sd = make_sim();
+        update_building_to_building_inner(&mut mgr, &mut sd, 0.2);
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.building_overheat_info.len(), 1, "接触方 B 过热");
+        assert_eq!(events.building_overheat_info.get(0).handle.value, b);
+    }
+
+    #[test]
+    fn update_emits_no_longer_overheated_on_contact() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_building_table();
+        let a = add_building(&bldg_msg(300.0, 1000.0, 4.0));
+        let mut bmsg = bldg_msg(400.0, 2000.0, 2.0);
+        bmsg.overheat_temperature = 380.0; // old 400 ≥ 380，new 366.67 < 380 → no-longer
+        let b = add_building(&bmsg);
+        let mut mgr = BuildingToBuildingManager::new();
+        let h = mgr.register(-1, a);
+        mgr.add_contact(h, b, 1);
+        let mut sd = make_sim();
+        update_building_to_building_inner(&mut mgr, &mut sd, 0.2);
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.building_no_longer_overheated_info.len(), 1);
+        assert_eq!(events.building_no_longer_overheated_info.get(0).handle.value, b);
     }
 }
