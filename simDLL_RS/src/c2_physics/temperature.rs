@@ -278,6 +278,128 @@ pub(crate) fn do_partial_heat_transition(sim: &mut SimData, cell: usize, neighbo
     false
 }
 
+/// DoPartialMelt — 部分熔化（原版 04_temperature.c L2471-2662）。
+/// 极热气体格把相邻固体 5kg 熔为液滴（SpawnFallingLiquid，温度=固体熔点+3）；
+/// 液滴失败则气体格就地转为熔融液体；固体格扣质量/病菌，扣尽则 Evaporate。
+pub(crate) fn do_partial_melt(sim: &mut SimData, cell: usize, neighbor: usize) -> bool {
+    let width = sim.width as usize;
+    let total = width * sim.height as usize;
+    if cell >= total || neighbor >= total {
+        return false;
+    }
+    if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
+        return false;
+    }
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    let cell_elem = updated.element_idx.get(cell);
+    let neigh_elem = updated.element_idx.get(neighbor);
+    let (Some(cell_el), Some(neigh_el)) = (
+        get_element_by_idx(cell_elem),
+        get_element_by_idx(neigh_elem),
+    ) else {
+        return false;
+    };
+    // 原版 L2495-2499：cell state&3 <= 1（真空/气体），neighbor state&3 == 3（固体）
+    if (cell_el.state & 3) > 1 || (neigh_el.state & 3) != 3 {
+        return false;
+    }
+    // 原版 L2500-2502：neighbor 质量 > 5.0
+    let mass_neigh = updated.mass.get(neighbor);
+    if mass_neigh <= 5.0 {
+        return false;
+    }
+    // 原版 L2503-2506：neighbor props & 0x48 == 0
+    if updated.properties.get(neighbor) & 0x48 != 0 {
+        return false;
+    }
+    let cell_temp = updated.temperature.get(cell);
+    let neigh_temp = updated.temperature.get(neighbor);
+    let f19 = neigh_el.high_temp + 3.0;
+    // 原版 L2510-2514：cell_temp > neigh_high+3；neigh_temp < neigh_high−3
+    if cell_temp <= f19 {
+        return false;
+    }
+    if neigh_el.high_temp - 3.0 <= neigh_temp {
+        return false;
+    }
+    // 原版 L2516-2519：neighbor 高温转换目标（Element offset 6）有效
+    let target = neigh_el.high_temp_transition_idx;
+    if target == INVALID_ELEMENT_INDEX {
+        return false;
+    }
+    let Some(target_el) = get_element_by_idx(target) else {
+        return false;
+    };
+    // 原版 L2527-2529：目标必须为液体
+    if (target_el.state & 3) != 2 {
+        return false;
+    }
+    // 原版 L2521：heat = (f19 − neigh_temp) × 目标TC × 5.0
+    let heat = (f19 - neigh_temp) * target_el.thermal_conductivity * 5.0;
+    // 原版 L2523-2525：f17 = mass[cell] × cell_TC；(cell_temp − (cell_low+6)) × f17 < heat → false
+    let cell_tc = cell_el.thermal_conductivity;
+    let mut f17 = updated.mass.get(cell) * cell_tc;
+    if (cell_temp - (cell_el.low_temp + 6.0)) * f17 < heat {
+        return false;
+    }
+    // 原版 L2531：气体格新温度
+    f17 = (f17 * cell_temp - heat) / f17;
+    let disease_neigh = updated.disease_count.get(neighbor);
+    let disease_idx_neigh = updated.disease_idx.get(neighbor);
+    // 原版 L2533：i14 = (int)((5.0 / mass[neighbor]) × disease[neighbor])
+    let i14 = ((5.0 / mass_neigh) * disease_neigh as f32) as i32;
+
+    if crate::c2_physics::liquid_flow::spawn_falling_liquid(
+        sim,
+        cell,
+        target,
+        5.0,
+        f19,
+        disease_idx_neigh,
+        i14,
+    ) {
+        // 原版 L2535-2545：成功 → 气体格降温、固体格扣 5kg/病菌
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.temperature.set(cell, f17);
+        updated.mass.set(neighbor, mass_neigh - 5.0);
+        let remain = disease_neigh - i14;
+        if remain < 1 {
+            crate::c2_physics::liquid_flow::clear_disease(updated, neighbor);
+        } else {
+            updated.disease_count.set(neighbor, remain);
+        }
+        if updated.mass.get(neighbor) <= 1.1754944e-38 {
+            crate::c2_physics::liquid_flow::do_evaporate(sim, neighbor);
+        }
+        return true;
+    }
+    // 原版 L2546-2562：液滴失败 → DisplaceGas(cell) 后就地转化 + 固体扣减
+    if !crate::c2_physics::liquid_flow::displace_gas(sim, cell, cell_elem) {
+        return false;
+    }
+    {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(cell, target);
+        updated.mass.set(cell, 5.0);
+        updated.temperature.set(cell, f19);
+        crate::c2_physics::liquid_flow::push_substance_change(sim, cell);
+    }
+    {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.mass.set(neighbor, mass_neigh - 5.0);
+        let remain = disease_neigh - i14;
+        if remain < 1 {
+            crate::c2_physics::liquid_flow::clear_disease(updated, neighbor);
+        } else {
+            updated.disease_count.set(neighbor, remain);
+        }
+        if updated.mass.get(neighbor) <= 1.1754944e-38 {
+            crate::c2_physics::liquid_flow::do_evaporate(sim, neighbor);
+        }
+    }
+    true
+}
+
 /// DoStateTransition（原版 L133261-133737）。每格换热/升温后调用，返回是否发生转变。
 ///
 /// - 高温侧（T ≥ highTemp+3 且 highTempTransitionIdx 有效）：温度= max(0,T-1.5)，元素切换，
@@ -1082,6 +1204,67 @@ mod tests {
             (u.temperature.get(15) - 600.0).abs() < 1e-4,
             "失败应恢复邻格温度"
         );
+    }
+
+    #[test]
+    fn partial_melt_spawns_droplet_and_deducts_solid() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_partial_heat_table();
+        // 热固体(4) 需 high_temp_transition_idx → 熔岩(5)；蒸汽(3) 作为高温气体格
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements[4].high_temp_transition_idx = 5; // 固体 → 熔岩
+            table.elements[4].low_temp = -100.0;
+            table.elements[4].high_temp = 500.0;
+            table.elements[4].thermal_conductivity = 1.0;
+        }
+        let mut sd = make_sim();
+        // cell14=蒸汽(气体格) 100kg 800℃；neighbor15=热固体 100kg 20℃
+        fill(&mut sd, 14, 3, 100.0, 800.0);
+        fill(&mut sd, 15, 4, 100.0, 20.0);
+        assert!(do_partial_melt(&mut sd, 14, 15));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert!(
+            (u.mass.get(15) - 95.0).abs() < 1e-4,
+            "固体应扣 5kg，got {}",
+            u.mass.get(15)
+        );
+        assert!(
+            (u.temperature.get(14) - 775.85).abs() < 1e-2,
+            "气体格应降温到 775.85，got {}",
+            u.temperature.get(14)
+        );
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.spawn_liquid_info.len(), 1, "应生成 1 条液滴");
+        let drop = events.spawn_liquid_info.get(0);
+        assert_eq!(drop.element_idx, 5);
+        assert!((drop.mass - 5.0).abs() < 1e-4);
+        assert!(
+            (drop.temperature - 503.0).abs() < 1e-4,
+            "液滴温度应为固体熔点+3"
+        );
+    }
+
+    #[test]
+    fn partial_melt_precondition_gates() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_partial_heat_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements[4].high_temp_transition_idx = 5;
+        }
+        let mut sd = make_sim();
+        // 邻格非固体 → false
+        fill(&mut sd, 14, 3, 100.0, 800.0);
+        fill(&mut sd, 15, 3, 100.0, 20.0); // 蒸汽
+        assert!(!do_partial_melt(&mut sd, 14, 15));
+        // 固体质量 <= 5 → false
+        fill(&mut sd, 15, 4, 5.0, 20.0);
+        assert!(!do_partial_melt(&mut sd, 14, 15));
+        // 气体格不够热（cell_temp <= 熔点+3）→ false
+        fill(&mut sd, 15, 4, 100.0, 20.0);
+        fill(&mut sd, 14, 3, 100.0, 300.0);
+        assert!(!do_partial_melt(&mut sd, 14, 15));
     }
 
     #[test]

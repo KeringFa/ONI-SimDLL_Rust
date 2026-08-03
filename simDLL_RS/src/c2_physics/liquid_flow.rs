@@ -1267,60 +1267,6 @@ fn do_sublimation(sim: &mut SimData, cell: usize) {
 /// DoUnstableCheck（塌方/下落检查，原版 L2537-2545）—— 留桩。
 fn do_unstable_check_stub(_sim: &mut SimData, _cell: usize) {}
 
-/// DoPartialMelt 的"是否熔融"判定近似（原版 04_temperature.c L2471-2658）。
-///
-/// **近似说明**：原版在判定熔融后还会执行熔融发射（SpawnFallingLiquid / DisplaceGas +
-/// 质量/温度改写等相变），本实现按设计文档把相变发射留桩，此处仅复现**判定**部分——
-/// 用可用数据（元素状态、质量、properties、temperature_data）逐条复现原版前置条件，
-/// 前序条件全部满足即视为"会发生部分熔融"返回 true。
-///
-/// 用途：PostProcessCell 气体邻居置换门控（原版 05_liquid_flow.c L2469-2475）需要
-/// `四个方向 DoPartialMelt 全 false` 才进入置换；本近似使该门控结构与原版一致。
-/// 越界格安全返回 false（原版为 `_invalid_parameter_noinfo_noreturn()` 崩溃）。
-fn do_partial_melt(sim: &SimData, cell: usize, neighbor: usize) -> bool {
-    let updated = unsafe { &*sim.updated_cells.ptr };
-    if neighbor >= updated.element_idx.len() || neighbor >= updated.mass.len() {
-        return false;
-    }
-    let (cell_elem, neigh_elem) = (updated.element_idx.get(cell), updated.element_idx.get(neighbor));
-    let (Some(cell_ppd), Some(neigh_ppd)) = (
-        elements_table::get_element_post_process_data(cell_elem),
-        elements_table::get_element_post_process_data(neigh_elem),
-    ) else {
-        return false;
-    };
-    // 原版 L2505-2507：当前格液体/固体，或邻居非固体 → false
-    if (cell_ppd.state & 3) > 1 || (neigh_ppd.state & 3) != 3 {
-        return false;
-    }
-    // 原版 L2511-2512：邻居质量 <= 5.0 → false
-    if updated.mass.get(neighbor) <= 5.0 {
-        return false;
-    }
-    // 原版 L2517-2518：邻居 props & 0x48 置位 → false
-    if updated.properties.get(neighbor) & 0x48 != 0 {
-        return false;
-    }
-    // 温度条件（原版 L2523-2535）：用 temperature_data 的 high_temp 替代 Element.highTemp
-    let Some(neigh_td) = elements_table::get_element_temperature_data(neigh_elem) else {
-        return false;
-    };
-    // 原版 L2524-2527：当前格温度 <= 邻居元素 highTemp + 3 → false
-    if updated.temperature.get(cell) <= neigh_td.high_temp + 3.0 {
-        return false;
-    }
-    // 原版 L2529-2532：邻居温度 >= 邻居元素 highTemp - 3 → false
-    if updated.temperature.get(neighbor) >= neigh_td.high_temp - 3.0 {
-        return false;
-    }
-    // 原版 L2533-2535：邻居元素高温相变目标无效 → false
-    if neigh_td.high_temp_transition_idx == 0xffff {
-        return false;
-    }
-    // 后续熔融量计算与发射（L2540-2658）留桩；前序条件满足即视为会熔融。
-    true
-}
-
 /// DoDensityDisplacement — 密度分层（原版 05_liquid_flow.c L1755-1840）。
 ///
 /// 对照原版逐行：
@@ -2154,11 +2100,13 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
             // 原版 L2469-2475：门控 = (props&2 != 0 || 四方向 DoPartialMelt 全 false) && random > 0.9。
             // 注意 props&2 置位（固体标志）的气体格**也**进入置换——原版是 OR 关系，
             // 旧实现 `(props&2)==0` 把置位格排除，与本修正冲突。
-            // DoPartialMelt 熔融判定见 do_partial_melt（近似实现，相变发射留桩）。
-            let melt_blocked = do_partial_melt(sim, cell, cell.wrapping_sub(width))
-                || do_partial_melt(sim, cell, cell.wrapping_sub(1))
-                || do_partial_melt(sim, cell, cell + 1)
-                || do_partial_melt(sim, cell, cell + width);
+            // DoPartialMelt 完整版（温度.rs）：真实执行熔化副作用（液滴/就地转化），
+            // 短路语义与原版一致——任一方向熔化成功即停止其余方向并阻断气体置换。
+            let melt_blocked =
+                crate::c2_physics::temperature::do_partial_melt(sim, cell, cell.wrapping_sub(width))
+                    || crate::c2_physics::temperature::do_partial_melt(sim, cell, cell.wrapping_sub(1))
+                    || crate::c2_physics::temperature::do_partial_melt(sim, cell, cell + 1)
+                    || crate::c2_physics::temperature::do_partial_melt(sim, cell, cell + width);
             if ((props_cell & 2) != 0 || !melt_blocked) && next_random(sim) > 0.9 {
                 // 候选顺序（原版 L2484-2486）：L2384 先反转 dir、L2484 再读新值，
                 // 净效果 = [cell-旧dir, cell+旧dir, cell-width]（旧实现顺序相反，已修正）
