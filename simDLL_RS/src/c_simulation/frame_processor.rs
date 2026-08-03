@@ -437,7 +437,7 @@ fn process_cell_modifications(frame: &mut SimFrameInfo, sim_data: &mut SimData) 
                             sim_data, idx, elem, mass, temp, didx, dcount,
                         ),
                         3 => crate::c2_physics::liquid_flow::add_solid(
-                            sim_data, idx, elem, mass, temp, didx, dcount,
+                            sim_data, idx, elem, mass, temp, didx, dcount, entry.flags,
                         ),
                         _ => {
                             // 真空元素 Add → 原版 "Invalid replacement type" 崩溃；安全跳过

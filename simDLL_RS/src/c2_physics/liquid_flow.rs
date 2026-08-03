@@ -1811,9 +1811,9 @@ pub(crate) fn add_gas(
     place_subtract(sim, cell, elem, mass, temperature, disease_idx, disease_count);
 }
 
-/// AddSolid（原版 L134555-134789 的简化版）。
-/// ⚠️ 垂直位移（DoVerticalDisplacement）推迟：属排液口/网格砖机制（用户裁决暂不做）。
-/// 语义：同元素合并；目标固体 → 四邻找非固体格；异形态 → Displace 后放置。
+/// AddSolid（原版 SimDLL_Source.c L134555-134789）。
+/// `add_sub_type`（ModifyCell 消息 addSubType）：0 = DoVerticalDisplacement（默认，
+/// 流星/AddRemoveSubstance 固体）；1 = OnlyIfSameElement；其他 → no-op。
 pub(crate) fn add_solid(
     sim: &mut SimData,
     cell: usize,
@@ -1822,60 +1822,116 @@ pub(crate) fn add_solid(
     temperature: f32,
     disease_idx: u8,
     disease_count: i32,
+    add_sub_type: u8,
 ) {
     if sim.updated_cells.ptr.is_null() {
         return;
     }
-    let updated = unsafe { &mut *sim.updated_cells.ptr };
-    if cell >= updated.element_idx.len() {
-        return;
-    }
-    let cur = updated.element_idx.get(cell);
-    if cur == elem {
-        add_mass_and_update_temperature(updated, cell, mass, temperature, disease_idx, disease_count);
-        return;
-    }
     let width = sim.width as usize;
-    let mut target = cell;
-    if elem_state(updated, cell) == 3 {
-        for n in [
-            cell.wrapping_sub(1),
-            cell + 1,
-            cell.wrapping_sub(width),
-            cell + width,
-        ] {
-            if n < updated.element_idx.len() && elem_state(updated, n) != 3 {
-                target = n;
-                break;
+    let total = width * sim.height as usize;
+    if cell >= total {
+        return;
+    }
+    // —— Type 0：DoVerticalDisplacement（L134573-134743）——
+    if add_sub_type == 0 {
+        let row = cell / width;
+        let col = cell % width;
+        let mut remaining = mass;
+        // 阶段 1：同列 4 格（row−1/0/+1/+2）同元素 → 按 ppd.maxMass 补满
+        for dr in [-1i32, 0, 1, 2] {
+            let r = row as i32 + dr;
+            if r < 0 || r as usize >= sim.height as usize {
+                continue;
+            }
+            let c = r as usize * width + col;
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            if updated.element_idx.get(c) != elem {
+                continue;
+            }
+            let Some(max_mass) = elements_table::get_element_post_process_data(elem)
+                .map(|p| p.max_mass)
+            else {
+                continue;
+            };
+            let room = max_mass - updated.mass.get(c);
+            if room <= 0.0 {
+                continue;
+            }
+            let f16 = room.min(remaining);
+            let d = (f16 / remaining * disease_count as f32) as i32;
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            add_mass_and_update_temperature(updated, c, f16, temperature, disease_idx, d);
+            remaining -= f16;
+            if remaining <= 0.0 {
+                return;
             }
         }
-    }
-    let target_state = elem_state(updated, target);
-    if target_state == 3 || updated.element_idx.get(target) == sim.void_element_idx {
-        place_subtract(sim, target, elem, mass, temperature, disease_idx, disease_count);
-        return;
-    }
-    if target_state == 0 {
-        let updated = unsafe { &mut *sim.updated_cells.ptr };
-        updated.element_idx.set(target, elem);
-        add_mass_and_update_temperature(updated, target, mass, temperature, disease_idx, disease_count);
-        push_substance_change(sim, target);
-        return;
-    }
-    if target_state == 1 {
-        let gas = updated.element_idx.get(target);
-        if !displace_gas(sim, target, gas) {
-            place_subtract(sim, target, elem, mass, temperature, disease_idx, disease_count);
+        // 阶段 2：从目标格向下走，跳过固体、挤走气/液、落到第一个非固体格
+        let mut cur = cell;
+        loop {
+            if cur >= total {
+                return;
+            }
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            let cur_elem = updated.element_idx.get(cur);
+            if cur_elem == sim.unobtanium_element_idx {
+                return;
+            }
+            let state = match elements_table::get_element_post_process_data(cur_elem) {
+                Some(p) => p.state & 3,
+                None => return,
+            };
+            match state {
+                3 => {
+                    cur += width;
+                    continue;
+                }
+                1 => {
+                    crate::c2_physics::liquid_flow::displace_gas(sim, cur, cur_elem);
+                }
+                2 => {
+                    crate::c2_physics::liquid_flow::displace_liquid(sim, cur, cur_elem);
+                }
+                _ => {}
+            }
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.element_idx.set(cur, elem);
+            updated.mass.set(cur, remaining);
+            updated.temperature.set(cur, temperature);
+            updated.disease_idx.set(cur, disease_idx);
+            updated.disease_count.set(cur, disease_count);
+            push_substance_change(sim, cur);
             return;
         }
-    } else {
-        let liq = updated.element_idx.get(target);
-        displace_liquid(sim, target, liq);
     }
-    let updated = unsafe { &mut *sim.updated_cells.ptr };
-    updated.element_idx.set(target, elem);
-    add_mass_and_update_temperature(updated, target, mass, temperature, disease_idx, disease_count);
-    push_substance_change(sim, target);
+    // —— Type 1：OnlyIfSameElement（L134744-134789）——
+    if add_sub_type == 1 {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        let cur_elem = updated.element_idx.get(cell);
+        let state = match elements_table::get_element_post_process_data(cur_elem) {
+            Some(p) => p.state & 3,
+            None => return,
+        };
+        match state {
+            3 => {
+                if cur_elem != elem {
+                    return;
+                }
+            }
+            1 => {
+                crate::c2_physics::liquid_flow::displace_gas(sim, cell, cur_elem);
+            }
+            2 => {
+                crate::c2_physics::liquid_flow::displace_liquid(sim, cell, cur_elem);
+            }
+            _ => {}
+        }
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        add_mass_and_update_temperature(updated, cell, mass, temperature, disease_idx, disease_count);
+        push_substance_change(sim, cell);
+        return;
+    }
+    // —— 其他 Type → no-op（原版直接 return）——
 }
 
 /// DoPressureBreak（原版 04_temperature.c L2663-2792）：超压液体沿一个方向尝试突破。
@@ -3347,6 +3403,157 @@ mod tests {
                 "异液体应挤到邻格：合计 50，got {}",
                 displaced
             );
+        }
+        DestroyElementsTable();
+    }
+
+    /// AddSolid Type 0（DoVerticalDisplacement）：先同列上方补满，剩余落到目标格。
+    /// 元素表：0=气体 / 1=液体 / 2=固体（max_mass=1000）。
+    #[test]
+    fn add_solid_vertical_displacement_fills_above_and_places_down() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        {
+            let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
+            table.post_process_data[2].max_mass = 1000.0;
+        }
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(8, 2); // row1 col2 同元素固体
+            u.mass.set(8, 900.0);
+            u.temperature.set(8, 300.0);
+            u.element_idx.set(14, 0); // row2 col2 气体
+            u.mass.set(14, 0.1);
+            u.temperature.set(14, 300.0);
+            u.element_idx.set(20, 0); // row3 col2 气体
+            u.mass.set(20, 0.1);
+            u.temperature.set(20, 300.0);
+        }
+        crate::c2_physics::liquid_flow::add_solid(&mut sd, 14, 2, 150.0, 400.0, 0xFF, 0, 0);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.mass.get(8) - 1000.0).abs() < 1e-3,
+                "上方应补满到 1000，got {}",
+                u.mass.get(8)
+            );
+            assert_eq!(u.element_idx.get(14), 2, "目标格应变成固体");
+            assert!(
+                (u.mass.get(14) - 50.0).abs() < 1e-3,
+                "剩余 50kg 应落到目标格，got {}",
+                u.mass.get(14)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// AddSolid Type 0：目标格已是同元素固体 → 跳过，继续向下落到气体格。
+    #[test]
+    fn add_solid_vertical_displacement_skips_solid_and_displaces_gas() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 4 元素表：0=气体 / 1=液体 / 2=固体A（max_mass 1000）/ 3=固体B（不同元素）
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(4);
+        for (id, state) in [(0i32, 1u8), (1i32, 2u8), (2i32, 3u8), (3i32, 3u8)] {
+            let mut e = Element::default();
+            e.id = id;
+            e.state = state;
+            e.max_mass = 1000.0;
+            e.number_of_gradient_colors = 1;
+            let bytes =
+                unsafe { std::slice::from_raw_parts(&e as *const Element as *const u8, 164).to_vec() };
+            w.write_bytes(&bytes);
+        }
+        for _ in 0..4 {
+            w.write_int(0);
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        assert!(!CreateElementsTable(&mut reader).is_null());
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(8, 2); // row1 固体A（可补满）
+            u.mass.set(8, 900.0);
+            u.temperature.set(8, 300.0);
+            u.element_idx.set(14, 3); // row2 固体B（不同元素，阶段 1 跳过 + 行走跳过）
+            u.mass.set(14, 100.0);
+            u.temperature.set(14, 300.0);
+            u.element_idx.set(20, 0); // row3 气体 → 挤走并放置
+            u.mass.set(20, 0.5);
+            u.temperature.set(20, 300.0);
+        }
+        crate::c2_physics::liquid_flow::add_solid(&mut sd, 14, 2, 150.0, 400.0, 0xFF, 0, 0);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.mass.get(8) - 1000.0).abs() < 1e-3,
+                "上方补满，got {}",
+                u.mass.get(8)
+            );
+            assert_eq!(u.element_idx.get(20), 2, "剩余落到 row3（跳过 row2 固体）");
+            assert!(
+                (u.mass.get(20) - 50.0).abs() < 1e-3,
+                "剩余 50kg，got {}",
+                u.mass.get(20)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// AddSolid Type 1（OnlyIfSameElement）：目标固体不同元素 → no-op；同元素 → 合并。
+    #[test]
+    fn add_solid_only_same_element_solid_noop_and_merge() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(14, 2);
+            u.mass.set(14, 100.0);
+            u.temperature.set(14, 300.0);
+        }
+        // 不同元素 → no-op
+        crate::c2_physics::liquid_flow::add_solid(&mut sd, 14, 0, 50.0, 400.0, 0xFF, 0, 1);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.element_idx.get(14), 2, "不应替换");
+            assert!((u.mass.get(14) - 100.0).abs() < 1e-3);
+        }
+        // 同元素 → 合并
+        crate::c2_physics::liquid_flow::add_solid(&mut sd, 14, 2, 50.0, 400.0, 0xFF, 0, 1);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.mass.get(14) - 150.0).abs() < 1e-3,
+                "应合并到 150，got {}",
+                u.mass.get(14)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// AddSolid 其他 Type → no-op。
+    #[test]
+    fn add_solid_other_type_is_noop() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(14, 0);
+            u.mass.set(14, 0.1);
+            u.temperature.set(14, 300.0);
+        }
+        crate::c2_physics::liquid_flow::add_solid(&mut sd, 14, 2, 50.0, 400.0, 0xFF, 0, 9);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.element_idx.get(14), 0, "不应放置");
         }
         DestroyElementsTable();
     }
