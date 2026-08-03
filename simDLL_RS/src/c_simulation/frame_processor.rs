@@ -58,6 +58,10 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
 
     // 步骤 14+: 其他 Component 消息处理（C2 桩）
     process_component_messages_stubs(frame, sim_data);
+
+    // 原版 ProcessFrame 末尾（L117034-117046）：frame.debugProperties → simData.debugProperties。
+    // 缺失导致 building_temperature_scale 恒 0 → 建筑↔格子换热 k=0 失效，is_debug_editing 恒 false。
+    sim_data.debug_properties = frame.debug_properties;
 }
 
 /// ProcessDigPoints：处理挖掘点。
@@ -1385,6 +1389,25 @@ mod tests {
         assert_eq!(insulation_u8(0.01), 2); // 0.01×255 = 2.55 → 2（隔热砖）
         assert_eq!(insulation_u8(0.5), 127); // 127.5 → 127
         assert_eq!(insulation_u8(-1.0), 0); // 负值截断为 0
+    }
+
+    #[test]
+    fn process_frame_copies_debug_properties_to_sim_data() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        use crate::a_framework::sim_data::DebugProperties;
+        let mut frame = SimFrameInfo::default();
+        frame.debug_properties = DebugProperties {
+            building_temperature_scale: 100.0,
+            building_to_building_temperature_scale: 100.0,
+            is_debug_editing: true,
+            pad: [false; 3],
+        };
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, true);
+        process_frame(&mut frame, &mut sd);
+        // 原版 ProcessFrame 末尾（L117034-117046）复制到 SimData
+        assert_eq!(sd.debug_properties.building_temperature_scale, 100.0);
+        assert_eq!(sd.debug_properties.building_to_building_temperature_scale, 100.0);
+        assert!(sd.debug_properties.is_debug_editing);
     }
     use crate::LIB_TESTS_LOCK;
 

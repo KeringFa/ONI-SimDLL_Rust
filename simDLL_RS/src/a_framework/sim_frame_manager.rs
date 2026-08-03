@@ -305,7 +305,12 @@ impl SimFrameManager {
                 clear_component_messages(&mut frame.radiation_emitter_messages);
                 // 重置帧时间和调试属性
                 frame.elapsed_seconds = 0.0;
-                frame.debug_properties = DebugProperties::default();
+                // 原版 SimFrameManager 构造默认 0.001（L113777-113778），C# SetDebugProperties 覆盖为 100f
+                frame.debug_properties = DebugProperties {
+                    building_temperature_scale: 0.001,
+                    building_to_building_temperature_scale: 0.001,
+                    ..DebugProperties::default()
+                };
             }
         }
         self.current_frame = frame_ptr;
