@@ -293,3 +293,21 @@
 - 新增索引：docs/superpowers/2026-08-03-module-index.md —— 模块→项目文件→原版位置
   （split 文件:行号 + SimDLL_Source.c 行号），A/B/C1/C2 四类全覆盖 + 已知偏差维护提醒。
 - 后续（剩余清单 #1）：ElementEmitter 本体（04_temperature.c L1609-2000）。
+
+## [待实测] ElementEmitter + 火箭热 + AddSolid 垂直位移（2026-08-03）
+
+- 规格：docs/superpowers/specs/2026-08-03-emitter-energy-addsolid-design.md（80cc55a）
+- 计划：docs/superpowers/plans/2026-08-03-emitter-energy-addsolid.md（e3fb04d）
+- A ElementEmitter（6055bcf→6a2910e）：注册表（44B 记录 + 版本句柄 + free list）+
+  Add/Modify/Remove（16/32/8B）+ Update（计时/BFS 可达/堵通回调/TryEmit 气液固三态）+
+  emitted_mass_info 输出（copy 交换已就绪，挂 update_data 组件阶段）。
+- B ProcessCellEnergyModifications（4650760，06_process_messages.c L134-211）：ModifyEnergy
+  落地——火箭 3×9 热（RocketEngineCluster.DoBurn → SimMessages.ModifyEnergy → sim 加能量
+  ΔT=kJ/(mass×SHC)、钳制 max(旧,maxT) 与 [1,10000]、DoStateTransition）、Burner 建筑通用。
+- C add_solid 重写（6055bcf）：Type 0 DoVerticalDisplacement（同列 4 格补满 + 向下落格，
+  流星/AddRemoveSubstance 固体默认） / Type 1 OnlyIfSameElement / 其他 no-op；
+  frame_processor 传 entry.flags；删除"四邻搜索混合版"。
+- 全量 418 测试串行全过；release 构建成功。
+- **待实测**：① 化肥机持续出天然气 + "Emitting" 状态 + 压力满 blocked 切换；
+  ② 火箭发射/降落地面 3×9 区域升温；③ 流星撞击生成固体方块（垂直位移落点）；
+  ④ 反应堆融毁核废料流星 + 3000°C 核废液 AddLiquid。
