@@ -1026,6 +1026,62 @@ pub(crate) fn push_spawn_fx(sim: &mut SimData, sim_cell: usize, fx_id: i32, rota
     }
 }
 
+/// 液体 offgas 产气辅助（原版 L149810 匿名 lambda 的可观测语义）：
+/// 源格扣 amount 质量（病菌按比例），目标格获得 sublimateIndex 气体
+/// （真空/异种 → 换元素 + substance 事件；同种 → 质量合并），温度加权；
+/// merge_disease=true 时按 add_mass_and_update_temperature 合并病菌，否则只合质量/温度。
+/// src_cell == dst_cell 时等价于"就地转气体"（耗尽路径）。
+fn emit_sublimate_gas(
+    sim: &mut SimData,
+    src_cell: usize,
+    dst_cell: usize,
+    amount: f32,
+    merge_disease: bool,
+    sublimate_index: u16,
+) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if src_cell >= updated.mass.len() || dst_cell >= updated.mass.len() {
+        return;
+    }
+    // 源格扣质量/病菌（比例），病菌 idx 先读
+    let src_mass = updated.mass.get(src_cell);
+    let src_disease_idx = updated.disease_idx.get(src_cell);
+    let src_disease_count = updated.disease_count.get(src_cell);
+    let d = if src_mass > 0.0 {
+        (src_disease_count as f32 * (amount / src_mass)) as i32
+    } else {
+        0
+    };
+    updated.mass.set(src_cell, src_mass - amount);
+    let remain = updated.disease_count.get(src_cell) - d;
+    if remain < 1 {
+        clear_disease(updated, src_cell);
+    } else {
+        updated.disease_count.set(src_cell, remain);
+    }
+    // 目标格：真空/异种 → 换元素 + 事件
+    let dst_elem = updated.element_idx.get(dst_cell);
+    if dst_elem != sublimate_index {
+        updated.element_idx.set(dst_cell, sublimate_index);
+        push_substance_change(sim, dst_cell);
+    }
+    let src_temp = updated.temperature.get(src_cell);
+    if merge_disease {
+        add_mass_and_update_temperature(updated, dst_cell, amount, src_temp, src_disease_idx, d);
+    } else {
+        let cur_mass = updated.mass.get(dst_cell);
+        let new_mass = cur_mass + amount;
+        let cur_temp = updated.temperature.get(dst_cell);
+        let avg = (cur_mass * cur_temp + src_temp * amount) / new_mass;
+        let mixed = avg.clamp(cur_temp.min(src_temp), cur_temp.max(src_temp));
+        updated.mass.set(dst_cell, new_mass);
+        updated.temperature.set(dst_cell, mixed);
+    }
+}
+
 /// DoSublimation（原版 SimDLL_Source.c L148591-148880）——自然固体格升华。
 /// 由真空/气体格驱动（PostProcessCell 真空/气体分支末尾调用）：检查四邻固体砖
 /// （上/右/左/下），概率门通过后把砖块质量以升华产物气体形式转移到调用格。
@@ -2275,14 +2331,16 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                     fvar24 = 1.0;
                 }
                 // 原版 L2770-2785：**上方格**（cell-width，原版 L2758 local_104 = cell-width）
-                // 同元素且更重 → 用上方质量重算 fVar24。
+                // 同元素且更重 → 用上方质量重算 fVar24（bVar9 = 更重标记，耗尽路径第二段判定用）。
                 // ⚠️ 修复轮：旧实现误用下方格（below=cell+width），原版读的是 cell-width，已修正。
+                let mut heavier_up = false;
                 let up = cell.wrapping_sub(width);
                 {
                     let updated = unsafe { &*sim.updated_cells.ptr };
                     if updated.element_idx.get(up) == elem {
                         let mass_up = updated.mass.get(up);
                         if mass_cell < mass_up {
+                            heavier_up = true;
                             fvar24 = ppd.off_gas_percentage * mass_up;
                             if fvar24 >= 1.0 {
                                 fvar24 = 1.0;
@@ -2290,8 +2348,11 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                         }
                     }
                 }
-                // 原版 L2788-2790：剩余质量 >= 0.01 且 fVar24 > 0 才继续
-                if mass_cell - fvar24 >= 0.01 && fvar24 > 0.0 {
+                // 原版 L2788-2790：剩余质量 >= 0.01（fVar24 <= 0 时原版直接 return，无 FX）
+                if mass_cell - fvar24 >= 0.01 {
+                    if fvar24 <= 0.0 {
+                        return;
+                    }
                     // 原版 L2792-2804：下方格元素非升华目标且非真空 → 先 DisplaceGas
                     // 把下方异类气体挤走；挤不走 → return（不累积，跳过 SpawnFX）。
                     // ⚠️ 修复轮：此项为原版 L2799 前置（旧实现缺失）。
@@ -2317,13 +2378,44 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                     if room < scaled {
                         fvar24 = fvar24 * (room / scaled);
                     }
+                    // 病菌合并判定（L149806-149819）：同菌种或目标无菌 → 合并
+                    let merge = {
+                        let updated = unsafe { &*sim.updated_cells.ptr };
+                        let src_idx = updated.disease_idx.get(cell);
+                        let dst_idx = updated.disease_idx.get(below);
+                        src_idx == dst_idx || dst_idx == 0xff
+                    };
+                    // 原版 L149810：产气（源格扣质量/病菌，目标格得升华气体）
+                    emit_sublimate_gas(sim, cell, below, fvar24, merge, ppd.sublimate_index);
                     // 原版 L2831-2832：accumulated_flow[cell] += fVar24
                     let total = sim.width as usize * sim.height as usize;
                     let acc = unsafe { std::slice::from_raw_parts_mut(sim.accumulated_flow.ptr, total) };
                     if cell < total {
                         acc[cell] += fvar24;
                     }
+                } else {
+                    // 耗尽路径（L149821-149833）：液体格就地转气体；差额从 cell-width 补足
+                    emit_sublimate_gas(sim, cell, cell, mass_cell, true, ppd.sublimate_index);
+                    if fvar24 - mass_cell > 0.0 && heavier_up {
+                        let down = cell.wrapping_sub(width);
+                        let merge = {
+                            let updated = unsafe { &*sim.updated_cells.ptr };
+                            let src_idx = updated.disease_idx.get(down);
+                            let cell_idx = updated.disease_idx.get(cell);
+                            src_idx == cell_idx || cell_idx == 0xff
+                        };
+                        emit_sublimate_gas(
+                            sim,
+                            down,
+                            cell,
+                            fvar24 - mass_cell,
+                            merge,
+                            ppd.sublimate_index,
+                        );
+                    }
                 }
+                // 原版 LAB_18004e400：SpawnFX(cell, sublimateFX, 0.0)
+                push_spawn_fx(sim, cell, ppd.sublimate_fx, 0.0);
             }
         }
     }
@@ -3594,7 +3686,8 @@ mod tests {
         DestroyElementsTable();
     }
 
-    /// 原版守卫：质量恰好 0.01 → 不蒸发（`mass <= 0.01 && mass != 0.01`）。
+    /// 原版守卫：质量恰好 0.01 → 不蒸发（`mass <= 0.01 && mass != 0.01`），
+    /// 但会走 offgas 耗尽路径就地转升华气体（原版 L149821：fVar23−fVar24 < 0.01 分支）。
     #[test]
     fn post_process_keeps_exact_0_01() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
@@ -3612,7 +3705,7 @@ mod tests {
         post_process_cell(&mut sd, 14);
         unsafe {
             let updated = &*sd.updated_cells.ptr;
-            assert_eq!(updated.element_idx.get(14), 1, "恰好 0.01 不蒸发");
+            assert_eq!(updated.element_idx.get(14), 3, "0.01 不蒸发，但耗尽路径就地转升华气体");
             assert!((updated.mass.get(14) - 0.01).abs() < 1e-9);
         }
         DestroyElementsTable();
@@ -4696,10 +4789,12 @@ mod tests {
                 "挤走异类气体后仍应累积 1.0，got {}",
                 acc[14]
             );
-            // 气体被挤到 cell26（下方格 20 的下方），cell20 清空为真空
+            // 气体被挤到 cell26（下方格 20 的下方），随后产气使 cell20 变成升华气体（原版 L149810）
             assert_eq!(updated.element_idx.get(26), 5, "异类气体应被挤到 cell26");
             assert!((updated.mass.get(26) - 0.1).abs() < 1e-3, "cell26 应收到 0.1 质量");
-            assert_eq!(updated.element_idx.get(20), 0, "cell20 应清空为真空");
+            assert_eq!(updated.element_idx.get(20), 3, "挤走后产气 → cell20 变升华气体");
+            assert!((updated.mass.get(20) - 1.0).abs() < 1e-3, "cell20 收到 1.0 产气");
+            assert!((updated.mass.get(14) - 99.0).abs() < 1e-3, "液体扣 1.0");
         }
         DestroyElementsTable();
     }
@@ -4865,5 +4960,155 @@ mod tests {
             assert_eq!(fx1.fx_id, 102);
             assert_eq!(fx1.rotation, 0.0);
         }
+    }
+
+    /// 液体 offgas 主路径产气（L149806-149819）：cell14 液体 mass=100@300、病菌 100，
+    /// 目标 20 真空。f24 = min(0.5×100, 1.0) = 1.0；目标换元素 5、质量 1.0、温度 300、
+    /// 病菌按比例 1；液体格扣 1.0/病菌 1；acc[14] += 1.0；SpawnFX(14, 107, 0.0)。
+    #[test]
+    fn offgas_main_path_emits_into_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 7); // 液体
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.disease_idx.set(14, 3);
+            updated.disease_count.set(14, 100);
+            updated.element_idx.set(20, 0); // 目标真空
+            updated.mass.set(20, 0.0);
+            updated.temperature.set(20, 0.0);
+            updated.disease_idx.set(20, 0xff); // 无菌哨兵（clear_disease 同款，原版 L149816 判定）
+            updated.element_idx.set(8, 0); // cell-width 真空，跳过同元素重算
+            updated.mass.set(8, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(20), 5, "目标换成污染氧");
+            assert!((updated.mass.get(20) - 1.0).abs() < 1e-4);
+            assert!((updated.temperature.get(20) - 300.0).abs() < 1e-4);
+            assert_eq!(updated.disease_idx.get(20), 3);
+            assert_eq!(updated.disease_count.get(20), 1, "病菌按 1/100 比例");
+            assert!((updated.mass.get(14) - 99.0).abs() < 1e-4, "液体扣 1.0");
+            assert_eq!(updated.disease_count.get(14), 99);
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!((acc[14] - 1.0).abs() < 1e-4);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1);
+            assert_eq!(events.substance_change_info.get(0).cell_idx, 9, "sim20 → game 9");
+            assert_eq!(events.spawn_fx_info.len(), 1);
+            let fx = events.spawn_fx_info.get(0);
+            assert_eq!(fx.cell_idx, 5);
+            assert_eq!(fx.fx_id, 107);
+            assert_eq!(fx.rotation, 0.0);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 同种气体合并 + 病菌合并（同菌种）：目标 20 = 气体5 mass 0.5@200、病菌 10。
+    /// f24 = 1.0；room = 1.8-0.5 = 1.3 ≥ 1.0 → 不缩放；合并后质量 1.5、温度 266.67、
+    /// 病菌 10+1=11；无 substance 事件（同元素）。
+    #[test]
+    fn offgas_main_path_merges_same_gas_and_disease() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 7);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.disease_idx.set(14, 3);
+            updated.disease_count.set(14, 100);
+            updated.element_idx.set(20, 5); // 同种气体
+            updated.mass.set(20, 0.5);
+            updated.temperature.set(20, 200.0);
+            updated.disease_idx.set(20, 3);
+            updated.disease_count.set(20, 10);
+            updated.element_idx.set(8, 0);
+            updated.mass.set(8, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(20) - 1.5).abs() < 1e-4);
+            assert!((updated.temperature.get(20) - 266.667).abs() < 1e-2, "温度加权");
+            assert_eq!(updated.disease_count.get(20), 11, "同菌种合并");
+            assert!((updated.mass.get(14) - 99.0).abs() < 1e-4);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 0, "同元素合并无事件");
+        }
+        DestroyElementsTable();
+    }
+
+    /// room 缩放（L2809-2812）：目标 20 = 气体5 mass 1.0；scaled = 1.0，room = 0.8 →
+    /// f24 = 0.8；目标恰好 1.8；液体扣 0.8；acc[14] = 0.8。
+    #[test]
+    fn offgas_main_path_scales_to_room() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 7);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(20, 5);
+            updated.mass.set(20, 1.0);
+            updated.temperature.set(20, 300.0);
+            updated.element_idx.set(8, 0);
+            updated.mass.set(8, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(20) - 1.8).abs() < 1e-4, "目标恰好 1.8");
+            assert!((updated.mass.get(14) - 99.2).abs() < 1e-4);
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!((acc[14] - 0.8).abs() < 1e-4);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 异类气体 DisplaceGas 失败 → 直接 return：无产气、无扣质量、无 acc、无 FX。
+    /// 目标 20 = 气体3（≠产物5），其四邻 [26,19,21,14] 全为固体/液体 → 挤不走。
+    #[test]
+    fn offgas_main_path_returns_when_displace_fails() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.tick_count = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 7);
+            updated.mass.set(14, 100.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(20, 3); // 异类气体
+            updated.mass.set(20, 0.1);
+            updated.temperature.set(20, 300.0);
+            updated.element_idx.set(8, 0);
+            updated.mass.set(8, 0.0);
+            for nb in [26usize, 19, 21] {
+                updated.element_idx.set(nb, 6); // 固体堵死
+                updated.mass.set(nb, 500.0);
+            }
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(14) - 100.0).abs() < 1e-4, "挤不走则不产气");
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert_eq!(acc[14], 0.0);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.spawn_fx_info.len(), 0);
+        }
+        DestroyElementsTable();
     }
 }
