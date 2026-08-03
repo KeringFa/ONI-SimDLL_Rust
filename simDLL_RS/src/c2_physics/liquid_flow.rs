@@ -2325,6 +2325,15 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                     let updated = unsafe { &*sim.updated_cells.ptr };
                     updated.mass.get(cell)
                 };
+                // 诊断（临时）：offgas 概率门通过后的输入值
+                tracing::info!(
+                    elem = elem,
+                    mass_cell,
+                    off_gas_percentage = ppd.off_gas_percentage,
+                    sublimate_probability = ppd.sublimate_probability,
+                    random,
+                    "DIAG offgas gate passed"
+                );
                 // 原版 L2765-2769：fVar24 = min(offGasPercentage × mass[cell], 1.0)
                 let mut fvar24 = ppd.off_gas_percentage * mass_cell;
                 if fvar24 >= 1.0 {
@@ -2387,6 +2396,19 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                     };
                     // 原版 L149810：产气（源格扣质量/病菌，目标格得升华气体）
                     emit_sublimate_gas(sim, cell, below, fvar24, merge, ppd.sublimate_index);
+                    // 诊断（临时）：产气后源/目标质量
+                    {
+                        let updated = unsafe { &*sim.updated_cells.ptr };
+                        tracing::info!(
+                            src_cell = cell,
+                            src_mass_after = updated.mass.get(cell),
+                            dst_cell = below,
+                            dst_elem = updated.element_idx.get(below),
+                            dst_mass_after = updated.mass.get(below),
+                            fvar24,
+                            "DIAG offgas emitted"
+                        );
+                    }
                     // 原版 L2831-2832：accumulated_flow[cell] += fVar24
                     let total = sim.width as usize * sim.height as usize;
                     let acc = unsafe { std::slice::from_raw_parts_mut(sim.accumulated_flow.ptr, total) };
@@ -5108,6 +5130,89 @@ mod tests {
             assert_eq!(acc[14], 0.0);
             let events = &*sd.sim_events.ptr;
             assert_eq!(events.spawn_fx_info.len(), 0);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 真实参数回归（对照游戏元素表 DirtyWater：offGasPercentage=0.001、prob=0.01、
+    /// eff=1.0、sublimate→污染氧）：500kg 液体单次产气应为 0.5kg（用户实测原版 500g），
+    /// 而非 250kg（0.5×mass 的错误量级）。
+    #[test]
+    fn offgas_realistic_dirty_water_emits_500g_from_500kg() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 自建 3 元素表：0=真空、1=液体（offGas=0.001/eff=1.0/prob=1.0，prob 用 1.0 使测试确定）、2=气体
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(3);
+        let elems = [
+            Element::default(),
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e.sublimate_index = 2;
+                e.sublimate_probability = 1.0;
+                e.off_gas_percentage = 0.001; // 真实 DirtyWater 值
+                e.sublimate_efficiency = 1.0;
+                e.sublimate_fx = 107;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 2;
+                e.state = 1;
+                e.number_of_gradient_colors = 1;
+                e.molar_mass = 44.0;
+                e
+            },
+        ];
+        for elem in &elems {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..3 {
+            w.write_int(0);
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1);
+            updated.mass.set(14, 500.0);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(20, 0);
+            updated.mass.set(20, 0.0);
+            updated.temperature.set(20, 0.0);
+            updated.disease_idx.set(20, 0xff);
+            updated.element_idx.set(8, 0);
+            updated.mass.set(8, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(20), 2, "目标变成污染氧");
+            assert!(
+                (updated.mass.get(20) - 0.5).abs() < 1e-4,
+                "500kg 液体应产 0.5kg 污染氧（offGas 0.001×500），got {}",
+                updated.mass.get(20)
+            );
+            assert!(
+                (updated.mass.get(14) - 499.5).abs() < 1e-4,
+                "液体应剩 499.5kg，got {}",
+                updated.mass.get(14)
+            );
         }
         DestroyElementsTable();
     }

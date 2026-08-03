@@ -550,6 +550,35 @@ pub extern "C" fn CreateElementsTable(reader: *mut BinaryBufferReader) -> *mut c
         match create_elements_table(reader) {
             Ok(count) => {
                 tracing::info!(count, "CreateElementsTable success");
+                // 诊断（临时）：打印所有带升华属性元素的字段，核对运行时数据
+                {
+                    let table = G_ELEMENTS_TABLE.lock();
+                    if let Ok(t) = table {
+                        for i in 0..t.post_process_data.len() {
+                            let ppd = t.post_process_data[i];
+                            if ppd.sublimate_index != 0xffff {
+                                let name = t
+                                    .element_names
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                tracing::info!(
+                                    idx = i,
+                                    id = t.elements.get(i).map(|e| e.id).unwrap_or(-1),
+                                    name,
+                                    state = ppd.state & 3,
+                                    sublimate_index = ppd.sublimate_index,
+                                    sublimate_rate = ppd.sublimate_rate,
+                                    sublimate_efficiency = ppd.sublimate_efficiency,
+                                    sublimate_probability = ppd.sublimate_probability,
+                                    off_gas_percentage = ppd.off_gas_percentage,
+                                    sublimate_fx = ppd.sublimate_fx,
+                                    "DIAG sublimate element fields"
+                                );
+                            }
+                        }
+                    }
+                }
                 count as usize as *mut c_void
             }
             Err(e) => {
