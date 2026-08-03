@@ -7,7 +7,7 @@
 //! GameData 中的 cells/backwalls 同样为 `UniquePtr<T>`。
 
 use crate::a_framework::sim_data::SimData;
-use crate::a_framework::game_data::GameData;
+use crate::a_framework::game_data::{EmittedMassInfo, GameData};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// CopySimDataToGame 内局部静态 tick_count 的镜像（原版 11_msvcrt_ignored.c L32494-32498）：
@@ -175,11 +175,27 @@ pub fn copy_sim_data_to_game(
             "copy_sim_data_to_game: consumed_mass_info delivered"
         );
     }
-    std::mem::swap(
-        &mut game_data.emitted_mass_info,
-        &mut sim_data.element_emitter.emitted_mass_info,
-    );
-    sim_data.element_emitter.emitted_mass_info.clear_keep_capacity();
+    // 原版 L31626-31648：**不是交换**——resize game 到 sim 长度 → 逐条拷贝 sim→game →
+    // sim 条目原地重置（elemIdx=vacuum、mass=0，**保持向量长度**）。
+    // 关键：sim 侧向量长度恒定（Register 时建立，重置不清长度），无时间帧（elapsed<=0，
+    // update 不跑）时 sim 条目为空但长度仍在 → 拷贝后 game 向量非空 → GDU emittedMassEntries
+    // 永不为 null → C# BuildingElementEmitter 无条件读取不会 NRE（建造肥料合成器瞬间复现）。
+    let sim_len = sim_data.element_emitter.emitted_mass_info.len();
+    game_data.emitted_mass_info.resize(sim_len, EmittedMassInfo::default());
+    for idx in 0..sim_len {
+        game_data.emitted_mass_info.set(idx, sim_data.element_emitter.emitted_mass_info.get(idx));
+        sim_data.element_emitter.emitted_mass_info.set(
+            idx,
+            EmittedMassInfo {
+                elem_idx: 0xFFFF,
+                disease_idx: 0xFF,
+                pad: 0,
+                mass: 0.0,
+                temperature: 0.0,
+                disease_count: 0,
+            },
+        );
+    }
 
     // ElementChunk 每帧输出（原版 CopySimDataToGame elementChunkInfo 交换）
     crate::c_simulation::element_chunk::swap_element_chunk_output(game_data);
@@ -386,6 +402,7 @@ mod tests {
     use crate::a_framework::sim_data::{CellSOA, BackwallSOA};
     use crate::a_framework::sim_events::SimEvents;
     use crate::a_framework::stl_shim::UniquePtr;
+    use crate::LIB_TESTS_LOCK;
 
     /// 构造测试用 SimData（4×4 含边界 = 6×6 = 36 个 cell）
     fn make_test_sim_data() -> SimData {
@@ -641,6 +658,39 @@ mod tests {
         copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 1);
         let dst = unsafe { std::slice::from_raw_parts(gd.accumulated_flow.ptr, 16) };
         assert_eq!(dst[0], 0.0, "清零后 GameData 应读到 0");
+    }
+
+    /// 回归：emitted_mass_info 清空必须**逐条目重置保持长度**（原版 L31641-31648）。
+    /// 若用 clear_keep_capacity()（长度→0），无时间帧（update 不跑）后 sim 侧向量为空，
+    /// 下一次交换把空向量给 game → GDU emittedMassEntries=null → C# BuildingElementEmitter NRE。
+    #[test]
+    fn copy_sim_data_to_game_keeps_emitted_mass_vector_length() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        crate::c_simulation::element_emitter::reset_for_test();
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        // 注册 1 个发射器：add() 会把 sim 输出向量 resize 到 1
+        let msg = crate::c_simulation::element_emitter::AddElementEmitterMsg {
+            max_pressure: 2.0,
+            ..Default::default()
+        };
+        crate::c_simulation::element_emitter::add_element_emitter(&mut sd, &msg);
+        assert_eq!(sd.element_emitter.emitted_mass_info.len(), 1);
+
+        let mut gd = GameData::new(4, 4);
+        // 第一次 copy：game 拿到长度 1
+        copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 1);
+        assert_eq!(gd.emitted_mass_info.len(), 1, "首次 copy 后 game 应为 1");
+
+        // 第二次 copy（模拟无时间帧，update 不跑，sim 侧未重新 resize）：
+        // 清空必须保持长度，game 仍拿到 1 且指针非空
+        copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 2);
+        assert_eq!(
+            gd.emitted_mass_info.len(),
+            1,
+            "无时间帧后 game 输出向量长度必须保持（否则 GDU null → C# NRE）"
+        );
+        assert!(!gd.emitted_mass_info.as_ptr().is_null());
     }
 
     /// 验证 SimData::new_for_allocate 分配了 sim_events。
