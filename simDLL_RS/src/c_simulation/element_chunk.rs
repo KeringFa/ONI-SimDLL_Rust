@@ -286,6 +286,82 @@ pub fn remove_element_chunk(handle: i32) -> bool {
     ELEMENT_CHUNK_MANAGER.lock().remove(handle)
 }
 
+/// ExchangeHeatEnergyWithWorld（原版 L139789-139890）。返回热流（正 = 碎片失热给格子）。
+pub(crate) fn exchange_heat_energy_with_world(
+    sim: &mut SimData,
+    chunk: &mut ElementChunkData,
+    cell: usize,
+    scale: f32,
+    dt: f32,
+) -> f32 {
+    if sim.updated_cells.ptr.is_null() {
+        return 0.0;
+    }
+    let (cell_mass, cell_temp, cell_ins, cell_hc, cell_tc) = {
+        let u = unsafe { &*sim.updated_cells.ptr };
+        if cell >= u.mass.len() || u.mass.get(cell) <= 0.0 {
+            return 0.0;
+        }
+        let elem = u.element_idx.get(cell);
+        let Some(etd) = crate::b_elements::elements_table::get_element_temperature_data(elem) else {
+            return 0.0;
+        };
+        if etd.state & 0x10 != 0 {
+            return 0.0; // TemperatureInsulated → 不换热
+        }
+        (
+            u.mass.get(cell),
+            u.temperature.get(cell),
+            u.insulation.get(cell) as f32,
+            u.mass.get(cell) * etd.specific_heat_capacity,
+            etd.thermal_conductivity,
+        )
+    };
+    if !(0.0..=10000.0).contains(&chunk.temperature) {
+        tracing::error!(t = chunk.temperature, "ElementChunk bad item temperature");
+        return 0.0;
+    }
+    if cell_hc <= 0.0 || chunk.heat_capacity <= 0.0 {
+        return 0.0;
+    }
+    let ins_val = cell_ins * cell_ins * 1.53787e-05;
+    let k_cell = ins_val * cell_tc;
+    let k = chunk.thermal_conductivity.min(k_cell)
+        * scale
+        * chunk.max_energy_transfer_scale_factor
+        * 0.001;
+    // CalculateTemperatureExchange wrapper（冷侧在前）→ (new_chunk, new_cell)
+    let (new_chunk, new_cell) = if chunk.temperature <= cell_temp {
+        crate::c2_physics::temperature::calculate_temperature_exchange_precise(
+            1.0,
+            k,
+            dt,
+            chunk.temperature,
+            chunk.heat_capacity,
+            cell_temp,
+            cell_hc,
+        )
+    } else {
+        let (nn, nc) = crate::c2_physics::temperature::calculate_temperature_exchange_precise(
+            1.0,
+            k,
+            dt,
+            cell_temp,
+            cell_hc,
+            chunk.temperature,
+            chunk.heat_capacity,
+        );
+        (nc, nn)
+    };
+    let heat = (chunk.temperature - new_chunk) * chunk.heat_capacity;
+    chunk.temperature = new_chunk;
+    unsafe {
+        (*sim.updated_cells.ptr).temperature.set(cell, new_cell);
+    }
+    let _ = cell_mass;
+    heat
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +459,72 @@ mod tests {
         // Remove
         assert!(mgr.remove(h));
         assert!(mgr.record(h).is_none());
+    }
+
+    #[test]
+    fn exchange_heat_energy_with_world_exchanges_cell_and_chunk() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut sd = make_sim();
+        // 格 14：水 300°C mass 100 ins 255（HC=200）；碎片：400°C HC=200 TC=4，factor=1000
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(14, 5);
+            u.mass.set(14, 100.0);
+            u.temperature.set(14, 300.0);
+            u.insulation.set(14, 255);
+        }
+        let mut chunk = ElementChunkData {
+            cell: 14,
+            temperature: 400.0,
+            heat_capacity: 200.0,
+            thermal_conductivity: 4.0,
+            max_energy_transfer_scale_factor: 1000.0,
+            ..Default::default()
+        };
+        let heat = exchange_heat_energy_with_world(&mut sd, &mut chunk, 14, 1.0, 0.2);
+        assert!(heat > 0.0, "碎片（热）应失热给格子");
+        assert!(chunk.temperature < 400.0, "碎片应降温，got {}", chunk.temperature);
+        unsafe {
+            assert!(
+                (*sd.updated_cells.ptr).temperature.get(14) > 300.0,
+                "格子应升温"
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_heat_energy_with_world_gates() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut chunk = ElementChunkData {
+            cell: 14,
+            temperature: 400.0,
+            heat_capacity: 200.0,
+            thermal_conductivity: 4.0,
+            max_energy_transfer_scale_factor: 1000.0,
+            ..Default::default()
+        };
+        // mass=0 → 0
+        assert_eq!(
+            exchange_heat_energy_with_world(&mut sd, &mut chunk, 14, 1.0, 0.2),
+            0.0
+        );
+        // 元素 TemperatureInsulated(0x10) → 0
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(14, 5);
+            u.mass.set(14, 100.0);
+            u.temperature.set(14, 300.0);
+        }
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data[5].state = 2 | 0x10;
+        }
+        assert_eq!(
+            exchange_heat_energy_with_world(&mut sd, &mut chunk, 14, 1.0, 0.2),
+            0.0
+        );
     }
 }
