@@ -460,9 +460,23 @@ impl SimFrameManager {
                 emplace_bytes(&mut frame.modify_building_energy_messages, reader, 16)
             }
 
-            // AddBuildingInContactMessages → add_building_in_contact_messages（C2 桩，8B）
+            // ===== BuildingToBuildingHeatExchange 消息（2026-08-03 实现，原版 ProcessFrame L116540-116650）=====
+            // RegisterBuildingToBuildingHeatExchange → adds 8B {callbackIdx, heatExchange_handle}
+            MSG_ADD_BUILDING_TO_BUILDING_HE => {
+                emplace_bytes(&mut frame.building_to_building_heat_exchange_messages.adds, reader, 8)
+            }
+            // RemoveBuildingInContactFromBuildingToBuildingHeatExchange → modifies 8B {self_handle, buildingInContact}
+            MSG_REMOVE_BUILDING_IN_CONTACT => {
+                emplace_bytes(&mut frame.building_to_building_heat_exchange_messages.modifies, reader, 8)
+            }
+            // AddInContactBuildingToBuildingToBuildingHeatExchange → add_building_in_contact_messages 12B
+            // {self_handle, buildingInContact, cellsInContact}（原 8B 修正为 12B）
             MSG_ADD_BUILDING_IN_CONTACT => {
-                emplace_bytes(&mut frame.add_building_in_contact_messages, reader, 8)
+                emplace_bytes(&mut frame.add_building_in_contact_messages, reader, 12)
+            }
+            // RemoveBuildingToBuildingHeatExchange → removes 8B {callbackIdx, handle}
+            MSG_REMOVE_BUILDING_TO_BUILDING_HE => {
+                emplace_bytes(&mut frame.building_to_building_heat_exchange_messages.removes, reader, 8)
             }
 
             // MoveElementChunk → move_element_chunk_messages（原版 ProcessFrame stride +2 = 8B）
@@ -518,10 +532,7 @@ impl SimFrameManager {
             // ===== ComponentMessages 类（C2 桩：返回 true，不 emplace）=====
             // 这些消息在 C1 阶段不处理，但返回 true 表示已识别，避免污染 handler 表查找。
             // C2 阶段会实现真实 emplace 到 adds/modifies/removes vector。
-            MSG_ADD_BUILDING_TO_BUILDING_HE
-            | MSG_REMOVE_BUILDING_TO_BUILDING_HE
-            | MSG_REMOVE_BUILDING_IN_CONTACT
-            | MSG_ADD_ELEMENT_EMITTER
+            MSG_ADD_ELEMENT_EMITTER
             | MSG_MODIFY_ELEMENT_EMITTER
             | MSG_REMOVE_ELEMENT_EMITTER
             | MSG_ADD_DISEASE_EMITTER
@@ -1055,6 +1066,72 @@ mod tests {
         ));
         assert_eq!(frame.element_chunk_messages.removes.len(), 8);
 
+        unsafe { let _ = Box::from_raw(mgr.current_frame); }
+    }
+
+    #[test]
+    fn handle_message_building_to_building_routes() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut result: *mut c_void = std::ptr::null_mut();
+        // Register 8B {callbackIdx, heatExchange_handle} → adds
+        let mut reg = vec![0u8; 8];
+        reg[0..4].copy_from_slice(&(-1i32).to_le_bytes());
+        reg[4..8].copy_from_slice(&7i32.to_le_bytes());
+        let mut r = BinaryBufferReader::new(&reg);
+        assert!(mgr.handle_message(
+            MessageType::AddBuildingToBuildingHeatExchange as u32,
+            &mut r,
+            &mut result
+        ));
+        assert_eq!(
+            unsafe { &*mgr.current_frame }
+                .building_to_building_heat_exchange_messages
+                .adds
+                .len(),
+            8
+        );
+        // AddInContact 12B（原 8B 错误）
+        let mut ac = vec![0u8; 12];
+        let mut r = BinaryBufferReader::new(&ac);
+        assert!(mgr.handle_message(
+            MessageType::AddInContactBuildingToBuildingToBuildingHeatExchange as u32,
+            &mut r,
+            &mut result
+        ));
+        assert_eq!(
+            unsafe { &*mgr.current_frame }.add_building_in_contact_messages.len(),
+            12
+        );
+        // RemoveInContact 8B → modifies
+        let mut rc = vec![0u8; 8];
+        let mut r = BinaryBufferReader::new(&rc);
+        assert!(mgr.handle_message(
+            MessageType::RemoveBuildingInContactFromBuildingToBuildingHeatExchange as u32,
+            &mut r,
+            &mut result
+        ));
+        assert_eq!(
+            unsafe { &*mgr.current_frame }
+                .building_to_building_heat_exchange_messages
+                .modifies
+                .len(),
+            8
+        );
+        // Remove 8B {callbackIdx, handle} → removes
+        let mut rm = vec![0u8; 8];
+        let mut r = BinaryBufferReader::new(&rm);
+        assert!(mgr.handle_message(
+            MessageType::RemoveBuildingToBuildingHeatExchange as u32,
+            &mut r,
+            &mut result
+        ));
+        assert_eq!(
+            unsafe { &*mgr.current_frame }
+                .building_to_building_heat_exchange_messages
+                .removes
+                .len(),
+            8
+        );
         unsafe { let _ = Box::from_raw(mgr.current_frame); }
     }
 

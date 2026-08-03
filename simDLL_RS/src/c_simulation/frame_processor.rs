@@ -55,6 +55,8 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     // 步骤 13: ElementConsumer 消息（Register/Modify/Unregister，2026-08-02 实现）
     process_element_consumer_messages(frame, sim_data);
     process_building_heat_exchange_messages(frame, sim_data);
+    // 原版 ProcessFrame 中 BuildingToBuilding 段位于 buildingHeatExchange 与 elementChunk 之间（L116540-116650）
+    process_building_to_building_messages(frame, sim_data);
     process_element_chunk_messages(frame, sim_data);
 
     // 步骤 14+: 其他 Component 消息处理（C2 桩）
@@ -1116,6 +1118,135 @@ fn process_building_heat_exchange_messages(frame: &mut SimFrameInfo, sim_data: &
     }
 }
 
+/// Frame handling for BuildingToBuildingHeatExchange messages（原版 ProcessFrame L116540-116650）：
+/// adds(Register 8B) → modifies(RemoveInContact 8B) → addInContact(Add 12B) → removes(Unregister 8B)。
+/// Register/Remove 均带 callbackIdx：≠-1 时推 componentStateChanged（注册失败推 sim_handle=-1，
+/// remove 恒推 -1，与原版一致）。
+fn process_building_to_building_messages(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    if sim_data.sim_events.ptr.is_null() {
+        frame
+            .building_to_building_heat_exchange_messages
+            .adds
+            .clear_keep_capacity();
+        frame
+            .building_to_building_heat_exchange_messages
+            .modifies
+            .clear_keep_capacity();
+        frame
+            .building_to_building_heat_exchange_messages
+            .removes
+            .clear_keep_capacity();
+        frame.add_building_in_contact_messages.clear_keep_capacity();
+        return;
+    }
+    // adds：8B {callbackIdx, heatExchange_handle} → Register
+    {
+        let adds = frame
+            .building_to_building_heat_exchange_messages
+            .adds
+            .as_slice();
+        let n = adds.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let callback_idx = i32::from_le_bytes(adds[off..off + 4].try_into().unwrap());
+            let heat_exchange_handle =
+                i32::from_le_bytes(adds[off + 4..off + 8].try_into().unwrap());
+            let handle =
+                crate::c_simulation::building_to_building::register_building_to_building(
+                    callback_idx,
+                    heat_exchange_handle,
+                );
+            tracing::info!(
+                callback = callback_idx,
+                heat_exchange_handle,
+                handle,
+                "building_to_building: registered"
+            );
+            if callback_idx != -1 {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events
+                    .component_state_changed_messages
+                    .push(crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx,
+                        sim_handle: handle, // 注册失败时 handle=-1，与原版 Register 一致
+                    });
+            }
+        }
+        frame
+            .building_to_building_heat_exchange_messages
+            .adds
+            .clear_keep_capacity();
+    }
+    // modifies：8B {self_handle, buildingInContact} → RemoveInContact
+    {
+        let mods = frame
+            .building_to_building_heat_exchange_messages
+            .modifies
+            .as_slice();
+        let n = mods.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let self_handle = i32::from_le_bytes(mods[off..off + 4].try_into().unwrap());
+            let building_in_contact =
+                i32::from_le_bytes(mods[off + 4..off + 8].try_into().unwrap());
+            crate::c_simulation::building_to_building::remove_building_in_contact(
+                self_handle,
+                building_in_contact,
+            );
+        }
+        frame
+            .building_to_building_heat_exchange_messages
+            .modifies
+            .clear_keep_capacity();
+    }
+    // addInContact：12B {self_handle, buildingInContact, cellsInContact} → Add
+    {
+        let bytes = frame.add_building_in_contact_messages.as_slice();
+        let n = bytes.len() / 12;
+        for i in 0..n {
+            let off = i * 12;
+            let self_handle = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let building_in_contact =
+                i32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            let cells_in_contact =
+                i32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+            crate::c_simulation::building_to_building::add_building_to_building_contact(
+                self_handle,
+                building_in_contact,
+                cells_in_contact,
+            );
+        }
+        frame.add_building_in_contact_messages.clear_keep_capacity();
+    }
+    // removes：8B {callbackIdx, handle} → Unregister
+    {
+        let removes = frame
+            .building_to_building_heat_exchange_messages
+            .removes
+            .as_slice();
+        let n = removes.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let callback_idx = i32::from_le_bytes(removes[off..off + 4].try_into().unwrap());
+            let handle = i32::from_le_bytes(removes[off + 4..off + 8].try_into().unwrap());
+            crate::c_simulation::building_to_building::remove_building_to_building(handle);
+            if callback_idx != -1 {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events
+                    .component_state_changed_messages
+                    .push(crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx,
+                        sim_handle: -1, // 原版 remove 回调 sim_handle=-1
+                    });
+            }
+        }
+        frame
+            .building_to_building_heat_exchange_messages
+            .removes
+            .clear_keep_capacity();
+    }
+}
+
 /// BFS 找 radius 内第一个 state==target 的格元素（原版 GetReachableCells + AnyInputCellHasState）。
 fn find_reachable_state(sim: &SimData, x: usize, y: usize, radius: usize, target: u8) -> Option<u16> {
     if sim.updated_cells.ptr.is_null() {
@@ -1432,14 +1563,6 @@ fn process_component_messages_stubs(frame: &mut SimFrameInfo, _sim_data: &mut Si
     // modify_building_energy_messages
     frame.modify_building_energy_messages.clear_keep_capacity();
 
-    // building_to_building_heat_exchange_messages
-    frame.building_to_building_heat_exchange_messages.adds.clear_keep_capacity();
-    frame.building_to_building_heat_exchange_messages.modifies.clear_keep_capacity();
-    frame.building_to_building_heat_exchange_messages.removes.clear_keep_capacity();
-
-    // add_building_in_contact_messages
-    frame.add_building_in_contact_messages.clear_keep_capacity();
-
     // element_chunk_messages
     frame.element_chunk_messages.adds.clear_keep_capacity();
     frame.element_chunk_messages.modifies.clear_keep_capacity();
@@ -1566,6 +1689,88 @@ mod tests {
             events.component_state_changed_messages.get(0).callback_idx,
             7
         );
+    }
+
+    #[test]
+    fn process_building_to_building_messages_registers_contacts_and_callbacks() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 元素表：elem5 供热数据
+        {
+            use crate::b_elements::element::ElementTemperatureData;
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.temperature_data.clear();
+            table.temperature_data.resize(6, ElementTemperatureData::default());
+            let mut water = ElementTemperatureData::default();
+            water.state = 2;
+            water.specific_heat_capacity = 2.0;
+            water.thermal_conductivity = 4.0;
+            table.temperature_data[5] = water;
+        }
+        crate::c_simulation::building_temperature::clear_building_temperature();
+        crate::c_simulation::building_to_building::clear_building_to_building();
+        // 注册 8 个建筑（句柄 0..7），供热记录由 elem5 推导
+        for i in 0..8 {
+            let msg = crate::a_framework::sim_events::AddBuildingHeatExchangeMsg {
+                callback_idx: -1,
+                elem_idx: 5,
+                pad0: 0,
+                pad1: 0,
+                mass: 500.0,
+                temperature: 300.0 + i as f32,
+                thermal_conductivity: 1.0,
+                overheat_temperature: 2000.0,
+                operating_kilowatts: 0.0,
+                min_x: 1,
+                min_y: 2,
+                max_x: 2,
+                max_y: 3,
+            };
+            crate::c_simulation::building_temperature::add_building(&msg);
+        }
+        let mut frame = SimFrameInfo::default();
+        // Register 8B {callbackIdx=7, heatExchange_handle=7} → adds
+        let mut reg = Vec::new();
+        for v in [7i32, 7] {
+            reg.extend_from_slice(&v.to_le_bytes());
+        }
+        for b in &reg {
+            frame.building_to_building_heat_exchange_messages.adds.push(*b);
+        }
+        // AddInContact 12B {self=0, buildingInContact=8, cellsInContact=3}
+        let mut ac = Vec::new();
+        for v in [0i32, 8, 3] {
+            ac.extend_from_slice(&v.to_le_bytes());
+        }
+        for b in &ac {
+            frame.add_building_in_contact_messages.push(*b);
+        }
+        // Remove 8B {callbackIdx=8, handle=0} → removes
+        let mut rm = Vec::new();
+        for v in [8i32, 0] {
+            rm.extend_from_slice(&v.to_le_bytes());
+        }
+        for b in &rm {
+            frame.building_to_building_heat_exchange_messages.removes.push(*b);
+        }
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, true);
+        process_building_to_building_messages(&mut frame, &mut sd);
+        // Register 回调 {callbackIdx=7, sim_handle=0}；Remove 回调 {8, -1}
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.component_state_changed_messages.len(), 2);
+        assert_eq!(
+            events.component_state_changed_messages.get(0).callback_idx,
+            7
+        );
+        assert_eq!(
+            events.component_state_changed_messages.get(0).sim_handle & 0xffffff,
+            0
+        );
+        assert_eq!(
+            events.component_state_changed_messages.get(1).callback_idx,
+            8
+        );
+        assert_eq!(events.component_state_changed_messages.get(1).sim_handle, -1);
     }
     use crate::LIB_TESTS_LOCK;
 
