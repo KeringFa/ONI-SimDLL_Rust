@@ -146,8 +146,10 @@ impl ElementEmitterManager {
         self.items.iter().filter(|&&ri| ri >= 0).count()
     }
 
-    /// Register（原版 L1679）：分配记录 + 返回 handle。
-    pub fn add(&mut self, msg: &AddElementEmitterMsg) -> i32 {
+    /// Register（原版 L1679）：分配记录 + **同步 resize/初始化输出向量**（原版 L1761-1769
+    /// Register 直接写 emittedMassInfo[handleIndex]，保证无时间帧（elapsed<=0，update 不跑）
+    /// 时 C# 也能在回调同帧拿到非空 emittedMassEntries）。
+    pub fn add(&mut self, sim: &mut SimData, msg: &AddElementEmitterMsg) -> i32 {
         let record = ElementEmitterData {
             max_pressure: msg.max_pressure,
             blocked_cb_idx: msg.on_blocked_cb as u32,
@@ -168,7 +170,25 @@ impl ElementEmitterManager {
             self.records.push(record);
             self.versions.push(0);
         }
-        ((self.versions[index] as i32) << 24) | (index as i32 & 0xffffff)
+        let handle = ((self.versions[index] as i32) << 24) | (index as i32 & 0xffffff);
+        // 输出向量 resize 到句柄数并初始化为空（原版 Register 写入 0xffff 条目）
+        let n = self.items.len();
+        let out = &mut sim.element_emitter.emitted_mass_info;
+        out.resize(n, EmittedMassInfo::default());
+        for idx in 0..n {
+            out.set(
+                idx,
+                EmittedMassInfo {
+                    elem_idx: 0xFFFF,
+                    disease_idx: 0xFF,
+                    pad: 0,
+                    mass: 0.0,
+                    temperature: 0.0,
+                    disease_count: 0,
+                },
+            );
+        }
+        handle
     }
 
     /// Modify（原版 L1610）：校验 + 写发射参数；emitMass<=0 → blockedState=0xFF（停用标记）。
@@ -228,8 +248,8 @@ static ELEMENT_EMITTER_MANAGER: Lazy<Mutex<ElementEmitterManager>> =
 pub fn clear_element_emitters() {
     ELEMENT_EMITTER_MANAGER.lock().clear();
 }
-pub fn add_element_emitter(msg: &AddElementEmitterMsg) -> i32 {
-    ELEMENT_EMITTER_MANAGER.lock().add(msg)
+pub fn add_element_emitter(sim: &mut SimData, msg: &AddElementEmitterMsg) -> i32 {
+    ELEMENT_EMITTER_MANAGER.lock().add(sim, msg)
 }
 pub fn modify_element_emitter(sim: &SimData, msg: &ModifyElementEmitterMsg) -> bool {
     ELEMENT_EMITTER_MANAGER.lock().modify(sim, msg)
@@ -610,15 +630,15 @@ mod tests {
     fn add_returns_versioned_handle_and_modify_writes_fields() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         reset_for_test();
+        let mut sim = SimData::new_for_allocate(6, 6, 1, false, false);
         let msg = AddElementEmitterMsg {
             max_pressure: 2.0,
             callback_idx: 7,
             on_blocked_cb: 8,
             on_unblocked_cb: 9,
         };
-        let h = add_element_emitter(&msg);
+        let h = add_element_emitter(&mut sim, &msg);
         assert_eq!(h & 0xffffff, 0, "首个 handle index 0");
-        let sim = SimData::new_for_allocate(6, 6, 1, false, false);
         let m = ModifyElementEmitterMsg {
             handle: h,
             cell_idx: 0,
@@ -648,8 +668,9 @@ mod tests {
     fn modify_with_zero_mass_sets_blocked_state_ff() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         reset_for_test();
-        let h = add_element_emitter(&AddElementEmitterMsg::default());
         let sim = SimData::new_for_allocate(6, 6, 1, false, false);
+        let mut sim = sim;
+        let h = add_element_emitter(&mut sim, &AddElementEmitterMsg::default());
         let m = ModifyElementEmitterMsg {
             handle: h,
             emit_mass: 0.0,
@@ -664,12 +685,32 @@ mod tests {
     fn remove_frees_and_versions_bump() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         reset_for_test();
-        let h = add_element_emitter(&AddElementEmitterMsg::default());
+        let mut sim = SimData::new_for_allocate(6, 6, 1, false, false);
+        let h = add_element_emitter(&mut sim, &AddElementEmitterMsg::default());
         assert!(remove_element_emitter(h));
         assert!(!remove_element_emitter(h), "重复移除应失败");
-        let h2 = add_element_emitter(&AddElementEmitterMsg::default());
+        let h2 = add_element_emitter(&mut sim, &AddElementEmitterMsg::default());
         assert_ne!(h2, h, "版本应递增");
         assert_eq!(h2 & 0xffffff, h & 0xffffff, "index 复用");
+    }
+
+    #[test]
+    fn add_sizes_output_vector_immediately() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        reset_for_test();
+        let mut sim = make_sim();
+        assert_eq!(sim.element_emitter.emitted_mass_info.len(), 0);
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 2.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        // 注册即 resize + 初始化（无需 update()），保证无时间帧下 C# 也能拿到非空指针
+        let out = &sim.element_emitter.emitted_mass_info;
+        assert_eq!(out.len(), 1, "注册后输出向量应立即为 1");
+        assert_eq!(out.get(h as usize & 0xffffff).elem_idx, 0xFFFF);
     }
 
     #[test]
@@ -677,11 +718,14 @@ mod tests {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         reset_for_test();
         init_table();
-        let h = add_element_emitter(&AddElementEmitterMsg {
-            max_pressure: 10.0,
-            ..AddElementEmitterMsg::default()
-        });
         let mut sim = make_sim();
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
         let m = ModifyElementEmitterMsg {
             handle: h,
             cell_idx: 0,
@@ -709,12 +753,15 @@ mod tests {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         reset_for_test();
         init_table();
-        let h = add_element_emitter(&AddElementEmitterMsg {
-            max_pressure: 1.0,
-            on_blocked_cb: 55,
-            ..AddElementEmitterMsg::default()
-        });
         let mut sim = make_sim();
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 1.0,
+                on_blocked_cb: 55,
+                ..AddElementEmitterMsg::default()
+            },
+        );
         // maxDepth=1 → 可达格仅发射格自身；填满质量 >= maxPressure → 堵住
         unsafe {
             let u = &mut *sim.updated_cells.ptr;
