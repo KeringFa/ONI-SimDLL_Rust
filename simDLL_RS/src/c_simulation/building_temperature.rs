@@ -476,7 +476,9 @@ pub fn update_building_heat_exchange(sim_data: &mut SimData) {
                 let low = bldg_t.min(cell_temp);
                 let high = bldg_t.max(cell_temp);
                 let mut new_cell_t = (cell_temp - k / cell_hc).max(low).min(high);
-                let mut new_bldg_t = (k / per_cell_hc + bldg_t).max(low).min(high);
+                // 原版交叉分支不重算 new_bldg_t（L137451-137458 仅更新 k 与 new_cell_t；
+                // 审查 Minor ③，2026-08-03 修正：删除多余重算）。
+                let new_bldg_t = (k / per_cell_hc + bldg_t).max(low).min(high);
                 if (new_bldg_t - new_cell_t) * (bldg_t - cell_temp) < 0.0 {
                     // 交叉：能量守恒均衡（原版 L137451-137458）
                     let inv = 1.0 / (per_cell_hc + cell_hc);
@@ -485,7 +487,6 @@ pub fn update_building_heat_exchange(sim_data: &mut SimData) {
                     let balanced = balanced.max(low).min(high);
                     k = (balanced - bldg_t) * per_cell_hc;
                     new_cell_t = balanced;
-                    new_bldg_t = k / per_cell_hc + bldg_t;
                 }
                 if !(low <= new_cell_t && new_cell_t <= high) {
                     tracing::error!(

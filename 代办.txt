@@ -321,3 +321,71 @@
 - 全量 422 测试串行全过；release 构建成功。
 - **剩余清单更新**：ElementEmitter（#1）与 add_solid 垂直位移（#5）已闭合；
   下一位是**气体流动**（#2，14_liquid_gas_flow.c 气体侧）。
+
+---
+
+## [已完成] 暂缓/差异项对照源码逐一处理（2026-08-03）
+
+**背景**：用户暂缓气体模拟，要求把此前"暂缓或有差异但不重要"的项全部拿出来，
+对照原版源码一一解决。方法：汇总 5 份审查报告 + 分类文档 + 模块索引中的全部
+已知偏差/简化/参考项 → 逐项对照 `OxygenNotIncluded_Source\simDLL_edit\*.c` 分诊。
+
+### 确认差异 → 已修复（5 项，TDD）
+
+1. **压力循环邻格门控**（c2_physics/mod.rs run_pressure_task）
+   - 原版 UpdateData 压力循环（11_msvcrt_ignored.c L42064-42076 水平 / L42126+ 垂直）：
+     邻格须 `pressure state & 3 <= 1`（真空/气体）+ `properties & 1 == 0`（可渗透）
+     + `updatedCells 元素 == cells 元素`（快照一致）+ 同元素或异态。
+   - 旧实现只跳固体（state==3）→ 同元素液体邻格也纳入压差（液体↔液体压差），
+     与原版不符（原版液体↔液体均衡由液体任务处理，压力循环只做液体→真空/气体渗透）。
+   - 修复：门控改为原版四条件；压力循环从 update_liquids 之后移到之前
+     （原版顺序：温度→CopyFrom→压力→CopyFrom→液体→PostProcess）。
+   - 提取 run_pressure_task 独立函数 + 2 条回归测试
+     （同元素液体邻格不转移 / 真空邻格仍转移 12.5%）。
+2. **update_data 阶段顺序**：液体→压力 改为 压力→液体（原版 L42030→L42408）。
+3. **GameData::Drop 泄漏**（a_framework/game_data.rs）：new() 中 7 个
+   `vec![...].leak()` 缓冲区（property_texture_flow/liquid/liquid_data/material_data/
+   exposed_to_sunlight + accumulated_flow + visible_grid）此前 Drop 不释放（旧注释
+   "保持 null"已过时）。修复：Vec::from_raw_parts(ptr, total, total) 释放
+   （与 SimData::Drop 模式一致，sim_data.rs L745-754）。
+4. **BuildingHeatExchange 交叉分支冗余重算**（building_temperature.rs L488）：
+   原版交叉后仅更新 k 与 new_cell_t，不重算 new_bldg_t（11_msvcrt_ignored.c
+   L137451-137458 区段）；删除多余赋值 + mut。
+5. **post_process 过压 0/0 防御**（liquid_flow.rs）：`ppd.max_mass <= 0` 时跳过过压
+   释放分支（原版依赖 maxMass>0 数据不变量，无守卫；避免 pressure_ratio=inf 传播）。
+
+### 确认等价 → 无需修改（记录在案）
+
+- **debug_properties 复制时机**：原版 ProcessFrame 末尾（08_sim_frame_manager.c
+  L1887-1898，diseaseConsumer 之后 return 前）——与我们一致（此前审查 Minor ②
+  记录"ProcessMassConsumption 前"有误，实为末尾）。
+- **conduit frozen/melted 句柄**：原版推 `dataHandleIndices & 0xffffff`（handle
+  index），与我们一致（11_msvcrt_ignored.c L2406-2441）。
+- **calculate_temperature_exchange_precise HC≤0 防御**：等价更稳（原版依赖不变量）。
+- **碎片 maxEnergyScale 除零防御**：thickness=0 → factor=0（原版 inf/nan），等价。
+- **temperature.rs 诊断日志**：已删除（此前升华审查残留，确认不存在）。
+- **powf alpha 参数**：原版反编译丢失参数（05_liquid_flow.c L397 `powf();` 空调用），
+  1.0 占位不可恢复——保持。
+- **ElementEmitter 简化项**（Register 内部向量/区域过滤/emit_state break/offsetIdx
+  递增位置/病菌简化/fast_combined）：均无害等价或已记录简化，不回溯。
+- **管道记录数组非压缩 + temperatureInfo 每帧重建**：性能/输出等价，不回溯。
+- **update_data 遍历顺序（iterateDirection 每帧翻转）**：原版并行任务 + 方向翻转；
+  我们固定方向。属遍历顺序近似（影响同帧内先后，统计行为一致），记录在案。
+
+### 需用户决策/大项（本次未动，列入待办）
+
+- **病菌混合简化（gDisease 表）**：疾病模拟全量（剩余清单 #4），大工程，另行立项。
+- **visible_grid 全可见兜底**：SetVisibleCells 消息的 C# 发送方未定位，找到后可做
+  屏幕级门控（性能项）。
+- **元素表每格加锁性能**：G_ELEMENTS_TABLE Mutex → RwLock/快照（性能项）。
+- **review-full 未覆盖**：a_framework 结构体布局全量核对（00_types_reference）、
+  存档格式、FFI 导出、纹理公式细节——建议单独一轮审查。
+- **用户待提问.txt 两项**：C# 侧小人/动物/植物逐格换热模块归属；液体相变凝固成
+  自然方块 vs 碎片的分界线（温度域收尾后对照源码回答）。
+
+### 验证
+
+- 全量 426 测试串行全过（374+12+11+12+8+9，新增 2 条压力门控回归）；
+  Release 构建成功。
+- **待实测**：部署 DLL → ① 液体水平/向下扩散与合并不回归；② 大片水域铺开行为
+  与原版一致（压力循环顺序/门控变化后重点回归）；③ 过压破坏与满格过压不回归。

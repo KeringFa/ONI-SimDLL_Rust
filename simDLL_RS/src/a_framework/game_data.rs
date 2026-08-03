@@ -359,7 +359,27 @@ impl Drop for GameData {
             unsafe { let _ = Box::from_raw(self.backwalls.ptr); }
             self.backwalls.ptr = std::ptr::null_mut();
         }
-        // flow/accumulatedFlow/visibleGrid/propertyTexture* 在 A3 阶段保持 null，无需释放
+        // 释放 new() 中 vec![...].leak() 分配的缓冲区（len == cap == width × height）。
+        // 2026-08-03 修正：此前仅释放 cells/backwalls，7 个 texture/visible/accumulated
+        // 缓冲区泄漏（旧注释"保持 null"已过时——new() 已实际分配）。
+        // 与 SimData::Drop 的 Vec::from_raw_parts 释放模式一致（sim_data.rs L745-754）。
+        let total = (self.width as usize).saturating_mul(self.height as usize);
+        macro_rules! free_leaked_vec {
+            ($field:ident) => {
+                if !self.$field.ptr.is_null() {
+                    unsafe { let _ = Vec::from_raw_parts(self.$field.ptr, total, total); }
+                    self.$field.ptr = std::ptr::null_mut();
+                }
+            };
+        }
+        free_leaked_vec!(property_texture_flow);
+        free_leaked_vec!(property_texture_liquid);
+        free_leaked_vec!(property_texture_liquid_data);
+        free_leaked_vec!(property_texture_material_data);
+        free_leaked_vec!(property_texture_exposed_to_sunlight);
+        free_leaked_vec!(accumulated_flow);
+        free_leaked_vec!(visible_grid);
+        // flow（Vector4f）在 new() 中保持 null（分配于 copy 路径/后续阶段），此处无需处理。
         // 29 个事件 MsvcVector 的内存在 resize 时分配，Drop 时需要 clear
         // 但 GameData 通常通过 Box::from_raw 释放，CellSOA/BackwallSOA 的 Drop 会清理 MsvcVector
     }

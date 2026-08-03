@@ -25,15 +25,35 @@ pub fn update_data(sim_data: &mut SimData) {
     // 原版 L144548：温度后 CopyFrom，供后续压力/液体阶段读取新温度
     crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
 
-    // C2 阶段实现：液体流动
+    // 压力循环（原版顺序：温度任务 → CopyFrom → **压力循环** L42030-42320 →
+    // CopyFrom → 液体任务 L42408+ → PostProcessCell；2026-08-03 对照源码修正，
+    // 置于 update_liquids 之前——此前液体→压力顺序与原版相反，同帧内先后不同）
+    run_pressure_task(sim_data);
+
+    // C2 阶段实现：液体流动（UpdateLiquid + PostProcessCell；原版 L42408+）
     crate::c2_physics::liquid_flow::update_liquids(sim_data);
     // ElementConsumer 逐帧消费（2026-08-02：水泵/涡轮取水；原版 UpdateData 调组件 Update）
     crate::c_simulation::frame_processor::process_element_consumers(sim_data);
-    // UpdateData 压力循环（对照源码 11_msvcrt_ignored.c L42108-42192 的 3 处 UpdatePressure 调用）：
-    // 遍历内部格，对液体格向 4 方向调 update_pressure，用返回值累加 flow 分量。
-    // 原版语义（L42121-42126 水平 / L42157-42160 垂直）：
-    //   flow[本格].y += dir×f39、flow[邻格].x −= dir×f39（水平，dir=±1）
-    //   flow[本格].z += f39、flow[邻格].w −= f39（垂直）
+
+    // BuildingHeatExchange::Update（原版 L145434 组件阶段：建筑↔格子换热，dt=0.2）
+    crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data);
+    // ElementChunk::Update（原版 L145434 同一组件阶段：物质碎片换热）
+    crate::c_simulation::element_chunk::update_element_chunks(sim_data, 0.2, sim_data.width);
+    // ElementEmitter::Update（原版 L145434 同一组件阶段：发射器逐帧发射）
+    crate::c_simulation::element_emitter::update_element_emitters(sim_data, 0.2, sim_data.width);
+    // BuildingToBuildingHeatExchange::Update（原版 L145434 同一组件阶段：导热板建筑↔建筑换热）
+    crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2);
+}
+
+/// UpdateData 压力循环（对照源码 11_msvcrt_ignored.c L42030-42320 的 UpdatePressure 调用）。
+///
+/// 遍历内部格，对液体格向 4 方向调 update_pressure，用返回值累加 flow 分量。
+/// 原版语义（L42121-42126 水平 / L42157-42160 垂直）：
+///   flow[本格].y += dir×f39、flow[邻格].x −= dir×f39（水平，dir=±1）
+///   flow[本格].z += f39、flow[邻格].w −= f39（垂直）
+///
+/// 提取为独立函数以便回归测试直接隔离门控（update_liquid 的水平扩散会干扰同场景断言）。
+pub(crate) fn run_pressure_task(sim_data: &mut SimData) {
     let sim_w = sim_data.width as usize;
     let sim_h = sim_data.height as usize;
     if sim_w < 3 || sim_h < 3 || sim_data.updated_cells.ptr.is_null() {
@@ -60,48 +80,53 @@ pub fn update_data(sim_data: &mut SimData) {
                 continue;
             }
             // 邻格状态（从 cells 读——update_pressure 读取的缓冲区）：
-            // 邻格为固体（state & 3 == 3）时**跳过**压力转移（原版门控 L42106，防固体侵蚀）。
+            // 原版门控（L42064-42076 水平 / L42126+ 垂直）：邻格须满足
+            //   ① pressure state & 3 <= 1（真空/气体；液体/固体邻格不参与压差），
+            //   ② properties & 1 == 0（可渗透），
+            //   ③ updatedCells 元素 == cells 元素（快照一致），
+            //   ④ 同元素或异元素但状态不同（液体源格对真空/气体邻格恒成立）。
+            // 2026-08-03 修正：此前只跳固体（state==3），会把同元素液体邻格也纳入压差，
+            // 与原版不符（原版液体↔液体压差不存在于压力循环，液体质量均衡由液体任务处理）。
             let [below, above, right, left] = [cell + sim_w, cell - sim_w, cell + 1, cell - 1];
-            let neighbor_states = {
+            let neighbor_ok = {
                 let cells = unsafe { &*sim_data.cells.ptr };
+                let updated = unsafe { &*sim_data.updated_cells.ptr };
                 [below, above, right, left].map(|n| {
-                    crate::b_elements::elements_table::get_element_state_by_idx(cells.element_idx.get(n))
+                    let nb_elem = cells.element_idx.get(n);
+                    crate::b_elements::elements_table::get_element_pressure_data(nb_elem)
+                        .map(|pd| {
+                            (pd.state & 3) <= 1
+                                && cells.properties.get(n) & 1 == 0
+                                && updated.element_idx.get(n) == nb_elem
+                        })
+                        .unwrap_or(false)
                 })
             };
             // 下（+w）、上（-w）垂直：flow[cell].z += f39、flow[邻格].w −= f39
-            if neighbor_states[0] != Some(3) {
+            if neighbor_ok[0] {
                 let f39 = crate::c2_physics::liquid_flow::update_pressure(sim_data, cell, below);
                 flow[cell].z += f39;
                 flow[below].w -= f39;
             }
-            if neighbor_states[1] != Some(3) {
+            if neighbor_ok[1] {
                 let f39 = crate::c2_physics::liquid_flow::update_pressure(sim_data, cell, above);
                 flow[cell].z += f39;
                 flow[above].w -= f39;
             }
             // 右（+1，dir=+1）、左（-1，dir=-1）水平：
             // flow[cell].y += dir×f39、flow[邻格].x −= dir×f39
-            if neighbor_states[2] != Some(3) {
+            if neighbor_ok[2] {
                 let f39 = crate::c2_physics::liquid_flow::update_pressure(sim_data, cell, right);
                 flow[cell].y += f39;
                 flow[right].x -= f39;
             }
-            if neighbor_states[3] != Some(3) {
+            if neighbor_ok[3] {
                 let f39 = crate::c2_physics::liquid_flow::update_pressure(sim_data, cell, left);
                 flow[cell].y -= f39;
                 flow[left].x += f39;
             }
         }
     }
-
-    // BuildingHeatExchange::Update（原版 L145434 组件阶段：建筑↔格子换热，dt=0.2）
-    crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data);
-    // ElementChunk::Update（原版 L145434 同一组件阶段：物质碎片换热）
-    crate::c_simulation::element_chunk::update_element_chunks(sim_data, 0.2, sim_data.width);
-    // ElementEmitter::Update（原版 L145434 同一组件阶段：发射器逐帧发射）
-    crate::c_simulation::element_emitter::update_element_emitters(sim_data, 0.2, sim_data.width);
-    // BuildingToBuildingHeatExchange::Update（原版 L145434 同一组件阶段：导热板建筑↔建筑换热）
-    crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2);
 }
 
 /// SimData::UpdateComponentsDataListOnly 的桩实现。
@@ -319,6 +344,97 @@ mod tests {
             }
             let events = &*sd.sim_events.ptr;
             assert_eq!(events.substance_change_info.len(), 0, "全固体邻格不应产生转移事件");
+        }
+    }
+
+    /// 原版压力循环门控（L42064-42076）：邻格 pressure state & 3 <= 1（真空/气体）才调
+    /// UpdatePressure。同元素液体邻格不参与压差——液体↔液体质量均衡由液体任务处理。
+    /// 2026-08-03 修正前只跳固体（state==3），此场景旧实现会转移 min(12.5%×500, 400)=62.5kg。
+    #[test]
+    fn pressure_task_skips_same_element_liquid_neighbor() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pressure_table();
+        let mut sd = make_sim_data();
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(14, 1);
+            b.mass.set(14, 500.0);
+            b.temperature.set(14, 300.0);
+            // 右邻同元素液体 100（质量差 400 → 旧实现会转移 62.5）
+            b.element_idx.set(15, 1);
+            b.mass.set(15, 100.0);
+            b.temperature.set(15, 300.0);
+            // cell15 自身也是液体格，会向自己的真空邻格转移——把 cell14/cell15 的
+            // 全部 6 个外邻（8/20/13 + 9/16/21）设为固体，隔离"同元素液体邻格"关系。
+            for c in [8usize, 20, 13, 9, 16, 21] {
+                b.element_idx.set(c, 2);
+                b.mass.set(c, 500.0);
+                b.temperature.set(c, 300.0);
+            }
+        });
+        run_pressure_task(&mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(14) - 500.0).abs() < 1e-3,
+                "同元素液体邻格不应触发压差：cell14 应保持 500，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.mass.get(15) - 100.0).abs() < 1e-3,
+                "同元素液体邻格不应触发压差：cell15 应保持 100，got {}",
+                updated.mass.get(15)
+            );
+            assert_eq!(updated.element_idx.get(15), 1, "邻格仍为液体");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 0, "不应产生转移事件");
+        }
+    }
+
+    /// 门控正例：真空邻格（state&3==0）仍参与压差转移（原版 L42064-42076 通过路径）。
+    /// cell14 液体 100 → 右邻真空格得 min(12.5%×100, 100)=12.5，flow 分量累加。
+    #[test]
+    fn pressure_task_transfers_to_vacuum_neighbor() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pressure_table();
+        let mut sd = make_sim_data();
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(14, 1);
+            b.mass.set(14, 100.0);
+            b.temperature.set(14, 300.0);
+            // 15 真空（elem0, mass 0）；其余 3 方向固体
+            for c in [8usize, 20, 13] {
+                b.element_idx.set(c, 2);
+                b.mass.set(c, 500.0);
+                b.temperature.set(c, 300.0);
+            }
+        });
+        run_pressure_task(&mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(15), 1, "真空邻格应变为液体元素");
+            assert!(
+                (updated.mass.get(15) - 12.5).abs() < 1e-3,
+                "cell15 应得 12.5，got {}",
+                updated.mass.get(15)
+            );
+            assert!(
+                (updated.mass.get(14) - 87.5).abs() < 1e-3,
+                "cell14 应减至 87.5，got {}",
+                updated.mass.get(14)
+            );
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 36);
+            assert!(
+                (flow[14].y - 12.5).abs() < 1e-3,
+                "flow[14].y 应 +12.5，got {}",
+                flow[14].y
+            );
+            assert!(
+                (flow[15].x + 12.5).abs() < 1e-3,
+                "flow[15].x 应 -12.5，got {}",
+                flow[15].x
+            );
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1, "真空格填充应产生 1 条事件");
         }
     }
 

@@ -2248,7 +2248,9 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
         let updated = unsafe { &*sim.updated_cells.ptr };
         updated.mass.get(cell)
     };
-    if ppd.max_mass < mass_cell {
+    // 2026-08-03 防御：max_mass <= 0 时跳过（原版依赖数据不变量 maxMass>0，
+    // 反编译无守卫；此处避免 0/0 → pressure_ratio=inf 传播进 DoPressureBreak）。
+    if ppd.max_mass > 0.0 && ppd.max_mass < mass_cell {
         // 原版 L2565-2583：先按压强比 mass/maxMass 尝试 4 方向突破（DoPressureBreak）。
         // 任一方向突破成功 → 释放超压（worldDamage），不再向下倾倒。
         // 2026-08-02 实现：此前留桩 → 超压总是向下倾倒，造成上下合并异常。
