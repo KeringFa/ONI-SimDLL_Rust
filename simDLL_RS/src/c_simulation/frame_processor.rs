@@ -1490,11 +1490,6 @@ fn process_element_emitter_messages(frame: &mut SimFrameInfo, sim_data: &mut Sim
                 on_unblocked_cb: i32::from_le_bytes(adds[off + 12..off + 16].try_into().unwrap()),
             };
             let h = crate::c_simulation::element_emitter::add_element_emitter(sim_data, &msg);
-            tracing::info!(
-                handle = h,
-                active = crate::c_simulation::element_emitter::element_emitter_count(),
-                "element_emitter: registered"
-            );
             if msg.callback_idx != -1 && !sim_data.sim_events.ptr.is_null() {
                 let events = unsafe { &mut *sim_data.sim_events.ptr };
                 events.component_state_changed_messages.push(
@@ -1538,13 +1533,7 @@ fn process_element_emitter_messages(frame: &mut SimFrameInfo, sim_data: &mut Sim
             let off = i * 8;
             let handle = i32::from_le_bytes(removes[off..off + 4].try_into().unwrap());
             let cb = i32::from_le_bytes(removes[off + 4..off + 8].try_into().unwrap());
-            let removed = crate::c_simulation::element_emitter::remove_element_emitter(handle);
-            tracing::info!(
-                handle,
-                removed,
-                active = crate::c_simulation::element_emitter::element_emitter_count(),
-                "element_emitter: removed"
-            );
+            crate::c_simulation::element_emitter::remove_element_emitter(handle);
             if cb != -1 && !sim_data.sim_events.ptr.is_null() {
                 let events = unsafe { &mut *sim_data.sim_events.ptr };
                 events.component_state_changed_messages.push(
