@@ -2333,15 +2333,6 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                     let updated = unsafe { &*sim.updated_cells.ptr };
                     updated.mass.get(cell)
                 };
-                // 诊断（临时）：offgas 概率门通过后的输入值
-                tracing::info!(
-                    elem = elem,
-                    mass_cell,
-                    off_gas_percentage = ppd.off_gas_percentage,
-                    sublimate_probability = ppd.sublimate_probability,
-                    random,
-                    "DIAG offgas gate passed"
-                );
                 // 原版 L2765-2769：fVar24 = min(offGasPercentage × mass[cell], 1.0)
                 let mut fvar24 = ppd.off_gas_percentage * mass_cell;
                 if fvar24 >= 1.0 {
@@ -2404,19 +2395,6 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                     };
                     // 原版 L149810：产气（源格扣质量/病菌，目标格得升华气体）
                     emit_sublimate_gas(sim, cell, below, fvar24, merge, ppd.sublimate_index);
-                    // 诊断（临时）：产气后源/目标质量
-                    {
-                        let updated = unsafe { &*sim.updated_cells.ptr };
-                        tracing::info!(
-                            src_cell = cell,
-                            src_mass_after = updated.mass.get(cell),
-                            dst_cell = below,
-                            dst_elem = updated.element_idx.get(below),
-                            dst_mass_after = updated.mass.get(below),
-                            fvar24,
-                            "DIAG offgas emitted"
-                        );
-                    }
                     // 原版 L2831-2832：accumulated_flow[cell] += fVar24
                     let total = sim.width as usize * sim.height as usize;
                     let acc = unsafe { std::slice::from_raw_parts_mut(sim.accumulated_flow.ptr, total) };
