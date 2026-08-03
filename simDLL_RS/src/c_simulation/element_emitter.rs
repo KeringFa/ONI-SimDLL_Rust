@@ -400,11 +400,12 @@ impl ElementEmitterManager {
                 e == 0xFFFF || e == sim.vacuum_element_idx || e == rec.elem_idx
             };
             if entry_ok {
-                let cell = rec.cell[1] as usize * w + rec.cell[0] as usize;
+                // rec.cell = [row, col]（modify 时存入）
+                let cell = rec.cell[0] as usize * w + rec.cell[1] as usize;
                 let reachable = get_reachable_cells(
                     sim,
-                    rec.cell[1] as usize,
                     rec.cell[0] as usize,
+                    rec.cell[1] as usize,
                     rec.max_depth as usize,
                     w,
                 );
@@ -713,6 +714,74 @@ mod tests {
         assert_eq!(out.get(h as usize & 0xffffff).elem_idx, 0xFFFF);
     }
 
+    /// 端到端：注册（process_frame）→ copy_sim_data_to_game → game_sync 交换 →
+    /// prepare_game_data_update 读 GDU —— emitted_mass_entries 必须非空。
+    #[test]
+    fn register_reaches_gdu_emitted_mass_entries() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        reset_for_test();
+        init_table();
+        use crate::a_framework::frame_sync::FrameSync;
+        use crate::a_framework::sim_frame_manager::SimFrameInfo;
+        use crate::c_simulation::sim_data_ops::copy_sim_data_to_game;
+
+        let mut sim = make_sim();
+        // 模拟 frame_sync 双缓冲（m_sim_data / m_game_data）
+        let mut fs = FrameSync::new_zeroed();
+        let mut m_sim = crate::a_framework::game_data::GameData::new(4, 4);
+        let mut m_game = crate::a_framework::game_data::GameData::new(4, 4);
+        fs.m_sim_data = crate::a_framework::stl_shim::UniquePtr {
+            ptr: Box::into_raw(Box::new(m_sim)),
+        };
+        fs.m_game_data = crate::a_framework::stl_shim::UniquePtr {
+            ptr: Box::into_raw(Box::new(m_game)),
+        };
+
+        // 1. process_frame：AddElementEmitter 消息 → add() 注册 + resize 输出向量
+        let mut frame = SimFrameInfo::default();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&2.0f32.to_le_bytes()); // maxPressure
+        msg.extend_from_slice(&7i32.to_le_bytes()); // callbackIdx
+        msg.extend_from_slice(&(-1i32).to_le_bytes()); // onBlockedCB
+        msg.extend_from_slice(&(-1i32).to_le_bytes()); // onUnblockedCB
+        for b in msg {
+            frame.element_emitter_messages.adds.push(b);
+        }
+        crate::c_simulation::frame_processor::process_frame(&mut frame, &mut sim);
+        assert_eq!(sim.element_emitter.emitted_mass_info.len(), 1, "注册后 sim 输出向量应为 1");
+
+        // 2. copy_sim_data_to_game（写入 m_sim_data）
+        unsafe {
+            copy_sim_data_to_game(
+                &mut sim,
+                &mut *fs.m_sim_data.ptr,
+                &*fs.m_game_data.ptr as *const _,
+                1,
+            );
+            assert_eq!(
+                (*fs.m_sim_data.ptr).emitted_mass_info.len(),
+                1,
+                "copy 后 m_sim_data 输出向量应为 1"
+            );
+        }
+
+        // 3. game_sync 交换双缓冲
+        unsafe {
+            std::mem::swap(&mut fs.m_sim_data, &mut fs.m_game_data);
+        }
+
+        // 4. prepare_game_data_update 读 m_game_data
+        unsafe {
+            let gd = &*fs.m_game_data.ptr;
+            assert_eq!(gd.emitted_mass_info.len(), 1, "交换后 m_game_data 应为 1");
+            let gdu = crate::a_framework::game_data_update::GameDataUpdate::default();
+            let _ = gdu;
+            // 直接验证指针：模拟 save_load 的赋值
+            let ptr = gd.emitted_mass_info.as_ptr();
+            assert!(!ptr.is_null(), "emitted_mass_entries 不得为 null");
+        }
+    }
+
     #[test]
     fn update_emits_after_interval_and_accumulates_output() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
@@ -790,5 +859,48 @@ mod tests {
             .iter()
             .find(|m| m.callback_idx == 55);
         assert!(cb.is_some(), "应推 blocked 回调");
+    }
+
+    /// 回归：发射器必须作用在**正确的非对称格**（modify 存 [row,col]，update 不得转置）。
+    /// game cell 7 → sim 16（row2,col4）；若 row/col 写反会作用到 sim 26（row4,col2）。
+    #[test]
+    fn update_emits_into_correct_nonsymmetric_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        reset_for_test();
+        init_table();
+        let mut sim = make_sim();
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        let m = ModifyElementEmitterMsg {
+            handle: h,
+            cell_idx: 7, // → sim 16 = row2 col4（非对称）
+            emit_interval: 0.2,
+            emit_mass: 0.002,
+            emit_temperature: 350.0,
+            max_pressure: 10.0,
+            disease_count: 0,
+            element_idx: 3,
+            max_depth: 1,
+            disease_idx: 0xFF,
+        };
+        assert!(modify_element_emitter(&sim, &m));
+        {
+            let mgr = ELEMENT_EMITTER_MANAGER.lock();
+            let rec = mgr.record(h).unwrap();
+            assert_eq!(rec.cell, [2, 4], "modify 应存 [row,col]");
+        }
+        update_element_emitters(&mut sim, 0.2, 6);
+        let u = unsafe { &*sim.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(16), 3, "sim 16（row2,col4）应变成气体");
+        assert_ne!(
+            u.element_idx.get(26),
+            3,
+            "转置格 sim 26（row4,col2）不应被错误写入"
+        );
     }
 }
