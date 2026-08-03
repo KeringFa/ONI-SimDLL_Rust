@@ -450,4 +450,25 @@ mod tests {
         assert_eq!(events.building_no_longer_overheated_info.len(), 1);
         assert_eq!(events.building_no_longer_overheated_info.get(0).handle.value, b);
     }
+
+    #[test]
+    fn update_data_runs_building_to_building() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_building_table();
+        crate::c_simulation::building_temperature::clear_building_temperature();
+        crate::c_simulation::building_to_building::clear_building_to_building();
+        let a = add_building(&bldg_msg(300.0, 1000.0, 4.0));
+        let b = add_building(&bldg_msg(400.0, 2000.0, 2.0));
+        let h = crate::c_simulation::building_to_building::register_building_to_building(-1, a);
+        crate::c_simulation::building_to_building::add_building_to_building_contact(h, b, 1);
+        let mut sd = make_sim();
+        crate::c2_physics::update_data(&mut sd);
+        let ra = record(a).unwrap();
+        let rb = record(b).unwrap();
+        assert!(ra.temperature > 300.0, "建筑 A 应升温，got {}", ra.temperature);
+        assert!(rb.temperature < 400.0, "建筑 B 应降温，got {}", rb.temperature);
+        let da = (ra.temperature - 300.0) * 1000.0;
+        let db = (rb.temperature - 400.0) * 2000.0;
+        assert!((da + db).abs() < 0.1);
+    }
 }
