@@ -579,6 +579,19 @@ impl SimData {
         let updated_cells = Box::new(CellSOA::with_size(total_cells));
         sd.updated_cells = UniquePtr { ptr: Box::into_raw(updated_cells) };
 
+        // 默认绝缘 255（满导热）：原版建格默认即可导电；存档格式不含 insulation，
+        // 加载后格子保留此默认；隔热砖/门经 SetInsulationValue(×255) 覆盖。
+        // 此前默认 0 → k = ins²×1.53787e-05×TC ≈ 0 → 邻格/背墙/建筑↔格子换热全部失效
+        //（2026-08-03 用户实测：加载存档后液体/气体/背墙均不换热）。
+        {
+            let cells = unsafe { &mut *sd.cells.ptr };
+            let updated = unsafe { &mut *sd.updated_cells.ptr };
+            for i in 0..total_cells {
+                cells.insulation.set(i, 255);
+                updated.insulation.set(i, 255);
+            }
+        }
+
         // 分配 flow（Vector4f × total_cells，4 方向流动量）—— 对照源码 L8406
         let flow = vec![crate::a_framework::vector_math::Vector4f::default(); total_cells];
         sd.flow = UniquePtr { ptr: flow.leak().as_mut_ptr() };
