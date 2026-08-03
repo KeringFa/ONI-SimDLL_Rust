@@ -106,7 +106,9 @@ pub fn update_data(sim_data: &mut SimData) {
 /// 原版更新组件数据列表（ElementConsumer/Emitter 等）。
 /// C1 桩：不执行任何操作。
 pub fn update_components_data_list_only(_sim_data: &mut SimData) {
-    // C2 阶段实现
+    // ElementChunk::UpdateDataListOnly（原版 L140202）：无时间流逝帧刷新输出，
+    // 保证 GDU elementChunkInfos 非空（否则 C# OnSimRegistered 读 elementChunks 时 NRE）
+    crate::c_simulation::element_chunk::update_element_chunks_data_list_only();
 }
 
 /// ConsolidateEvents 的桩实现。

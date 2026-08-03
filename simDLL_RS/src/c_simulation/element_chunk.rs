@@ -296,6 +296,12 @@ pub fn update_element_chunks(sim: &mut SimData, dt: f32, width: i32) {
     update_element_chunks_inner(&mut mgr, sim, dt, width);
 }
 
+/// UpdateComponentsDataListOnly 路径：无时间流逝帧刷新输出（保证 GDU elementChunkInfos 非空）。
+pub fn update_element_chunks_data_list_only() {
+    let mut mgr = ELEMENT_CHUNK_MANAGER.lock();
+    update_element_chunks_data_list_only_inner(&mut mgr);
+}
+
 /// 每帧输出交换（原版 CopySimDataToGame elementChunkInfo 交换）。
 pub fn swap_element_chunk_output(game_data: &mut crate::a_framework::game_data::GameData) {
     let mut mgr = ELEMENT_CHUNK_MANAGER.lock();
@@ -398,7 +404,8 @@ pub(crate) fn update_element_chunks_inner(
     dt: f32,
     width: i32,
 ) {
-    mgr.output.clear();
+    // 输出按 handle index 索引（原版 Update 首行 _Resize 到 items 数，写 output[handleIndex]）
+    mgr.output.resize(mgr.items.len(), ElementChunkInfo::default());
     if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
         return;
     }
@@ -408,7 +415,8 @@ pub(crate) fn update_element_chunks_inner(
         if ri < 0 {
             continue;
         }
-        let handle = ((mgr.versions[index] as i32) << 24) | (index as i32 & 0xffffff);
+        let handle_index = index as i32 & 0xffffff;
+        let handle = ((mgr.versions[index] as i32) << 24) | handle_index;
         let chunk = &mut mgr.records[ri as usize];
         if chunk.heat_capacity <= 0.0 {
             continue;
@@ -468,7 +476,7 @@ pub(crate) fn update_element_chunks_inner(
             }
         }
         let t = chunk.temperature;
-        mgr.output.push(ElementChunkInfo {
+        mgr.output.set(handle_index as usize, ElementChunkInfo {
             temperature: t,
             delta_kj: delta,
         });
@@ -481,6 +489,27 @@ pub(crate) fn update_element_chunks_inner(
                     handle: Handle { value: handle },
                 });
         }
+    }
+}
+
+/// ElementChunk::UpdateDataListOnly（原版 L140202）：无时间流逝帧刷新输出
+/// （{temperature, delta=0} 按 handle index），保证 GDU elementChunkInfos 非空
+/// ——否则 C# `SimTemperatureTransfer.OnSimRegistered` 读 `simData.elementChunks[handleIndex]` 时 NRE。
+pub(crate) fn update_element_chunks_data_list_only_inner(mgr: &mut ElementChunkManager) {
+    mgr.output.resize(mgr.items.len(), ElementChunkInfo::default());
+    for index in 0..mgr.items.len() {
+        let ri = mgr.items[index];
+        if ri < 0 {
+            continue;
+        }
+        let chunk = &mgr.records[ri as usize];
+        mgr.output.set(
+            index,
+            ElementChunkInfo {
+                temperature: chunk.temperature,
+                delta_kj: 0.0,
+            },
+        );
     }
 }
 
@@ -727,5 +756,24 @@ mod tests {
         assert_eq!(gd.element_chunk_info.get(0).temperature, 300.0);
         assert_eq!(gd.element_chunk_info.get(0).delta_kj, 1.0);
         assert_eq!(ELEMENT_CHUNK_MANAGER.lock().output.len(), 0);
+    }
+
+    #[test]
+    fn update_data_list_only_fills_output_per_handle_index() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut mgr = ElementChunkManager::new();
+        let h0 = mgr.add(6, &add_msg(5, 300.0)); // index 0
+        let h1 = mgr.add(6, &add_msg(9, 400.0)); // index 1
+        mgr.remove(h0);
+        let h2 = mgr.add(6, &add_msg(13, 500.0)); // 复用 index 0
+        assert_eq!(h2 & 0xffffff, 0);
+        assert_eq!(h1 & 0xffffff, 1);
+        update_element_chunks_data_list_only_inner(&mut mgr);
+        let out = mgr.output_snapshot();
+        assert_eq!(out.len(), 2, "输出按 handle index 索引，长度 = items 数");
+        assert_eq!(out[0].temperature, 500.0, "index 0 = h2");
+        assert_eq!(out[1].temperature, 400.0, "index 1 = h1");
+        assert_eq!(out[0].delta_kj, 0.0);
     }
 }
