@@ -205,6 +205,20 @@ impl BuildingTemperatureManager {
         true
     }
 
+    /// 写建筑温度记录（原版 ChangeBuildingTemperature L136853 的记录写路径）。
+    /// temperatureInfo 由每帧 write_building_temperature_info 重建，行为等价。
+    pub fn set_temperature(&mut self, handle: i32, temperature: f32) -> bool {
+        let Some(record) = self.get_mut(handle) else {
+            tracing::warn!(
+                handle,
+                "BuildingTemperatureManager::set_temperature: bad handle"
+            );
+            return false;
+        };
+        record.temperature = temperature;
+        true
+    }
+
     /// ModifyBuildingEnergy 消费（原版 L115484-115540）。
     /// 返回 false 仅表示消息被跳过（坏句柄或钳制范围越出 [0,10000]）；
     /// 非法终温时原版仅告警不写回（消息已消费，返回 true）。
@@ -334,6 +348,13 @@ pub fn add_building(msg: &AddBuildingHeatExchangeMsg) -> i32 {
 /// 只读访问建筑温度记录快照（供 BuildingToBuilding 等校验/读取）。
 pub fn record(handle: i32) -> Option<BuildingTemperatureRecord> {
     BUILDING_TEMPERATURE_MANAGER.lock().record(handle).copied()
+}
+
+/// ChangeBuildingTemperature（原版 L136853）：写建筑温度记录。
+pub fn change_building_temperature(handle: i32, temperature: f32) -> bool {
+    BUILDING_TEMPERATURE_MANAGER
+        .lock()
+        .set_temperature(handle, temperature)
 }
 
 /// 处理 ModifyBuildingHeatExchange 消息。
@@ -750,6 +771,17 @@ mod tests {
         let m3 = add_msg(10, 1800.0);
         assert!(mgr.modify_with_events(h, &m3, &mut events));
         assert_eq!(events.building_no_longer_overheated_info.len(), 1);
+    }
+
+    #[test]
+    fn change_building_temperature_updates_record() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table();
+        let h = add_building(&add_msg(10, 300.0));
+        assert!(change_building_temperature(h, 350.0));
+        assert_eq!(record(h).unwrap().temperature, 350.0);
+        // 坏句柄（版本不符）→ 拒绝
+        assert!(!change_building_temperature(h + (1 << 24), 350.0));
     }
 
     fn make_exchange_sim() -> SimData {
