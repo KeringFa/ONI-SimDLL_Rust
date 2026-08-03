@@ -1148,7 +1148,48 @@ fn emit_sublimate_gas(
 运行：`cargo test -p simdll_rs offgas -- --test-threads=1`
 预期：PASS（4 项新测试 + 既有 offgas/升华路径测试全部通过）
 
-- [ ] **步骤 5：Commit**
+- [ ] **步骤 5：更新 2 个既有测试断言（产气后的正确行为）**
+
+`post_process_cell_displaces_heterogeneous_gas_below`（原 L4011）：异类气体被挤走后，产气不再让目标格停留真空——断言改为目标格收到升华气体：
+
+```rust
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!(
+                (acc[14] - 1.0).abs() < 1e-3,
+                "挤走异类气体后仍应累积 1.0，got {}",
+                acc[14]
+            );
+            // 气体被挤到 cell26（下方格 20 的下方），随后产气使 cell20 变成升华气体（原版 L149810）
+            assert_eq!(updated.element_idx.get(26), 5, "异类气体应被挤到 cell26");
+            assert!((updated.mass.get(26) - 0.1).abs() < 1e-3, "cell26 应收到 0.1 质量");
+            assert_eq!(updated.element_idx.get(20), 3, "挤走后产气 → cell20 变升华气体");
+            assert!((updated.mass.get(20) - 1.0).abs() < 1e-3, "cell20 收到 1.0 产气");
+            assert!((updated.mass.get(14) - 99.0).abs() < 1e-3, "液体扣 1.0");
+        }
+        DestroyElementsTable();
+```
+
+`post_process_keeps_exact_0_01`（原 L3409）：0.01kg 恰好不蒸发，但会走 offgas 耗尽路径就地转气体（原版 L149821）——断言改为：
+
+```rust
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 3, "0.01 不蒸发，但耗尽路径就地转升华气体");
+            assert!((updated.mass.get(14) - 0.01).abs() < 1e-9);
+        }
+        DestroyElementsTable();
+```
+
+- [ ] **步骤 6：全量 offgas/后处理测试**
+
+运行：`cargo test -p simdll_rs post_process -- --test-threads=1`
+预期：PASS（含更新后的 2 项）
+
+- [ ] **步骤 7：Commit**
 
 ```bash
 git add simDLL_RS/src/c2_physics/liquid_flow.rs
