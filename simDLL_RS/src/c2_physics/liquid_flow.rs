@@ -5111,4 +5111,74 @@ mod tests {
         }
         DestroyElementsTable();
     }
+
+    /// 耗尽路径 + 差额补足（L149821-149833）：cell14 液体 mass=0.015，cell8（cell-width）
+    /// 同液体更重（mass=10）→ f24 = min(0.5×10, 1.0) = 1.0；剩余 <0.01 →
+    /// cell14 就地转气体 5（质量 0.015、病菌保留）；差额 0.985 从 cell8 补足 → cell14 质量 1.0；
+    /// 耗尽路径**不累积** accumulated_flow；SpawnFX(14, 107, 0.0)。
+    #[test]
+    fn offgas_depleted_path_converts_in_place_with_top_up() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 7);
+            updated.mass.set(14, 0.015);
+            updated.temperature.set(14, 300.0);
+            updated.disease_idx.set(14, 3);
+            updated.disease_count.set(14, 100);
+            updated.element_idx.set(8, 7); // cell-width 同液体，更重
+            updated.mass.set(8, 10.0);
+            updated.temperature.set(8, 300.0);
+            updated.disease_idx.set(8, 0xff); // 无菌
+            updated.element_idx.set(20, 0); // 目标真空
+            updated.mass.set(20, 0.0);
+            updated.temperature.set(20, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 5, "液体格就地转气体");
+            assert!((updated.mass.get(14) - 1.0).abs() < 1e-4, "剩余 + 补足差额");
+            assert!((updated.mass.get(8) - 9.015).abs() < 1e-4, "cell8 扣差额");
+            assert_eq!(updated.disease_idx.get(14), 3, "就地转化保留病菌");
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert_eq!(acc[14], 0.0, "耗尽路径不累积 flow");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.spawn_fx_info.len(), 1);
+            assert_eq!(events.spawn_fx_info.get(0).cell_idx, 5);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 耗尽路径无补足：cell8 非同元素 → heavier_up=false；f24 = min(0.5×0.015,1)=0.0075；
+    /// 只就地转化（质量 0.015），无第二段调用。
+    #[test]
+    fn offgas_depleted_path_without_top_up() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 7);
+            updated.mass.set(14, 0.015);
+            updated.temperature.set(14, 300.0);
+            updated.element_idx.set(8, 0); // 非液体 → 不重算
+            updated.mass.set(8, 0.0);
+            updated.element_idx.set(20, 0);
+            updated.mass.set(20, 0.0);
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 5);
+            assert!((updated.mass.get(14) - 0.015).abs() < 1e-5, "就地转化全部剩余");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.spawn_fx_info.len(), 1);
+        }
+        DestroyElementsTable();
+    }
 }
