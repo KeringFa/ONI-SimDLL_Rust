@@ -186,3 +186,15 @@
   ProcessElementChunkMessages L116132-116223）。
 - 全量 368 测试通过；Release 构建成功。
 - **下一步**：导热板 BuildingToBuildingHeatExchange（L138358）→ 升华/持续蒸发 → ElementEmitter 本体。
+
+## [备忘] 温度域审查 Minor 6 项（2026-08-03，日后回归原版原理用）
+
+- ① ElementChunk 消息顺序：**已修正**（move 提前到 modifies 前，原版 ProcessElementChunkMessages L116132-116223）。
+- ② debug_properties 复制时机：我们在 process_frame 末尾，原版在 ProcessMassConsumption 前（L117034）。
+  当前无消费者差异；若日后新增依赖 debug_properties 的消息处理，需核对时机。
+- ③ 建筑换热交叉分支后重算 new_bldg_t（原版不重算，值未被使用）。
+- ④ calculate_temperature_exchange_precise 增加 HC≤0 防御（原版依赖数据不变量）。
+- ⑤ conduit frozen/melted 句柄推 index 而非完整 handle（C# GetHandleIndex 掩码后等价）。
+- ⑥ 碎片 maxEnergyScale 除零防御（thickness=0 → factor=0，原版 inf/nan）。
+
+> 以上均为无害等价差异；若日后出现相关异常，回归原版原理时先检查这些位置。
