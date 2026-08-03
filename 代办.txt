@@ -177,3 +177,12 @@
   （groundTransferScale）；③ 碎片加热/冷却至相变温度 → 熔化事件。
 - **后续**：透气砖/网格砖特殊换热机制（用户暂不研究）、碎片 disease/辐射、导热板
   BuildingToBuildingHeatExchange、升华/持续蒸发、ElementEmitter 本体。
+
+## [已完成] 温度域全量对照审查（2026-08-03 内联）
+
+- 审查报告：.superpowers/sdd/review-temperature-full.md
+- **结论：可以继续**——无 Critical/Important；Minor 6 项均为无害等价差异（消息顺序、防御守卫、
+  未用变量等）。已按严格对照修正 ElementChunk 消息顺序（move 提前到 modifies 之前，原版
+  ProcessElementChunkMessages L116132-116223）。
+- 全量 368 测试通过；Release 构建成功。
+- **下一步**：导热板 BuildingToBuildingHeatExchange（L138358）→ 升华/持续蒸发 → ElementEmitter 本体。
