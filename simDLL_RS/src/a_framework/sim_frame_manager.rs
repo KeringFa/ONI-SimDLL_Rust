@@ -529,13 +529,21 @@ impl SimFrameManager {
                 emplace_bytes(&mut frame.building_heat_exchange_messages.removes, reader, 8)
             }
 
+            // ===== ElementEmitter 消息（adds 16B / modifies 32B / removes 8B）=====
+            MSG_ADD_ELEMENT_EMITTER => {
+                emplace_bytes(&mut frame.element_emitter_messages.adds, reader, 16)
+            }
+            MSG_MODIFY_ELEMENT_EMITTER => {
+                emplace_bytes(&mut frame.element_emitter_messages.modifies, reader, 32)
+            }
+            MSG_REMOVE_ELEMENT_EMITTER => {
+                emplace_bytes(&mut frame.element_emitter_messages.removes, reader, 8)
+            }
+
             // ===== ComponentMessages 类（C2 桩：返回 true，不 emplace）=====
             // 这些消息在 C1 阶段不处理，但返回 true 表示已识别，避免污染 handler 表查找。
             // C2 阶段会实现真实 emplace 到 adds/modifies/removes vector。
-            MSG_ADD_ELEMENT_EMITTER
-            | MSG_MODIFY_ELEMENT_EMITTER
-            | MSG_REMOVE_ELEMENT_EMITTER
-            | MSG_ADD_DISEASE_EMITTER
+            MSG_ADD_DISEASE_EMITTER
             | MSG_MODIFY_DISEASE_EMITTER
             | MSG_REMOVE_DISEASE_EMITTER
             | MSG_ADD_DISEASE_CONSUMER

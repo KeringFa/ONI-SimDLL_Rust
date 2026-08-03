@@ -58,6 +58,8 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     // 原版 ProcessFrame 中 BuildingToBuilding 段位于 buildingHeatExchange 与 elementChunk 之间（L116540-116650）
     process_building_to_building_messages(frame, sim_data);
     process_element_chunk_messages(frame, sim_data);
+    // 原版 ProcessFrame：ElementConsumer removes → ElementEmitter adds→modifies→removes（L1628-1665）
+    process_element_emitter_messages(frame, sim_data);
 
     // 步骤 14+: 其他 Component 消息处理（C2 桩）
     process_component_messages_stubs(frame, sim_data);
@@ -1469,6 +1471,80 @@ fn process_element_chunk_messages(frame: &mut SimFrameInfo, sim_data: &mut SimDa
             }
         }
         frame.element_chunk_messages.removes.clear_keep_capacity();
+    }
+}
+
+/// ElementEmitter 消息：adds(16B)→modifies(32B)→removes(8B) + componentStateChanged 回调
+/// （原版 08_sim_frame_manager.c L1628-1665）。
+fn process_element_emitter_messages(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    // adds（16B）{maxPressure, callbackIdx, onBlockedCB, onUnblockedCB}
+    {
+        let adds = frame.element_emitter_messages.adds.as_slice();
+        let n = adds.len() / 16;
+        for i in 0..n {
+            let off = i * 16;
+            let msg = crate::c_simulation::element_emitter::AddElementEmitterMsg {
+                max_pressure: f32::from_le_bytes(adds[off..off + 4].try_into().unwrap()),
+                callback_idx: i32::from_le_bytes(adds[off + 4..off + 8].try_into().unwrap()),
+                on_blocked_cb: i32::from_le_bytes(adds[off + 8..off + 12].try_into().unwrap()),
+                on_unblocked_cb: i32::from_le_bytes(adds[off + 12..off + 16].try_into().unwrap()),
+            };
+            let h = crate::c_simulation::element_emitter::add_element_emitter(&msg);
+            if msg.callback_idx != -1 && !sim_data.sim_events.ptr.is_null() {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events.component_state_changed_messages.push(
+                    crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: msg.callback_idx,
+                        sim_handle: h,
+                    },
+                );
+            }
+        }
+        frame.element_emitter_messages.adds.clear_keep_capacity();
+    }
+    // modifies（32B）{handle, cellIdx, emitInterval, emitMass, emitTemperature, maxPressure,
+    //                diseaseCount, elementIdx, maxDepth, diseaseIdx}
+    {
+        let mods = frame.element_emitter_messages.modifies.as_slice();
+        let n = mods.len() / 32;
+        for i in 0..n {
+            let off = i * 32;
+            let msg = crate::c_simulation::element_emitter::ModifyElementEmitterMsg {
+                handle: i32::from_le_bytes(mods[off..off + 4].try_into().unwrap()),
+                cell_idx: i32::from_le_bytes(mods[off + 4..off + 8].try_into().unwrap()),
+                emit_interval: f32::from_le_bytes(mods[off + 8..off + 12].try_into().unwrap()),
+                emit_mass: f32::from_le_bytes(mods[off + 12..off + 16].try_into().unwrap()),
+                emit_temperature: f32::from_le_bytes(mods[off + 16..off + 20].try_into().unwrap()),
+                max_pressure: f32::from_le_bytes(mods[off + 20..off + 24].try_into().unwrap()),
+                disease_count: i32::from_le_bytes(mods[off + 24..off + 28].try_into().unwrap()),
+                element_idx: u16::from_le_bytes(mods[off + 28..off + 30].try_into().unwrap()),
+                max_depth: mods[off + 30],
+                disease_idx: mods[off + 31],
+            };
+            crate::c_simulation::element_emitter::modify_element_emitter(sim_data, &msg);
+        }
+        frame.element_emitter_messages.modifies.clear_keep_capacity();
+    }
+    // removes（8B）{handle, callbackIdx}
+    {
+        let removes = frame.element_emitter_messages.removes.as_slice();
+        let n = removes.len() / 8;
+        for i in 0..n {
+            let off = i * 8;
+            let handle = i32::from_le_bytes(removes[off..off + 4].try_into().unwrap());
+            let cb = i32::from_le_bytes(removes[off + 4..off + 8].try_into().unwrap());
+            crate::c_simulation::element_emitter::remove_element_emitter(handle);
+            if cb != -1 && !sim_data.sim_events.ptr.is_null() {
+                let events = unsafe { &mut *sim_data.sim_events.ptr };
+                events.component_state_changed_messages.push(
+                    crate::a_framework::game_data::ComponentStateChangedMessage {
+                        callback_idx: cb,
+                        sim_handle: -1,
+                    },
+                );
+            }
+        }
+        frame.element_emitter_messages.removes.clear_keep_capacity();
     }
 }
 
