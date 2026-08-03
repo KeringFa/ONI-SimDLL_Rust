@@ -123,6 +123,38 @@ pub fn copy_sim_data_to_game(
         let game_cells = unsafe { &mut *game_data.cells.ptr };
         let sim_updated_cells = unsafe { &*sim_data.updated_cells.ptr };
         game_cells.copy_rows_from_stripped(sim_updated_cells, game_w, game_h, sim_w);
+        // 诊断（临时）：游戏可见缓冲（game_data.cells）中污染氧/污染水的量
+        {
+            let gc = unsafe { &*game_data.cells.ptr };
+            let total = gc.element_idx.len();
+            let mut po2_total = 0.0f32;
+            let mut po2_max = 0.0f32;
+            let mut water_max = 0.0f32;
+            for i in 0..total {
+                let e = gc.element_idx.get(i);
+                let m = gc.mass.get(i);
+                if e == 190 {
+                    po2_total += m;
+                    if m > po2_max {
+                        po2_max = m;
+                    }
+                }
+                if e == 163 && m > water_max {
+                    water_max = m;
+                }
+            }
+            let water_cell = gc.mass.get(74847.min(total - 1));
+            let gas_cell = gc.mass.get(75103.min(total - 1));
+            tracing::info!(
+                frame_count,
+                po2_total,
+                po2_max,
+                water_max,
+                water_cell,
+                gas_cell,
+                "DIAG game visible state"
+            );
+        }
     } else {
         tracing::warn!("copy_sim_data_to_game: cells or updated_cells ptr is null, skip cells copy");
     }
