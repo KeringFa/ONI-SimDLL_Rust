@@ -869,6 +869,14 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
         None => return 0.0,
     };
     let mut bvar12 = neighbor_pd.state & 3;
+    // 2026-08-03 修复：异元素非真空目标禁止压力质量转移。
+    // 原版压力只在同元素格或真空目标间转移（UpdateData 门控 L144628-144655）；
+    // 液体格向异元素气体/液体转移时接收格元素不变，源格质量被"吸收"成目标元素
+    // —— 实测 500kg 污染水 + 上方 0.5kg 污染氧 → 每子步 ~60kg 水变成污染氧，
+    // 直至 250/250 质量均衡（用户观察到的"一次性分出自身一半质量"）。
+    if bvar12 != 0 && neighbor_elem != cell_elem {
+        return 0.0;
+    }
     // —— 质量（原版 L1469-1474：fVar15 = mass[cell]，fVar19 = mass[neighbor]）——
     let mass_cell = cells.mass.get(cell);
     let mass_neighbor = cells.mass.get(neighbor);
@@ -3914,6 +3922,89 @@ mod tests {
             assert_eq!(updated.disease_count.get(14), 225, "接收格病菌 100+125");
             assert_eq!(updated.disease_idx.get(14), 0x05, "病菌 idx 不变");
             assert_eq!(updated.disease_idx.get(13), 0x05);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 自建 3 元素压力表：0=真空、1=液体(state=2, flow=50)、2=气体(state=1, flow=0.12)。
+    fn create_pressure_gas_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(3);
+        let elems = [
+            Element::default(),
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 2;
+                e.state = 1;
+                e.number_of_gradient_colors = 1;
+                e.flow = 0.12; // 类污染氧气体 flow
+                e.molar_mass = 44.0;
+                e
+            },
+        ];
+        for elem in &elems {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..3 {
+            w.write_int(0);
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// 2026-08-03 回归：液体格不得向**异元素气体**格转移质量。
+    /// 实测 bug：500kg 污染水 + 上方 0.5kg 污染氧 → 压力每子步把 ~60kg 水质量
+    /// 塞进污染氧格（元素不变 → 水质量变成污染氧），直到 250/250 均衡。
+    /// 原版压力只在同元素格或真空目标间转移。修复后 update_pressure 应返回 0、质量不变。
+    #[test]
+    fn update_pressure_does_not_transfer_into_heterogeneous_gas() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_pressure_gas_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1); // 液体
+                buf.mass.set(14, 500.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(13, 2); // 异元素气体
+                buf.mass.set(13, 0.5);
+                buf.temperature.set(13, 300.0);
+            }
+        }
+        let r = update_pressure(&mut sd, 14, 13);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(r, 0.0, "异元素气体目标不应发生压力转移");
+            assert!(
+                (updated.mass.get(14) - 500.0).abs() < 1e-4,
+                "液体质量不得减少，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.mass.get(13) - 0.5).abs() < 1e-4,
+                "气体质量不得增加，got {}",
+                updated.mass.get(13)
+            );
+            assert_eq!(updated.element_idx.get(13), 2, "气体元素不变");
         }
         DestroyElementsTable();
     }

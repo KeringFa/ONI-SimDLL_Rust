@@ -145,6 +145,33 @@ pub fn copy_sim_data_to_game(
             }
             let water_cell = gc.mass.get(74847.min(total - 1));
             let gas_cell = gc.mass.get(75103.min(total - 1));
+            // 诊断（临时 v2）：本会话水源格 82143 / 目标格 82401 / 下方格 81885 的
+            // 元素+质量+温度，以及前 3 大污染氧格索引（元素 190）
+            let mut po2_cells: Vec<(usize, f32)> = Vec::new();
+            for i in 0..total {
+                if gc.element_idx.get(i) == 190 && gc.mass.get(i) > 0.01 {
+                    po2_cells.push((i, gc.mass.get(i)));
+                }
+            }
+            po2_cells.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top3: Vec<String> = po2_cells
+                .iter()
+                .take(3)
+                .map(|(i, m)| format!("{}:{:.1}", i, m))
+                .collect();
+            for (sim_cell, label) in [(82143usize, "water"), (82401, "gas"), (81885, "below")] {
+                let game = (sim_cell / 258 - 1) * 256 + (sim_cell % 258 - 1);
+                if game < total {
+                    tracing::info!(
+                        label,
+                        sim_cell,
+                        elem = gc.element_idx.get(game),
+                        mass = gc.mass.get(game),
+                        temp = gc.temperature.get(game),
+                        "DIAG cell state"
+                    );
+                }
+            }
             tracing::info!(
                 frame_count,
                 po2_total,
@@ -152,6 +179,7 @@ pub fn copy_sim_data_to_game(
                 water_max,
                 water_cell,
                 gas_cell,
+                top3 = top3.join("|"),
                 "DIAG game visible state"
             );
         }

@@ -575,6 +575,25 @@ pub extern "C" fn CreateElementsTable(reader: *mut BinaryBufferReader) -> *mut c
                                     sublimate_fx = ppd.sublimate_fx,
                                     "DIAG sublimate element fields"
                                 );
+                                if let Some(e) = t.elements.get(i) {
+                                    let bytes = unsafe {
+                                        std::slice::from_raw_parts(
+                                            e as *const Element as *const u8,
+                                            164,
+                                        )
+                                    };
+                                    tracing::info!(
+                                        idx = i,
+                                        name,
+                                        b7c_80 = hex_word(bytes, 0x7c),
+                                        b80_84 = hex_word(bytes, 0x80),
+                                        b84_88 = hex_word(bytes, 0x84),
+                                        b88_8c = hex_word(bytes, 0x88),
+                                        b34_38 = hex_word(bytes, 0x34),
+                                        b14_18 = hex_word(bytes, 0x14),
+                                        "DIAG sublimate raw bytes"
+                                    );
+                                }
                             }
                         }
                     }
@@ -600,6 +619,20 @@ pub extern "C" fn DestroyElementsTable() {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         destroy_elements_table();
     }));
+}
+
+/// 诊断辅助：读取元素原始字节的 4 字节小端词（hex）。
+fn hex_word(bytes: &[u8], off: usize) -> String {
+    if off + 4 > bytes.len() {
+        return String::new();
+    }
+    let v = u32::from_le_bytes([
+        bytes[off],
+        bytes[off + 1],
+        bytes[off + 2],
+        bytes[off + 3],
+    ]);
+    format!("{:#010x}", v)
 }
 
 /// GetElementIndex — 查找元素索引。
