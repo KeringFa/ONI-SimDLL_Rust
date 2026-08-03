@@ -465,19 +465,34 @@ impl SimFrameManager {
                 emplace_bytes(&mut frame.add_building_in_contact_messages, reader, 8)
             }
 
-            // MoveElementChunk → move_element_chunk_messages（C2 桩，16B）
+            // MoveElementChunk → move_element_chunk_messages（原版 ProcessFrame stride +2 = 8B）
             MSG_MOVE_ELEMENT_CHUNK => {
-                emplace_bytes(&mut frame.move_element_chunk_messages, reader, 16)
+                emplace_bytes(&mut frame.move_element_chunk_messages, reader, 8)
             }
 
-            // ModifyElementChunkEnergy → modify_element_chunk_energy_messages（C2 桩，16B）
+            // ModifyElementChunkEnergy → modify_element_chunk_energy_messages（原版 stride +2 = 8B）
             MSG_MODIFY_ELEMENT_CHUNK_ENERGY => {
-                emplace_bytes(&mut frame.modify_element_chunk_energy_messages, reader, 16)
+                emplace_bytes(&mut frame.modify_element_chunk_energy_messages, reader, 8)
             }
 
             // ModifyChunkTemperatureAdjuster → modify_element_chunk_adjuster_messages（C2 桩，16B）
             MSG_MODIFY_CHUNK_TEMP_ADJUSTER => {
                 emplace_bytes(&mut frame.modify_element_chunk_adjuster_messages, reader, 16)
+            }
+
+            // AddElementChunk → adds（原版 stride +0x20 = 32B）
+            MSG_ADD_ELEMENT_CHUNK => {
+                emplace_bytes(&mut frame.element_chunk_messages.adds, reader, 32)
+            }
+
+            // SetElementChunkData（= Modify）→ modifies（原版 stride +3 = 12B）
+            MSG_SET_ELEMENT_CHUNK_DATA => {
+                emplace_bytes(&mut frame.element_chunk_messages.modifies, reader, 12)
+            }
+
+            // RemoveElementChunk → removes（原版 stride +2 = 8B）
+            MSG_REMOVE_ELEMENT_CHUNK => {
+                emplace_bytes(&mut frame.element_chunk_messages.removes, reader, 8)
             }
 
             // ModifyBackwallData → modify_backwall_data_messages（C2 桩，12B）
@@ -506,9 +521,6 @@ impl SimFrameManager {
             MSG_ADD_BUILDING_TO_BUILDING_HE
             | MSG_REMOVE_BUILDING_TO_BUILDING_HE
             | MSG_REMOVE_BUILDING_IN_CONTACT
-            | MSG_ADD_ELEMENT_CHUNK
-            | MSG_REMOVE_ELEMENT_CHUNK
-            | MSG_SET_ELEMENT_CHUNK_DATA
             | MSG_ADD_ELEMENT_EMITTER
             | MSG_MODIFY_ELEMENT_EMITTER
             | MSG_REMOVE_ELEMENT_EMITTER
@@ -900,10 +912,12 @@ mod tests {
         let mut r8 = BinaryBufferReader::new(&data8);
         assert!(mgr.handle_message(MessageType::RemoveBuildingHeatExchange as u32, &mut r8, &mut result));
 
-        // 其余 ComponentMessages 仍是 C2 桩（返回 true，不 emplace）
+        // ElementChunk 已真实 emplace（Add 32B）；其余 ComponentMessages 仍是 C2 桩
+        let data32 = [0u8; 32];
+        let mut r32 = BinaryBufferReader::new(&data32);
+        assert!(mgr.handle_message(MessageType::AddElementChunk as u32, &mut r32, &mut result));
         let data = [0u8; 16];
         let mut reader = BinaryBufferReader::new(&data);
-        assert!(mgr.handle_message(MessageType::AddElementChunk as u32, &mut reader, &mut result));
         assert!(mgr.handle_message(MessageType::AddDiseaseEmitter as u32, &mut reader, &mut result));
 
         unsafe { let _ = Box::from_raw(mgr.current_frame); }
@@ -973,6 +987,73 @@ mod tests {
         let frame = unsafe { &*mgr.current_frame };
         assert_eq!(frame.debug_properties.building_temperature_scale, 1.0);
         assert!(frame.debug_properties.is_debug_editing);
+
+        unsafe { let _ = Box::from_raw(mgr.current_frame); }
+    }
+
+    #[test]
+    fn handle_message_element_chunk_messages_route_to_buffers() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut result: *mut c_void = std::ptr::null_mut();
+        // AddElementChunk（32B）
+        let mut add = vec![0u8; 32];
+        add[0..4].copy_from_slice(&5i32.to_le_bytes());
+        add[4..8].copy_from_slice(&7i32.to_le_bytes());
+        add[8..12].copy_from_slice(&100f32.to_le_bytes());
+        add[12..16].copy_from_slice(&300f32.to_le_bytes());
+        add[16..20].copy_from_slice(&2f32.to_le_bytes());
+        add[20..24].copy_from_slice(&0.5f32.to_le_bytes());
+        add[24..28].copy_from_slice(&0.5f32.to_le_bytes());
+        add[28..30].copy_from_slice(&5u16.to_le_bytes());
+        let mut reader = BinaryBufferReader::new(&add);
+        assert!(mgr.handle_message(MessageType::AddElementChunk as u32, &mut reader, &mut result));
+        let frame = unsafe { &*mgr.current_frame };
+        assert_eq!(frame.element_chunk_messages.adds.len(), 32);
+
+        // MoveElementChunk（8B，不是 16B）
+        let mut mv = vec![0u8; 8];
+        mv[0..4].copy_from_slice(&1i32.to_le_bytes());
+        mv[4..8].copy_from_slice(&9i32.to_le_bytes());
+        let mut reader = BinaryBufferReader::new(&mv);
+        assert!(mgr.handle_message(MessageType::MoveElementChunk as u32, &mut reader, &mut result));
+        assert_eq!(frame.move_element_chunk_messages.len(), 8);
+
+        // ModifyElementChunkEnergy（8B，不是 16B）
+        let mut en = vec![0u8; 8];
+        en[0..4].copy_from_slice(&1i32.to_le_bytes());
+        en[4..8].copy_from_slice(&200f32.to_le_bytes());
+        let mut reader = BinaryBufferReader::new(&en);
+        assert!(mgr.handle_message(
+            MessageType::ModifyElementChunkEnergy as u32,
+            &mut reader,
+            &mut result
+        ));
+        assert_eq!(frame.modify_element_chunk_energy_messages.len(), 8);
+
+        // SetElementChunkData = Modify（12B）→ modifies
+        let mut sd = vec![0u8; 12];
+        sd[0..4].copy_from_slice(&1i32.to_le_bytes());
+        sd[4..8].copy_from_slice(&400f32.to_le_bytes());
+        sd[8..12].copy_from_slice(&500f32.to_le_bytes());
+        let mut reader = BinaryBufferReader::new(&sd);
+        assert!(mgr.handle_message(
+            MessageType::SetElementChunkData as u32,
+            &mut reader,
+            &mut result
+        ));
+        assert_eq!(frame.element_chunk_messages.modifies.len(), 12);
+
+        // RemoveElementChunk（8B）→ removes
+        let mut rm = vec![0u8; 8];
+        rm[0..4].copy_from_slice(&1i32.to_le_bytes());
+        rm[4..8].copy_from_slice(&7i32.to_le_bytes());
+        let mut reader = BinaryBufferReader::new(&rm);
+        assert!(mgr.handle_message(
+            MessageType::RemoveElementChunk as u32,
+            &mut reader,
+            &mut result
+        ));
+        assert_eq!(frame.element_chunk_messages.removes.len(), 8);
 
         unsafe { let _ = Box::from_raw(mgr.current_frame); }
     }
