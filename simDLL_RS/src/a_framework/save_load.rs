@@ -839,6 +839,8 @@ pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
     let disease_idx_val = gdu.disease_idx;
     let disease_count_val = gdu.disease_count;
     let accumulated_flow_val = gdu.accumulated_flow;
+    let emitted_mass_entries_val = gdu.emitted_mass_entries;
+    let num_emitted_mass_entries_val = gdu.num_emitted_mass_entries;
     tracing::info!(
         gdu_ptr = ?ptr,
         elem_idx = ?elem_idx_val,
@@ -848,6 +850,8 @@ pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
         disease_idx = ?disease_idx_val,
         disease_count = ?disease_count_val,
         accumulated_flow = ?accumulated_flow_val,
+        emitted_mass_entries = ?emitted_mass_entries_val,
+        num_emitted_mass_entries = num_emitted_mass_entries_val,
         "PrepareGameDataUpdate: final GDU pointers"
     );
 
