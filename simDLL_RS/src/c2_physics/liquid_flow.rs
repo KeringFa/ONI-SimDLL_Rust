@@ -44,7 +44,7 @@ pub fn is_solid(cells: &CellSOA, cell_idx: usize) -> bool {
 // ===== 任务 6：UpdateLiquid + UpdateNeighbourLiquidMass =====
 // 对照源码 05_liquid_flow.c L656-1212（UpdateLiquid）+ L1213-1274（UpdateNeighbourLiquidMass）。
 
-use crate::a_framework::game_data::SubstanceChangeInfo;
+use crate::a_framework::game_data::{SpawnFXInfo, SubstanceChangeInfo};
 
 /// UpdateLiquidData 入口 — 遍历内部格，对"液体格"（state&3==2 且 mass>0）调 update_liquid。
 /// 对照源码 11_msvcrt_ignored.c L42408-42435（遍历循环）：
@@ -1003,6 +1003,27 @@ fn do_evaporate(sim: &mut SimData, cell: usize) {
     }
     clear_cell(sim, updated, cell);
     push_substance_change(sim, cell);
+}
+
+/// SimEvents::SpawnFX（原版 L149835+）：sim→game 坐标转换 + 推 spawn_fx_info。
+/// SpawnFXInfo 12B = {cell_idx: i32, fx_id: i32, rotation: f32}（L7251-7253）。
+/// fx_id = 元素 sublimateFX；rotation = 方向角（镜像原版常量，C# 渲染端解释）。
+pub(crate) fn push_spawn_fx(sim: &mut SimData, sim_cell: usize, fx_id: i32, rotation: f32) {
+    if sim.sim_events.ptr.is_null() {
+        return;
+    }
+    let width = sim.width;
+    let game_w = width - 2;
+    let internal = sim_cell as i32;
+    let game_cell = (internal % width - 1) + (internal / width - 1) * game_w;
+    if game_cell >= 0 && game_cell < sim.num_game_cells {
+        let events = unsafe { &mut *sim.sim_events.ptr };
+        events.spawn_fx_info.push(SpawnFXInfo {
+            cell_idx: game_cell,
+            fx_id,
+            rotation,
+        });
+    }
 }
 
 /// DoSublimation 的相变发射部分（原版 L2722-2863）—— 相变留桩，
@@ -4176,5 +4197,32 @@ mod tests {
             );
         }
         DestroyElementsTable();
+    }
+
+    /// SimEvents::SpawnFX（原版 L149835+）：sim→game 坐标转换 + 推 spawn_fx_info。
+    /// sim14（row2,col2）→ game 5；字段 = {cell_idx, fx_id, rotation}（12B，L7251-7253）。
+    #[test]
+    fn push_spawn_fx_converts_cell_and_fields() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        DestroyElementsTable();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let events = &mut *sd.sim_events.ptr;
+            assert_eq!(events.spawn_fx_info.len(), 0);
+        }
+        push_spawn_fx(&mut sd, 14, 101, 180.0);
+        push_spawn_fx(&mut sd, 20, 102, 0.0); // sim20（row3,col2）→ game 9
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.spawn_fx_info.len(), 2);
+            let fx0 = events.spawn_fx_info.get(0);
+            assert_eq!(fx0.cell_idx, 5);
+            assert_eq!(fx0.fx_id, 101);
+            assert_eq!(fx0.rotation, 180.0);
+            let fx1 = events.spawn_fx_info.get(1);
+            assert_eq!(fx1.cell_idx, 9);
+            assert_eq!(fx1.fx_id, 102);
+            assert_eq!(fx1.rotation, 0.0);
+        }
     }
 }
