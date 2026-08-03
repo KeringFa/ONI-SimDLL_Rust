@@ -5,5 +5,6 @@
 
 pub mod building_temperature;
 pub mod conduit_temperature;
+pub mod element_chunk;
 pub mod frame_processor;
 pub mod sim_data_ops;
