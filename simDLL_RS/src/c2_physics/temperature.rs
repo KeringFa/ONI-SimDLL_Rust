@@ -453,6 +453,77 @@ pub(crate) fn update_temperature_for_backwall(sim: &mut SimData, cell: usize) {
     }
 }
 
+/// 邻格换热门控（原版 L144246-144258）：双方元素 ETD 有效、TC>0、state 无 TemperatureInsulated(0x10)。
+fn pair_allowed(sim: &SimData, a: usize, b: usize) -> bool {
+    let c = unsafe { &*sim.cells.ptr };
+    let (Some(etd_a), Some(etd_b)) = (
+        get_element_temperature_data(c.element_idx.get(a)),
+        get_element_temperature_data(c.element_idx.get(b)),
+    ) else {
+        return false;
+    };
+    etd_a.thermal_conductivity > 0.0
+        && etd_b.thermal_conductivity > 0.0
+        && (etd_a.state | etd_b.state) & 0x10 == 0
+}
+
+/// SimUpdateTemperatureTask::InternalDoTask 单线程等价（原版 L144205-144310）。
+/// 遍历内部格：背墙换热 → 右邻（ΔT≥1 且 TC>0 且无 0x10）→ 下邻（同门控）→ DoStateTransition。
+/// 读 `cells` 稳定缓冲、写 `updatedCells` 增量（opening CopyFrom 后 == 子步初态）。
+pub(crate) fn run_temperature_task(sim: &mut SimData) {
+    if sim.cells.ptr.is_null()
+        || sim.updated_cells.ptr.is_null()
+        || sim.backwall.ptr.is_null()
+        || sim.sim_events.ptr.is_null()
+    {
+        return;
+    }
+    let w = sim.width as usize;
+    let h = sim.height as usize;
+    if w < 3 || h < 3 {
+        return;
+    }
+    for row in 1..h - 1 {
+        for col in 1..w - 1 {
+            let cell = row * w + col;
+            // 1. 背墙换热（cells.mass>0 且 backwall.mass>0，原版 L144222-144234）
+            {
+                let c = unsafe { &*sim.cells.ptr };
+                let bw = unsafe { &*sim.backwall.ptr };
+                if cell < c.mass.len()
+                    && cell < bw.mass.len()
+                    && c.mass.get(cell) > 0.0
+                    && bw.mass.get(cell) > 0.0
+                {
+                    update_temperature_for_backwall(sim, cell);
+                }
+            }
+            // 2/3. 右/下邻换热（门控：|ΔT|≥1、双方 TC>0、无 TemperatureInsulated）
+            let (t_self, t_right, t_below) = {
+                let c = unsafe { &*sim.cells.ptr };
+                (
+                    c.temperature.get(cell),
+                    c.temperature.get(cell + 1),
+                    c.temperature.get(cell + w),
+                )
+            };
+            if col + 1 < w - 1 && (t_self - t_right).abs() >= 1.0 && pair_allowed(sim, cell, cell + 1)
+            {
+                update_temperature_pair(sim, cell, cell + 1);
+            }
+            if row + 1 < h - 1 && (t_self - t_below).abs() >= 1.0 && pair_allowed(sim, cell, cell + w)
+            {
+                update_temperature_pair(sim, cell, cell + w);
+            }
+            // 4. DoStateTransition（每格，原版 L144293-144306）
+            let elem = unsafe { (*sim.cells.ptr).element_idx.get(cell) };
+            if let Some(etd) = get_element_temperature_data(elem) {
+                do_state_transition(sim, cell, &etd);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +729,10 @@ mod tests {
         water.gas_surface_area_multiplier = 1.0;
         water.liquid_surface_area_multiplier = 1.0;
         water.solid_surface_area_multiplier = 1.0;
+        water.low_temp = 0.0;
+        water.high_temp = 1000.0;
+        water.low_temp_transition_idx = INVALID_ELEMENT_INDEX;
+        water.high_temp_transition_idx = INVALID_ELEMENT_INDEX;
         let mut rock = ElementTemperatureData::default();
         rock.state = 3;
         rock.specific_heat_capacity = 0.8;
@@ -665,6 +740,10 @@ mod tests {
         rock.gas_surface_area_multiplier = 1.0;
         rock.liquid_surface_area_multiplier = 1.0;
         rock.solid_surface_area_multiplier = 1.0;
+        rock.low_temp = 0.0;
+        rock.high_temp = 1000.0;
+        rock.low_temp_transition_idx = INVALID_ELEMENT_INDEX;
+        rock.high_temp_transition_idx = INVALID_ELEMENT_INDEX;
         table.temperature_data.push(ElementTemperatureData::default()); // 0 dummy
         table.temperature_data.push(water); // 1
         table.temperature_data.push(rock); // 2
@@ -756,6 +835,11 @@ mod tests {
             bw.mass.set(14, 200.0);
             bw.temperature.set(14, 500.0);
         }
+        // 相变事件：把砖的 highTemp 调低到 0 → 背墙 500°C 越 high+3
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data[2].high_temp = 0.0;
+        }
         update_temperature_for_backwall(&mut sd, 14);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -767,7 +851,7 @@ mod tests {
             assert!(new_back > 300.0);
             // 背墙温度被直接写（非增量）
             assert_eq!(bw.temperature.get(14), new_back);
-            // elem2 默认 highTemp=0 → 背墙 500°C 越 high+3 → 相变事件
+            // 背墙 500°C > 0+3 → 相变事件
             let events = &*sd.sim_events.ptr;
             assert_eq!(events.backwall_should_transition_info.len(), 1);
         }
@@ -798,6 +882,56 @@ mod tests {
             assert_eq!(bw.temperature.get(14), 500.0, "真空格不换热");
             let events = &*sd.sim_events.ptr;
             assert_eq!(events.backwall_should_transition_info.len(), 0);
+        }
+    }
+
+    #[test]
+    fn temperature_task_exchanges_adjacent_pairs_with_gates() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pair_table();
+        let mut sd = make_sim();
+        // cell14(row2,col2 水 300) 与 cell15(row2,col3 砖 400) 相邻（ΔT=100 ≥ 1）→ 换热；
+        // cell20(row3,col2 水 300) 与 cell26(row4,col2 水 300) 同温（ΔT=0）→ 不换热
+        fill_pair_cells(
+            &mut sd,
+            &[
+                (14, 1, 100.0, 300.0, 255),
+                (15, 2, 200.0, 400.0, 255),
+                (20, 1, 100.0, 300.0, 255),
+                (26, 1, 100.0, 300.0, 255),
+            ],
+        );
+        run_temperature_task(&mut sd);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(u.temperature.get(14) > 300.0, "水平相邻应换热");
+            assert!(u.temperature.get(15) < 400.0, "水平相邻应换热");
+            assert_eq!(u.temperature.get(20), 300.0, "ΔT=0 不换热");
+            assert_eq!(u.temperature.get(26), 300.0, "ΔT=0 不换热");
+        }
+    }
+
+    #[test]
+    fn temperature_task_skips_temperature_insulated_state() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pair_table();
+        // 砖加 TemperatureInsulated(0x10) 位
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            let mut rock = table.temperature_data[2];
+            rock.state = 3 | 0x10;
+            table.temperature_data[2] = rock;
+        }
+        let mut sd = make_sim();
+        fill_pair_cells(&mut sd, &[(14, 1, 100.0, 300.0, 255), (15, 2, 200.0, 400.0, 255)]);
+        run_temperature_task(&mut sd);
+        unsafe {
+            assert_eq!(
+                (*sd.updated_cells.ptr).temperature.get(14),
+                300.0,
+                "绝缘元素不换热"
+            );
+            assert_eq!((*sd.updated_cells.ptr).temperature.get(15), 400.0);
         }
     }
 }
