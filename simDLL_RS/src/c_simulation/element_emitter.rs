@@ -207,6 +207,8 @@ impl ElementEmitterManager {
         rec.max_depth = msg.max_depth;
         rec.disease_idx = msg.disease_idx;
         rec.elapsed_time = 0.0;
+        // 原版 Modify L1661：offsetIdx（byte 0x1f）每次置 0 —— 激活后轮转起点归零
+        rec.offset_idx = 0;
         if msg.emit_mass <= 0.0 {
             rec.blocked_state = 0xFF;
         }
@@ -489,6 +491,15 @@ fn try_emit(
         Some(e) => e.state & 3,
         None => return result,
     };
+    // 原版 L1796-1799：emitTemperature < 0 → 用元素 defaultValues.temperature
+    let emit_temp = if rec.emit_temperature < 0.0 {
+        match crate::b_elements::elements_table::get_element_by_idx(rec.elem_idx) {
+            Some(e) => e.default_values.temperature,
+            None => rec.emit_temperature,
+        }
+    } else {
+        rec.emit_temperature
+    };
     for k in 0..count {
         let c = reachable[(start + k) % count];
         let (mass_c, cur_elem) = {
@@ -542,7 +553,7 @@ fn try_emit(
                                     disease_idx: 0xFF,
                                     pad: 0,
                                     mass: rec.emit_mass,
-                                    temperature: rec.emit_temperature,
+                                    temperature: emit_temp,
                                     disease_count: 0,
                                 },
                             );
@@ -559,13 +570,13 @@ fn try_emit(
             c,
             rec.elem_idx,
             rec.emit_mass,
-            rec.emit_temperature,
+            emit_temp,
             rec.disease_idx,
             rec.emit_disease_count,
         );
         result.elem_idx = rec.elem_idx;
         result.mass = rec.emit_mass;
-        result.temperature = rec.emit_temperature;
+        result.temperature = emit_temp;
         result.disease_idx = 0xFF;
         result.disease_count = 0;
         break;
@@ -902,5 +913,87 @@ mod tests {
             3,
             "转置格 sim 26（row4,col2）不应被错误写入"
         );
+    }
+
+    /// 回归：Modify 必须重置 offset_idx = 0（原版 L1661 byte 0x1f=0）。
+    #[test]
+    fn modify_resets_offset_idx() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        reset_for_test();
+        init_table();
+        let mut sim = make_sim();
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        let m = ModifyElementEmitterMsg {
+            handle: h,
+            cell_idx: 7,
+            emit_interval: 0.2,
+            emit_mass: 0.002,
+            emit_temperature: 350.0,
+            max_pressure: 10.0,
+            disease_count: 0,
+            element_idx: 3,
+            max_depth: 2,
+            disease_idx: 0xFF,
+        };
+        assert!(modify_element_emitter(&sim, &m));
+        update_element_emitters(&mut sim, 0.2, 6); // try_emit 使 offset_idx 0→1
+        {
+            let mgr = ELEMENT_EMITTER_MANAGER.lock();
+            assert_eq!(mgr.record(h).unwrap().offset_idx, 1, "发射后轮转起点应前进");
+        }
+        assert!(modify_element_emitter(&sim, &m)); // 再次 Modify → 归零
+        {
+            let mgr = ELEMENT_EMITTER_MANAGER.lock();
+            assert_eq!(mgr.record(h).unwrap().offset_idx, 0, "Modify 应重置 offset_idx");
+        }
+    }
+
+    /// 回归：emitTemperature < 0 → 用元素 defaultValues.temperature（原版 L1796-1799）。
+    #[test]
+    fn try_emit_negative_temp_falls_back_to_default() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        reset_for_test();
+        init_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements[3].default_values.temperature = 300.0;
+        }
+        let mut sim = make_sim();
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        let m = ModifyElementEmitterMsg {
+            handle: h,
+            cell_idx: 0,
+            emit_interval: 0.2,
+            emit_mass: 0.002,
+            emit_temperature: -1.0,
+            max_pressure: 10.0,
+            disease_count: 0,
+            element_idx: 3,
+            max_depth: 1,
+            disease_idx: 0xFF,
+        };
+        assert!(modify_element_emitter(&sim, &m));
+        update_element_emitters(&mut sim, 0.2, 6);
+        let u = unsafe { &*sim.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(7), 3);
+        assert!(
+            (u.temperature.get(7) - 300.0).abs() < 1e-3,
+            "负温度应回退元素默认 300，got {}",
+            u.temperature.get(7)
+        );
+        let out = &sim.element_emitter.emitted_mass_info;
+        assert!((out.get(0).temperature - 300.0).abs() < 1e-3);
     }
 }
