@@ -294,7 +294,7 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
                 }
 
                 // L104: DoLoadTimeStateTransition
-                sim_data.do_load_time_state_transition(cell_idx);
+                crate::c2_physics::temperature::do_load_time_state_transition(sim_data, cell_idx);
             }
         }
     }

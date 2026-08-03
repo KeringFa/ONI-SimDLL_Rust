@@ -628,14 +628,6 @@ impl SimData {
         self.saved_options = settings;
     }
 
-    /// DoLoadTimeStateTransition — 加载时温度状态转变。
-    /// 对照源码 04_temperature.c L7-73。
-    ///
-    /// A3 阶段实现桩版本（不执行温度转变），C 类阶段完善真实逻辑。
-    pub fn do_load_time_state_transition(&mut self, _cell_idx: usize) {
-        // 桩：A3 阶段不执行温度转变
-    }
-
     /// InitializeBoundary — 初始化外围边界格。
     /// 对照源码 11_msvcrt_ignored.c L23949-24195。
     ///

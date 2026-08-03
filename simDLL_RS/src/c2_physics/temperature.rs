@@ -58,6 +58,61 @@ pub(crate) fn spawn_ore(
     true
 }
 
+/// DoLoadTimeStateTransition — 加载时温度状态修正（原版 04_temperature.c L7-73）。
+/// 读取 updated_cells：温度越界 [lowTemp−3, highTemp+3] 时 ±1.5 换元素，
+/// 使存档中轻微越界的格子回到相变窗口内。
+pub(crate) fn do_load_time_state_transition(sim: &mut SimData, cell: usize) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    if cell >= updated.element_idx.len() || cell >= updated.temperature.len() {
+        return;
+    }
+    let elem = updated.element_idx.get(cell);
+    let Some(etd) = get_element_temperature_data(elem) else {
+        return;
+    };
+    let mut temp = updated.temperature.get(cell);
+    // 原版 L22-24：temp >= lowTemp−3 或无低温转换目标 → 只查高温侧
+    if temp >= etd.low_temp - 3.0 || etd.low_temp_transition_idx == INVALID_ELEMENT_INDEX {
+        // 原版 L25-32：highTemp+3 < temp 且有高温转换目标 → 高温转换（temp −1.5、换元素）
+        if etd.high_temp + 3.0 < temp && etd.high_temp_transition_idx != INVALID_ELEMENT_INDEX {
+            if get_element_temperature_data(etd.high_temp_transition_idx).is_none() {
+                tracing::warn!(
+                    cell,
+                    target = etd.high_temp_transition_idx,
+                    "DoLoadTimeStateTransition: invalid high transition target"
+                );
+                return;
+            }
+            temp -= 1.5;
+            updated.temperature.set(cell, temp);
+            updated.element_idx.set(cell, etd.high_temp_transition_idx);
+        }
+    } else {
+        // 原版 L33-39：低温转换（temp +1.5、换元素）
+        if get_element_temperature_data(etd.low_temp_transition_idx).is_none() {
+            tracing::warn!(
+                cell,
+                target = etd.low_temp_transition_idx,
+                "DoLoadTimeStateTransition: invalid low transition target"
+            );
+            return;
+        }
+        temp += 1.5;
+        updated.temperature.set(cell, temp);
+        updated.element_idx.set(cell, etd.low_temp_transition_idx);
+    }
+    if temp > 10000.0 {
+        tracing::warn!(
+            cell,
+            temp,
+            "DoLoadTimeStateTransition: temperature exceeds SIM_MAX_TEMPERATURE"
+        );
+    }
+}
+
 /// DoStateTransition（原版 L133261-133737）。每格换热/升温后调用，返回是否发生转变。
 ///
 /// - 高温侧（T ≥ highTemp+3 且 highTempTransitionIdx 有效）：温度= max(0,T-1.5)，元素切换，
@@ -646,6 +701,75 @@ mod tests {
         let u = unsafe { &*sd.updated_cells.ptr };
         assert_eq!(u.element_idx.get(14), 1);
         assert_eq!(u.temperature.get(14), 102.9);
+    }
+
+    #[test]
+    fn load_time_transition_high_converts_element_and_cools() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 1, 10.0, 105.0); // 水 105℃ > high+3(103)
+        do_load_time_state_transition(&mut sd, 14);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 3, "应转为蒸汽");
+        assert!((u.temperature.get(14) - 103.5).abs() < 1e-4, "温度应 -1.5 → 103.5");
+    }
+
+    #[test]
+    fn load_time_transition_low_converts_element_and_warms() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 1, 10.0, -5.0); // 水 -5℃ < low-3(-3)
+        do_load_time_state_transition(&mut sd, 14);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 2, "应转为冰");
+        assert!((u.temperature.get(14) + 3.5).abs() < 1e-4, "温度应 +1.5 → -3.5");
+    }
+
+    #[test]
+    fn load_time_transition_within_window_and_boundary_is_noop() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 1, 10.0, 97.0); // 窗口内
+        do_load_time_state_transition(&mut sd, 14);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 1);
+        assert_eq!(u.temperature.get(14), 97.0);
+        fill(&mut sd, 14, 1, 10.0, -3.0); // 恰在 low-3 边界 → 不触发
+        do_load_time_state_transition(&mut sd, 14);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 1);
+        assert_eq!(u.temperature.get(14), -3.0);
+        fill(&mut sd, 14, 1, 10.0, 103.0); // 恰在 high+3 边界 → 不触发
+        do_load_time_state_transition(&mut sd, 14);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 1);
+        assert_eq!(u.temperature.get(14), 103.0);
+    }
+
+    #[test]
+    fn load_time_transition_without_target_is_noop() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        // 冰(2) 无转换目标：手动置 0xFFFF
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data[2].low_temp_transition_idx = 0xFFFF;
+            table.temperature_data[2].high_temp_transition_idx = 0xFFFF;
+        }
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 2, 10.0, 2000.0); // 冰 2000℃ 但无高温目标
+        do_load_time_state_transition(&mut sd, 14);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 2);
+        assert_eq!(u.temperature.get(14), 2000.0);
+        fill(&mut sd, 14, 2, 10.0, -100.0); // 冰 无低温目标 → 也不动
+        do_load_time_state_transition(&mut sd, 14);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 2);
+        assert_eq!(u.temperature.get(14), -100.0);
     }
 
     #[test]
