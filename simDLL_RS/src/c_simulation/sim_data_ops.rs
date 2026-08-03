@@ -8,6 +8,18 @@
 
 use crate::a_framework::sim_data::SimData;
 use crate::a_framework::game_data::GameData;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// CopySimDataToGame 内局部静态 tick_count 的镜像（原版 11_msvcrt_ignored.c L32494-32498）：
+/// 每次 CopySimDataToGame 调用 +1，超过 14 后清零 SimData.accumulatedFlow 并归零。
+/// 用途：accumulated_flow 是"3 秒窗口累积量"（15 帧 × 0.2s = 3s，C# 悬停显示
+/// `AccumulatedFlow / 3` 折算每秒速率），窗口结束必须重置源缓冲，否则无限增长。
+static ACCUMULATED_FLOW_RESET_COUNT: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+fn reset_accumulated_flow_reset_count_for_tests() {
+    ACCUMULATED_FLOW_RESET_COUNT.store(0, Ordering::SeqCst);
+}
 
 /// SimData::ClearCell：清除单元格元素。
 ///
@@ -235,6 +247,40 @@ pub fn copy_sim_data_to_game(
 
     // 5. 更新 num_frames_processed
     game_data.num_frames_processed = frame_count;
+
+    // 5b. accumulated_flow 同步（原版 11_msvcrt_ignored.c L32491-32498）：
+    //     按行 memcpy（去掉边界）SimData.accumulatedFlow → GameData.accumulatedFlow，
+    //     随后局部静态 tick_count 超过 14 时 memset 清零 SimData 源缓冲。
+    //     C# 悬停显示 "Emitting {Element}: {FlowRate}" 读 GameData.accumulatedFlow
+    //     （SelectToolHoverTextCard L745：AccumulatedFlow/3），缺失此同步 → 恒显示 0。
+    if !sim_data.accumulated_flow.ptr.is_null() && !game_data.accumulated_flow.ptr.is_null() {
+        let sim_total = sim_w * sim_data.height as usize;
+        let game_total = game_w * game_h;
+        if game_total > 0 {
+            unsafe {
+                let src = std::slice::from_raw_parts(sim_data.accumulated_flow.ptr, sim_total);
+                let dst = std::slice::from_raw_parts_mut(
+                    game_data.accumulated_flow.ptr,
+                    game_total,
+                );
+                for row in 0..game_h {
+                    let sim_row_start = (row + 1) * sim_w + 1;
+                    dst[row * game_w..(row + 1) * game_w]
+                        .copy_from_slice(&src[sim_row_start..sim_row_start + game_w]);
+                }
+            }
+        }
+        // 原版：tick_count = tick_count + 1; if (0xe < tick_count) { memset(...); tick_count = 0; }
+        // memset 清零 SimData 源缓冲（写入侧），窗口语义：显示维持至多 15 帧后归零。
+        let tick = ACCUMULATED_FLOW_RESET_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick > 14 {
+            unsafe {
+                let src = std::slice::from_raw_parts_mut(sim_data.accumulated_flow.ptr, sim_total);
+                src.fill(0.0);
+            }
+            ACCUMULATED_FLOW_RESET_COUNT.store(0, Ordering::Relaxed);
+        }
+    }
 
     // 6. 液体纹理更新（对照源码 11_msvcrt_ignored.c L32496-32500：UpdateFlowTexture
     //    + UpdateExposedToSunPropertyTexture + UpdateLiquidPropertyTexture）
@@ -526,6 +572,75 @@ mod tests {
         // 验证 (sim row=2, col=3) → (game row=1, col=2) = game_idx = 1*4+2 = 6
         assert_eq!(game_cells.element_idx.get(6), 444u16, "game[1,2] element_idx");
         assert_eq!(game_cells.mass.get(6), 555.0f32, "game[1,2] mass");
+    }
+
+    /// 验证 copy_sim_data_to_game 把 SimData.accumulated_flow 逐行（去掉边界）
+    /// 同步到 GameData.accumulated_flow —— C# 悬停显示 "Emitting {Element}: {FlowRate}"
+    /// 读取的就是该缓冲（SelectToolHoverTextCard L745：AccumulatedFlow / 3）。
+    ///
+    /// SimData: 6×6（含边界）→ 内部格 sim 坐标 row=1..4, col=1..4
+    /// GameData: 4×4（不含边界）→ game 坐标 row=0..3, col=0..3
+    #[test]
+    fn copy_sim_data_to_game_copies_accumulated_flow_stripped() {
+        reset_accumulated_flow_reset_count_for_tests();
+        let mut sd = make_test_sim_data();
+        let mut gd = make_test_game_data();
+
+        // 分配 SimData.accumulated_flow（36 格），在内部格填入升华累积量
+        let acc: Vec<f32> = vec![0.0f32; 36];
+        sd.accumulated_flow = UniquePtr { ptr: acc.leak().as_mut_ptr() };
+        unsafe {
+            let src = std::slice::from_raw_parts_mut(sd.accumulated_flow.ptr, 36);
+            src[7] = 0.5;  // sim (row=1, col=1) → game (0,0)
+            src[15] = 0.25; // sim (row=2, col=3) → game (1,2)
+            src[0] = 9.0;  // 边界格不应被拷贝
+        }
+
+        copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 1);
+
+        let dst = unsafe { std::slice::from_raw_parts(gd.accumulated_flow.ptr, 16) };
+        assert!((dst[0] - 0.5).abs() < 1e-6, "game[0,0] 应为 sim 内部格累积量 0.5");
+        assert!((dst[6] - 0.25).abs() < 1e-6, "game[1,2] 应为 0.25");
+        assert_eq!(dst[3], 0.0, "game 边界行（sim 边界格 9.0）不应被拷贝");
+    }
+
+    /// 验证 accumulated_flow 的 15 帧清零窗口（原版 CopySimDataToGame 局部静态
+    /// tick_count：tick_count+1 后 > 0xe 时 memset 清零 SimData 源缓冲）。
+    /// 语义：第 15 次调用仍把"窗口内累积量"交给 GameData，随后源归零；
+    /// 第 16 次调用起 GameData 读到 0 —— 即 C# 显示只维持一个窗口。
+    #[test]
+    fn copy_sim_data_to_game_resets_accumulated_flow_after_15_calls() {
+        reset_accumulated_flow_reset_count_for_tests();
+        let mut sd = make_test_sim_data();
+        let mut gd = make_test_game_data();
+
+        let acc: Vec<f32> = vec![0.0f32; 36];
+        sd.accumulated_flow = UniquePtr { ptr: acc.leak().as_mut_ptr() };
+        unsafe {
+            let src = std::slice::from_raw_parts_mut(sd.accumulated_flow.ptr, 36);
+            src[7] = 0.5;
+        }
+
+        // 前 14 次：GameData 一直读到 0.5，SimData 源保持不变
+        for _ in 0..14 {
+            copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 1);
+            let dst = unsafe { std::slice::from_raw_parts(gd.accumulated_flow.ptr, 16) };
+            assert!((dst[0] - 0.5).abs() < 1e-6, "窗口内 GameData 应持续读到 0.5");
+            let src = unsafe { std::slice::from_raw_parts(sd.accumulated_flow.ptr, 36) };
+            assert!((src[7] - 0.5).abs() < 1e-6, "第 14 次前 SimData 源不应被清零");
+        }
+
+        // 第 15 次：先拷贝（GameData 仍读到 0.5），随后 SimData 源被 memset 清零
+        copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 1);
+        let dst = unsafe { std::slice::from_raw_parts(gd.accumulated_flow.ptr, 16) };
+        assert!((dst[0] - 0.5).abs() < 1e-6, "第 15 次拷贝应交付窗口值 0.5");
+        let src = unsafe { std::slice::from_raw_parts(sd.accumulated_flow.ptr, 36) };
+        assert_eq!(src[7], 0.0, "第 15 次调用后 SimData 源应被清零");
+
+        // 第 16 次：GameData 读到 0
+        copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 1);
+        let dst = unsafe { std::slice::from_raw_parts(gd.accumulated_flow.ptr, 16) };
+        assert_eq!(dst[0], 0.0, "清零后 GameData 应读到 0");
     }
 
     /// 验证 SimData::new_for_allocate 分配了 sim_events。
