@@ -213,6 +213,40 @@ pub(crate) fn do_state_transition(
     true
 }
 
+/// CalculateTemperatureExchange_precise（原版 L133110-133170）。
+///
+/// heat = min((T_b−T_a)×k×dt, (T_b−T_a)×rate×HC_a, (T_b−T_a)×rate×HC_b)；
+/// 新温度 = ±heat/HC + 原温度，钳制不越过加权均衡；double 计算、f32 输出。
+/// 返回 (new_第一参, new_第二参)。
+pub(crate) fn calculate_temperature_exchange_precise(
+    rate: f32,
+    k: f32,
+    dt: f32,
+    t_a: f32,
+    hc_a: f32,
+    t_b: f32,
+    hc_b: f32,
+) -> (f32, f32) {
+    let (t_a, hc_a) = (t_a as f64, hc_a as f64);
+    let (t_b, hc_b) = (t_b as f64, hc_b as f64);
+    let (rate, k, dt) = (rate as f64, k as f64, dt as f64);
+    if hc_a <= 0.0 || hc_b <= 0.0 {
+        return (t_a as f32, t_b as f32);
+    }
+    let equilibrium = (t_a * hc_a + t_b * hc_b) / (hc_a + hc_b);
+    let d = t_b - t_a;
+    let heat = (d * k * dt).min(d * rate * hc_a).min(d * rate * hc_b);
+    let mut new_a = heat / hc_a + t_a;
+    if equilibrium <= new_a {
+        new_a = equilibrium;
+    }
+    let mut new_b = -heat / hc_b + t_b;
+    if new_b <= equilibrium {
+        new_b = equilibrium;
+    }
+    (new_a as f32, new_b as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +410,33 @@ mod tests {
         let mut sd = make_sim();
         // sim 尺寸 6×6（含边界）：内部行 1..4；cell0 = row0 边界 → game = -5 → false
         assert!(!spawn_ore(&mut sd, 0, 7, 5.0, 300.0, 0xFF, 0, true));
+    }
+
+    #[test]
+    fn exchange_precise_conserves_energy_and_clamps_to_equilibrium() {
+        // T_a=300 HC=100，T_b=400 HC=100，k=1，rate=0.25，dt=0.2
+        let (na, nb) =
+            calculate_temperature_exchange_precise(0.25, 1.0, 0.2, 300.0, 100.0, 400.0, 100.0);
+        // heat = min(100×1×0.2, 100×0.25×100, 100×0.25×100) = 20
+        assert!((na - 300.2).abs() < 1e-3, "a 得热 20/100 → 300.2，got {na}");
+        assert!((nb - 399.8).abs() < 1e-3, "b 失热 20/100 → 399.8，got {nb}");
+        // 能量守恒：0.2×100 == 0.2×100
+        assert!(((na - 300.0) * 100.0 + (nb - 400.0) * 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn exchange_precise_caps_heat_by_k_and_hc() {
+        // 原版约定：precise 只在"冷侧在前"（T_a ≤ T_b）下调用，d ≥ 0。
+        // k 极小 → k×dt 上限生效：heat = 100×0.01×0.2 = 0.2
+        let (na, nb) =
+            calculate_temperature_exchange_precise(0.25, 0.01, 0.2, 300.0, 100.0, 400.0, 100.0);
+        assert!((na - 300.002).abs() < 1e-3, "got {na}");
+        assert!((nb - 399.998).abs() < 1e-3, "got {nb}");
+        // k 极大 → 0.25×HC 上限生效：heat = 100×0.25×100 = 2500 → 325/375，不越过均衡 350
+        let (na2, nb2) =
+            calculate_temperature_exchange_precise(0.25, 1e9, 0.2, 300.0, 100.0, 400.0, 100.0);
+        assert!((na2 - 325.0).abs() < 1e-3, "got {na2}");
+        assert!((nb2 - 375.0).abs() < 1e-3, "got {nb2}");
+        assert!(na2 <= 350.0 && nb2 >= 350.0);
     }
 }
