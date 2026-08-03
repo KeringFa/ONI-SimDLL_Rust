@@ -4156,6 +4156,220 @@ mod tests {
         DestroyElementsTable();
     }
 
+    /// 异种气体 DisplaceGas 成功（L148705-148753）：cell14=气体X mass 0.5，上方砖 A（产物气体4）。
+    /// tick0 候选 [20,13,15,8]：20 固体、13 真空 → 气体 X 全量移到 13；
+    /// 目标换元素 4、质量 += 0.04；砖 A 扣 0.08。
+    #[test]
+    fn do_sublimation_displaces_heterogeneous_gas() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.tick_count = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 3); // 气体 X
+                buf.mass.set(14, 0.5);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1); // 固体 A（产物 4）
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 250.0);
+                buf.element_idx.set(13, 0); // 真空（DisplaceGas 目的地）
+                buf.mass.set(13, 0.0);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(13), 3, "异类气体被挤到 13");
+            assert!((updated.mass.get(13) - 0.5).abs() < 1e-4);
+            assert_eq!(updated.element_idx.get(14), 4, "目标换成升华产物");
+            assert!((updated.mass.get(14) - 0.04).abs() < 1e-5, "挤走后只剩新增 0.04");
+            assert!((updated.temperature.get(14) - 250.0).abs() < 1e-4);
+            assert!((updated.mass.get(20) - 99.92).abs() < 1e-4);
+        }
+        DestroyElementsTable();
+    }
+
+    /// DisplaceGas 失败且无先前成功（L148758）：四邻全固体/无真空 → 跳过，砖格无损、无事件。
+    #[test]
+    fn do_sublimation_skips_when_displace_fails_and_no_prior_success() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 3);
+                buf.mass.set(14, 0.5);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 300.0);
+                for nb in [15usize, 13, 8] {
+                    buf.element_idx.set(nb, 6); // 普通固体，无升华
+                    buf.mass.set(nb, 500.0);
+                    buf.temperature.set(nb, 300.0);
+                }
+            }
+        }
+        let seed_before = sd.random_seed;
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(14) - 0.5).abs() < 1e-4);
+            assert!((updated.mass.get(20) - 100.0).abs() < 1e-4);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.spawn_fx_info.len(), 0);
+        }
+        let expected = seed_before.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+        assert_eq!(sd.random_seed, expected, "仅 1 个有效邻格 → 恰好消耗 1 次");
+        DestroyElementsTable();
+    }
+
+    /// 原版怪癖（L148758 fall-through）：前一邻格成功（bvar16=true）后，
+    /// 后续邻格 DisplaceGas 失败 → 仍扣该砖质量/播 FX，但目标不产气。
+    /// cell14=气体X 0.5；20=砖A(产物4)→先成功（挤到13）；15=砖B(产物5)→挤 4 失败（四邻堵死）。
+    #[test]
+    fn do_sublimation_quirk_mirrors_mass_loss_after_prior_success() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.tick_count = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 3);
+                buf.mass.set(14, 0.5);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1); // 产物 4 ≠ 3 → 挤 3（成功，13 真空）
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 300.0);
+                buf.element_idx.set(15, 2); // 产物 5 → 挤当前 4（失败，四邻无真空/同气体）
+                buf.mass.set(15, 100.0);
+                buf.temperature.set(15, 300.0);
+                buf.element_idx.set(13, 0);
+                buf.mass.set(13, 0.0);
+                buf.element_idx.set(8, 6);
+                buf.mass.set(8, 500.0);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(13), 3, "气体 X 被挤到 13");
+            assert_eq!(updated.element_idx.get(14), 4, "第一邻格成功换元素");
+            assert!((updated.mass.get(14) - 0.04).abs() < 1e-5);
+            assert!(
+                (updated.mass.get(15) - 99.98).abs() < 1e-4,
+                "怪癖：失败邻格仍扣 0.02（f18=0.1×0.2）"
+            );
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert!((acc[15] - 0.02).abs() < 1e-5, "怪癖：flow 仍累积");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.spawn_fx_info.len(), 2, "两个邻格都有 FX");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 整格消耗分支（L148848-148866）：砖质量 0.05 <= f18=0.08 → 砖格就地转气体、
+    /// 质量 ×eff、substance 事件、SpawnFX(0.0)；调用格（真空）不变。
+    #[test]
+    fn do_sublimation_full_consumption_converts_in_place() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 0);
+                buf.mass.set(14, 0.0);
+                buf.temperature.set(14, 0.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 0.05);
+                buf.temperature.set(20, 250.0);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(20), 4, "砖格就地转气体");
+            assert!((updated.mass.get(20) - 0.025).abs() < 1e-5, "0.05×0.5");
+            assert_eq!(updated.element_idx.get(14), 0, "调用格不变");
+            let acc = std::slice::from_raw_parts(sd.accumulated_flow.ptr, 30);
+            assert_eq!(acc[20], 0.0, "整格消耗分支不累积 flow");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 1);
+            assert_eq!(events.substance_change_info.get(0).cell_idx, 9);
+            let fx = events.spawn_fx_info.get(0);
+            assert_eq!(fx.rotation, 0.0);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 入口快照语义（L148650/param_4->state）：入口真空 → 后续邻格走换元素段**不尝试 DisplaceGas**，
+    /// 即使目标已被前一邻格换成气体 4。最终元素 = 后邻格产物 5。
+    #[test]
+    fn do_sublimation_uses_entry_snapshot_for_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 0);
+                buf.mass.set(14, 0.0);
+                buf.temperature.set(14, 0.0);
+                buf.element_idx.set(20, 1); // 产物 4
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 300.0);
+                buf.element_idx.set(15, 2); // 产物 5
+                buf.mass.set(15, 100.0);
+                buf.temperature.set(15, 300.0);
+                buf.element_idx.set(13, 6);
+                buf.mass.set(13, 500.0);
+                buf.element_idx.set(8, 6);
+                buf.mass.set(8, 500.0);
+            }
+        }
+        do_sublimation(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 5, "后邻格覆盖（入口快照驱动）");
+            assert!((updated.mass.get(14) - 0.044).abs() < 1e-5, "0.04 + 0.02×0.2");
+            assert!((updated.mass.get(20) - 99.92).abs() < 1e-4);
+            assert!((updated.mass.get(15) - 99.98).abs() < 1e-4);
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.substance_change_info.len(), 2, "两次换元素各一次事件");
+            assert_eq!(events.substance_change_info.get(0).cell_idx, 5);
+            assert_eq!(events.substance_change_info.get(1).cell_idx, 5);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 随机种子只对有效邻格消耗（L148656-148662）：四邻全为普通固体 → 种子不变。
+    #[test]
+    fn do_sublimation_consumes_seed_only_for_valid_neighbors() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_sublimate_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 0);
+                buf.mass.set(14, 0.0);
+                for nb in [20usize, 15, 13, 8] {
+                    buf.element_idx.set(nb, 6);
+                    buf.mass.set(nb, 500.0);
+                }
+            }
+        }
+        let seed_before = sd.random_seed;
+        do_sublimation(&mut sd, 14);
+        assert_eq!(sd.random_seed, seed_before, "无有效邻格不消耗");
+        DestroyElementsTable();
+    }
+
     /// 挤压链路（用户观察）：液体格被固体挤压 → 质量**平均分配**给上下左右 4 格。
     /// 对照 DisplaceLiquid L34136 / DisplaceLiquidSimple L34206：
     /// 4 个候选（右/左/下/上）均为真空 → 各得 100/4 = 25；
