@@ -483,6 +483,46 @@ pub(crate) fn run_temperature_task(sim: &mut SimData) {
     if w < 3 || h < 3 {
         return;
     }
+    // 一次性诊断：统计内部格 insulation 分布与可换热对数（定位加载后绝缘是否恢复）
+    {
+        use std::sync::Once;
+        static DIAG: Once = Once::new();
+        DIAG.call_once(|| {
+            let c = unsafe { &*sim.cells.ptr };
+            let mut hist = [0usize; 256];
+            let mut pairs = 0usize;
+            let mut cells_with_mass = 0usize;
+            for row in 1..h - 1 {
+                for col in 1..w - 1 {
+                    let cell = row * w + col;
+                    if c.mass.get(cell) > 0.0 {
+                        cells_with_mass += 1;
+                    }
+                    let ins = c.insulation.get(cell) as usize;
+                    hist[ins.min(255)] += 1;
+                    if col + 1 < w - 1
+                        && (c.temperature.get(cell) - c.temperature.get(cell + 1)).abs() >= 1.0
+                    {
+                        pairs += 1;
+                    }
+                    if row + 1 < h - 1
+                        && (c.temperature.get(cell) - c.temperature.get(cell + w)).abs() >= 1.0
+                    {
+                        pairs += 1;
+                    }
+                }
+            }
+            let nonzero: usize = hist[1..].iter().sum();
+            tracing::info!(
+                ins_zero = hist[0],
+                ins_nonzero = nonzero,
+                ins_255 = hist[255],
+                cells_with_mass,
+                delta_t_pairs = pairs,
+                "temperature task diagnostic (first run)"
+            );
+        });
+    }
     for row in 1..h - 1 {
         for col in 1..w - 1 {
             let cell = row * w + col;
