@@ -362,6 +362,101 @@ pub(crate) fn exchange_heat_energy_with_world(
     heat
 }
 
+/// ElementChunk::Update（原版 L140092-140202）。
+/// 逐碎片：adjuster 换热（rate 1.0，不写格子）或世界换热（本格 1.0 + 下方固体 groundTransferScale）；
+/// 输出 {temperature, delta_kj}；越相变 → elementChunkMeltedInfo。
+pub(crate) fn update_element_chunks_inner(
+    mgr: &mut ElementChunkManager,
+    sim: &mut SimData,
+    dt: f32,
+    width: i32,
+) {
+    mgr.output.clear();
+    if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
+        return;
+    }
+    let w = width as usize;
+    for index in 0..mgr.items.len() {
+        let ri = mgr.items[index];
+        if ri < 0 {
+            continue;
+        }
+        let handle = ((mgr.versions[index] as i32) << 24) | (index as i32 & 0xffffff);
+        let chunk = &mut mgr.records[ri as usize];
+        if chunk.heat_capacity <= 0.0 {
+            continue;
+        }
+        let mut delta = 0.0f32;
+        if chunk.adjuster.heat_capacity > 0.0 {
+            // adjuster 分支（原版 L140114-140120）：rate 1.0，不写格子；
+            // 原版走 CalculateTemperatureExchange wrapper（冷侧在前），负温差下 min 取负会过冲。
+            let nc = if chunk.temperature <= chunk.adjuster.temperature {
+                let (nc, _na) =
+                    crate::c2_physics::temperature::calculate_temperature_exchange_precise(
+                        1.0,
+                        chunk.adjuster.thermal_conductivity,
+                        dt,
+                        chunk.temperature,
+                        chunk.heat_capacity,
+                        chunk.adjuster.temperature,
+                        chunk.adjuster.heat_capacity,
+                    );
+                nc
+            } else {
+                let (_na, nc) =
+                    crate::c2_physics::temperature::calculate_temperature_exchange_precise(
+                        1.0,
+                        chunk.adjuster.thermal_conductivity,
+                        dt,
+                        chunk.adjuster.temperature,
+                        chunk.adjuster.heat_capacity,
+                        chunk.temperature,
+                        chunk.heat_capacity,
+                    );
+                nc
+            };
+            chunk.temperature = nc;
+        } else {
+            let cell = chunk.cell as usize;
+            let h1 = exchange_heat_energy_with_world(sim, chunk, cell, 1.0, dt);
+            delta += h1;
+            // 下方格为固体 → groundTransferScale 换热（原版 L140159-140167）
+            if cell >= w {
+                let below = cell - w;
+                let below_elem = unsafe { (*sim.updated_cells.ptr).element_idx.get(below) };
+                if let Some(etd) =
+                    crate::b_elements::elements_table::get_element_temperature_data(below_elem)
+                {
+                    if etd.state & 3 == 3 {
+                        let h2 = exchange_heat_energy_with_world(
+                            sim,
+                            chunk,
+                            below,
+                            chunk.ground_transfer_scale,
+                            dt,
+                        );
+                        delta += h2;
+                    }
+                }
+            }
+        }
+        let t = chunk.temperature;
+        mgr.output.push(ElementChunkInfo {
+            temperature: t,
+            delta_kj: delta,
+        });
+        // 相变（原版 L140185-140196）：T ≥ highTemp+3 或 < lowTemp−3 → elementChunkMeltedInfo
+        if chunk.high_temp + 3.0 <= t || t < chunk.low_temp - 3.0 {
+            let events = unsafe { &mut *sim.sim_events.ptr };
+            events
+                .element_chunk_melted_info
+                .push(MeltedInfo {
+                    handle: Handle { value: handle },
+                });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +621,64 @@ mod tests {
             exchange_heat_energy_with_world(&mut sd, &mut chunk, 14, 1.0, 0.2),
             0.0
         );
+    }
+
+    #[test]
+    fn update_uses_adjuster_when_present() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        let h = mgr.add(6, &add_msg(4, 300.0)); // game 4 → sim 13
+        mgr.modify_adjuster(h, 500.0, 100.0, 2.0);
+        // adjuster 分支不依赖格子质量
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let d = mgr.record(h).unwrap();
+        assert!(
+            d.temperature > 300.0,
+            "adjuster 应加热碎片，got {}",
+            d.temperature
+        );
+        assert!(d.temperature < 500.0);
+    }
+
+    #[test]
+    fn update_exchanges_with_solid_cell_below() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        // game 9 → sim (3,2) = 20；下方格 14 为固体砖 300°C
+        let h = mgr.add(6, &add_msg(9, 5000.0));
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(14, 2);
+            u.mass.set(14, 1000.0);
+            u.temperature.set(14, 300.0);
+            u.insulation.set(14, 255);
+        }
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let d = mgr.record(h).unwrap();
+        assert!(
+            d.temperature < 5000.0,
+            "碎片应降温给下方固体，got {}",
+            d.temperature
+        );
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.element_chunk_melted_info.len(), 0, "无相变");
+        assert!(!mgr.output_snapshot().is_empty());
+    }
+
+    #[test]
+    fn update_emits_melted_event_on_phase_cross() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table(); // elem5 highTemp=5000 → >5003 触发
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        let h = mgr.add(6, &add_msg(4, 6000.0)); // game 4 → sim 13（无质量格 → 世界分支不换热）
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.element_chunk_melted_info.len(), 1);
+        assert_eq!(events.element_chunk_melted_info.get(0).handle.value, h);
     }
 }
