@@ -239,9 +239,26 @@ fn process_set_insulation_values(frame: &mut SimFrameInfo, sim_data: &mut SimDat
         let entry = slice[i];
         let internal_cell = ((entry.game_cell % game_w + 1) as i32)
             + ((entry.game_cell / game_w + 1) as i32) * sim_data.width;
-        updated_cells.insulation.set(internal_cell as usize, entry.value as u8);
+        updated_cells
+            .insulation
+            .set(internal_cell as usize, insulation_u8(entry.value));
+    }
+    if count > 0 {
+        let sample = slice[0];
+        tracing::info!(
+            count,
+            first_value = sample.value,
+            first_byte = insulation_u8(sample.value),
+            "SetInsulationValue processed"
+        );
     }
     frame.set_insulation_values.clear_keep_capacity();
+}
+
+/// 原版 L116370：`insulation = (u8)(value × 255.0)`——C# 发送 0-1 导热系数（1.0=满导热）。
+/// 此前直接 `as u8` 截断：1.0f → 1（≈0 导热），导致格子间/背墙换热全部失效（k = ins²×1.53787e-05×TC ≈ 0）。
+fn insulation_u8(value: f32) -> u8 {
+    (value * 255.0) as u8
 }
 
 /// ProcessSetStrengthValues：处理强度值设置。
@@ -1359,6 +1376,16 @@ mod tests {
     use crate::a_framework::stl_shim::UniquePtr;
     use crate::b_elements::element::{Element, ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData};
     use crate::b_elements::elements_table::{G_ELEMENTS_TABLE, DestroyElementsTable};
+
+    #[test]
+    fn insulation_value_scale_is_255() {
+        // 原版 L116370：insulation = (u8)(value × 255.0)
+        assert_eq!(insulation_u8(1.0), 255, "C# 发 1.0 = 满导热 255");
+        assert_eq!(insulation_u8(0.0), 0);
+        assert_eq!(insulation_u8(0.01), 2); // 0.01×255 = 2.55 → 2（隔热砖）
+        assert_eq!(insulation_u8(0.5), 127); // 127.5 → 127
+        assert_eq!(insulation_u8(-1.0), 0); // 负值截断为 0
+    }
     use crate::LIB_TESTS_LOCK;
 
     /// 初始化 elements_table：添加 2 个元素（索引 0=固体, 1=真空/非固体）
