@@ -154,3 +154,26 @@
   ④ 建筑↔格子与背墙路径互不干扰。
 - **后续（温度模块下一块）**：导热板 BuildingToBuildingHeatExchange（L138358）、升华/持续蒸发、
   ElementEmitter 本体、辐射。
+
+## [已完成] ElementChunk（物质碎片）温度组件（2026-08-03 内联执行）
+
+- 规格：docs/superpowers/specs/2026-08-03-element-chunk-design.md（be8eb8f）
+- 计划：docs/superpowers/plans/2026-08-03-element-chunk.md（7ac0f0d）
+- **已实现（严格对照原版 SimDLL_Source.c，未抄神秘版本）**：
+  - 注册表（版本句柄 + free list + swap-remove）：ElementChunkData 44B
+    （cell / temperature / heatCapacity=SHC×mass / TC=元素TC / maxEnergyScale=surfaceArea÷thickness /
+    groundTransferScale / high·lowTemp / adjuster）；
+  - 消息：Add 32B（含 game→sim 坐标换算与回调）、Modify 12B、ModifyEnergy 8B（ΔT=ΔQ/HC 钳制≥0）、
+    ModifyAdjuster 16B、Move 8B、Remove 8B；ProcessFrame 顺序 adds→modifies→energy→adjuster→move→removes；
+  - ExchangeHeatEnergyWithWorld（L139789）：min(碎片TC, ins²×1.53787e-05×cellTC)×scale×maxEnergyScale×0.001，
+    冷侧在前能量守恒，直接写 updatedCells；
+  - Update（L140092）：adjuster 分支（rate 1.0 不写格子）或世界分支（本格全比例 + 下方固体格
+    groundTransferScale——"真空碎片与下方实体方格换热"机制）；越相变 → elementChunkMeltedInfo；
+  - 输出：elementChunkInfo {temperature, delta_kj} 每帧 swap 进 GameData（GDU elementChunkInfos）。
+- **勘误记录**：adjuster 分支须走 CalculateTemperatureExchange wrapper 的"冷侧在前"约定（负温差下
+  min 取负会过冲）；game→sim 坐标 `(gc/(w-2)+1)*w + gc%(w-2)+1`。
+- 全量 366 测试串行全过；release 构建成功（任务 5 轮）。
+- **待实测**：部署 DLL → ① 碎片与所在格内容物换热；② 真空下碎片与下方实体方格换热
+  （groundTransferScale）；③ 碎片加热/冷却至相变温度 → 熔化事件。
+- **后续**：透气砖/网格砖特殊换热机制（用户暂不研究）、碎片 disease/辐射、导热板
+  BuildingToBuildingHeatExchange、升华/持续蒸发、ElementEmitter 本体。
