@@ -42,6 +42,74 @@ pub fn update_data(sim_data: &mut SimData) {
             "update_data: grid vs active-region coverage diag"
         );
     }
+    // 2026-08-04 D1 探针（临时）：验证活动区域之外的格（未发现星球/太空缝隙）
+    // 状态不变化（原版"UNKNOWN 永不变化"机制）。取 3 个区域外样本，第 1 次与
+    // 第 200 次 update_data 各记录一次元素/质量/温度，比较是否冻结。
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static FROZEN_PROBE_COUNT: AtomicU32 = AtomicU32::new(0);
+        static FROZEN_PROBE_RECORDED: std::sync::Mutex<Option<Vec<(u16, f32, f32)>>> =
+            std::sync::Mutex::new(None);
+        let n = FROZEN_PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n == 0 || n == 200 {
+            // 采样：活动区域之外的格（取区域矩形外固定偏移，含世界之间缝隙/未发现世界）。
+            let bounds_list: Vec<crate::d1_activity::RegionBounds> = sim_data
+                .active_regions
+                .as_slice()
+                .iter()
+                .map(|r| crate::d1_activity::compute_region_bounds(sim_data, r))
+                .collect();
+            let w = sim_data.width as usize;
+            let h = sim_data.height as usize;
+            let mut samples: Vec<(usize, u16, f32, f32)> = Vec::new();
+            let candidates = [
+                (w / 4, h / 2),
+                (w / 2, h / 4),
+                (w * 3 / 4, h / 2),
+            ];
+            for (x, y) in candidates {
+                let cell = y * w + x;
+                let in_region = bounds_list.iter().any(|b| {
+                    x >= b.min_x && x <= b.max_x && y >= b.min_y && y <= b.max_y
+                });
+                if !in_region && !sim_data.updated_cells.ptr.is_null() {
+                    let c = unsafe { &*sim_data.updated_cells.ptr };
+                    if cell < c.element_idx.len() {
+                        samples.push((cell, c.element_idx.get(cell), c.mass.get(cell), c.temperature.get(cell)));
+                    }
+                }
+            }
+            if n == 0 {
+                if samples.is_empty() {
+                    tracing::info!("frozen-probe: no cells outside active regions (single-star or full coverage)");
+                } else {
+                    *FROZEN_PROBE_RECORDED.lock().unwrap() = Some(
+                        samples.iter().map(|s| (s.1, s.2, s.3)).collect(),
+                    );
+                    tracing::info!(
+                        ?samples,
+                        "frozen-probe: first sample (cells outside active regions)"
+                    );
+                }
+            } else if n == 200 {
+                let first = FROZEN_PROBE_RECORDED.lock().unwrap().clone();
+                let changed = match &first {
+                    Some(f) => {
+                        f.len() == samples.len()
+                            && f.iter()
+                                .zip(samples.iter())
+                                .all(|(a, s)| a.0 == s.1 && (a.1 - s.2).abs() < 1e-6 && (a.2 - s.3).abs() < 1e-6)
+                    }
+                    None => false,
+                };
+                tracing::info!(
+                    ?samples,
+                    frozen = changed,
+                    "frozen-probe: 200th sample vs first (expect frozen=true)"
+                );
+            }
+        }
+    }
     // 原版 UpdateData L144415：每子步开头 CopyFrom(cells, updatedCells)
     crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
 
