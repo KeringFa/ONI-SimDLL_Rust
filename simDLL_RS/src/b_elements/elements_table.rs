@@ -281,32 +281,6 @@ fn create_elements_table(reader: &mut BinaryBufferReader) -> Result<usize, Buffe
         table.element_indices.insert(elem_id, i as u16);
     }
 
-    // 2026-08-04 定性诊断（临时）：元素表关键数据——
-    // ① 是否有 id=0 的元素（决定存档 backwall hash=0 → GetElementIndex(0) 的值）；
-    // ② 真空（id=0x2d39bf75）的索引与 C# elementsTableIdx 字段。
-    let vac_hash = 0x2d39bf75u32;
-    let mut zero_idx: Option<usize> = None;
-    let mut vac_idx: Option<usize> = None;
-    let mut vac_table_idx: u16 = 0xFFFF;
-    for (i, e) in table.elements.iter().enumerate() {
-        if e.id as u32 == 0 {
-            zero_idx = Some(i);
-        }
-        if e.id as u32 == vac_hash {
-            vac_idx = Some(i);
-            vac_table_idx = e.elements_table_idx;
-        }
-    }
-    tracing::info!(
-        count,
-        ?zero_idx,
-        ?vac_idx,
-        vac_table_idx,
-        elem0_id = table.elements.first().map(|e| e.id as u32),
-        elem1_id = table.elements.get(1).map(|e| e.id as u32),
-        "ElementsTable diag (space vacuum)"
-    );
-
     tracing::info!(
         count,
         mapped = table.element_indices.len(),

@@ -127,11 +127,14 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
     let world_zones = unsafe { std::slice::from_raw_parts(sim.world_zones.ptr, total) };
     let backwall = unsafe { &*sim.backwall.ptr };
     // 原版 L145470：backwall.elementIdx[cell] == *(short*)backwall（backwall 首 2 字节）。
-    // old 稳定版（已实测太空删除）解析为 backwall.element_idx[0]——"backwall 模板元素"：
-    // backwall[0]（边界格）加载后 = 存档解析值（本存档 hash=0 → 65535），太空格同为
-    // 65535 → 判定通过。此前我们用 vacuum_element_idx 字段（=211，真空在元素表）→
-    // 65535 ≠ 211 恒失败。2026-08-04 修正：改用 backwall.element_idx[0]。
-    let bw_template = backwall.element_idx.get(0);
+    // BackwallSOA 构造（11_msvcrt_ignored.c L21506-21507：this->vacuumElementIdx = param_2）
+    // 确认首字段 = vacuumElementIdx。元素表定性诊断（2026-08-04）：
+    //   count=212、zero_idx=None（无 id=0）、vac_idx=211、vac_table_idx=211 →
+    //   原版真空索引 = 211，原版只删"背墙 == 真空(211)"的太空格；
+    //   原版存档太空格背墙 hash=0 → GetElementIndex(0)=65535 → 原版对该存档不删。
+    //   此前 element_idx[0]（=65535 加载值）判定把原版不删的格也删了（过度宽松；
+    //   old 版因无 vacuumElementIdx 字段才用 element_idx[0]）。修正回 vacuumElementIdx。
+    let vacuum = backwall.vacuum_element_idx;
     unsafe {
         let updated = &mut *sim.updated_cells.ptr;
         let flow = std::slice::from_raw_parts_mut(sim.flow.ptr, total);
@@ -142,8 +145,8 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
                 if world_zones[cell] != 0xFF {
                     continue;
                 }
-                // 原版 L42967-42970：背墙元素 == vacuum
-                if backwall.element_idx.get(cell) != bw_template {
+                // 原版 L42967-42970：背墙元素 == backwall.vacuumElementIdx（真空 211）
+                if backwall.element_idx.get(cell) != vacuum {
                     continue;
                 }
                 // 原版 L42979-42987：读 updatedCells 元素 state & 3
