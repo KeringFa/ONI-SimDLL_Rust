@@ -17,6 +17,31 @@ pub mod temperature;
 /// 原版调用 UpdateTemperature/UpdatePressure/UpdateLiquid 等物理更新。
 /// C1 桩：不执行任何物理计算，cell 状态保持不变。
 pub fn update_data(sim_data: &mut SimData) {
+    // 2026-08-04 D1 探针（临时）：首帧统计整网格 vs 活动区域覆盖格数，
+    // 量化"只算已发现世界矩形"的裁剪收益。
+    static UPDATE_DATA_REGION_DIAG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !UPDATE_DATA_REGION_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let total = (sim_data.width as usize).saturating_mul(sim_data.height as usize);
+        let regions = sim_data.active_regions.as_slice();
+        let mut region_cells = 0u64;
+        let mut region_list: Vec<(i32, i32, i32, i32, u64)> = Vec::new();
+        for r in regions {
+            let w = (r.max_x - r.min_x + 1).max(0) as u64;
+            let h = (r.max_y - r.min_y + 1).max(0) as u64;
+            region_cells += w * h;
+            if region_list.len() < 8 {
+                region_list.push((r.min_x, r.min_y, r.max_x, r.max_y, w * h));
+            }
+        }
+        tracing::info!(
+            total,
+            region_count = regions.len(),
+            region_cells,
+            ?region_list,
+            "update_data: grid vs active-region coverage diag"
+        );
+    }
     // 原版 UpdateData L144415：每子步开头 CopyFrom(cells, updatedCells)
     crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
     // 温度任务（原版 L144430-144548：读 cells 稳定缓冲、写 updatedCells 增量；

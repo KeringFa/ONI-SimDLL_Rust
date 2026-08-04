@@ -608,6 +608,8 @@ impl SimFrameManager {
 
         // 读取所有 NewGameFrame 结构体
         let mut regions: Vec<ActiveRegion> = Vec::with_capacity(frame_count);
+        // 2026-08-04 D1 探针（临时）：记录首帧原始坐标（未 +1 边界偏移）。
+        let mut diag_raw: Vec<(i32, i32, i32, i32)> = Vec::new();
         let mut elapsed_seconds = 0.0f32;
 
         for i in 0..frame_count {
@@ -627,6 +629,9 @@ impl SimFrameManager {
             let max_y = i32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
             let sunlight = f32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
             let cosmic_rad = f32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+            if diag_raw.len() < 16 {
+                diag_raw.push((min_x, min_y, max_x, max_y));
+            }
 
             if i == 0 {
                 elapsed_seconds = elapsed;
@@ -641,6 +646,19 @@ impl SimFrameManager {
                 current_sunlight_intensity: sunlight,
                 current_cosmic_radiation_intensity: cosmic_rad,
             });
+        }
+
+        // 2026-08-04 D1 探针（临时）：首帧打印活动区域数量与原始坐标（未 +1），
+        // 确认 C# 下发的是"已发现世界整块矩形"（对照 DefineWorldOffsets 的世界偏移）。
+        static NEW_GAME_FRAME_DIAG: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !NEW_GAME_FRAME_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                frame_count,
+                elapsed_seconds,
+                ?diag_raw,
+                "NewGameFrame: first-frame diag (raw coords, no +1)"
+            );
         }
 
         // 写入 currentFrame.elapsedSeconds
@@ -820,6 +838,14 @@ impl SimFrameManager {
 
         // 调用 ProcessFrame（C1 阶段通过 frame_processor 模块实现）
         crate::c_simulation::frame_processor::process_frame(frame, sim_data);
+
+        // 原版 ProcessFrame 末尾（L117396-117400）：SimFrameManager::activeRegions
+        // → SimData::activeRegions（_Assign_range）。供 update_data 按活动区域裁剪。
+        // 2026-08-04 D1：此前未同步 → 物理层读不到区域数据。
+        sim_data.active_regions.clear_keep_capacity();
+        for r in self.active_regions.as_slice() {
+            sim_data.active_regions.push(*r);
+        }
 
         self.num_frames_processed += 1;
         frame.elapsed_seconds
