@@ -705,6 +705,20 @@ property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生�
 - **依赖记录**：病菌贡献（RadiationSickness → +count×0.001）依赖病菌表，阶段 A 跳过；
   RadiationEmitter（建造辐射）→ 阶段 B；生物辐射/辐射消费 → 阶段 C。
 
+### 阶段 A 实测（2026-08-04 用户）
+
+- 02 多星：元素辐射（铀矿碎片建筑）✓、宇宙辐射 ✓、辐射计/叠层可观察；
+  **生物辐射（发光虫/冰息萝卜等发射）失败**——属 RadiationEmitter 组件缺失（阶段 B）；
+  研究性反应堆未测试。
+- 03 单星：零辐射 ✓（单星无辐射图层按钮，无法直接观察，门控生效）。
+- 阶段 B = RadiationEmitter 组件（建筑辐射与生物辐射共用）；用户澄清"建造辐射"= 建筑辐射。
+- **辐射分类澄清（用户）**：建筑辐射与生物辐射同一类（RadiationEmitter，可控发射器）；
+  铀元素辐射另一类（铀材料建筑、天然铀矿、熔融铀等——元素辐射，阶段 A 的 25 格核原理）。
+- **辐射粒子系统（HEP/Radbolt）结论**：纯 C#（HighEnergyParticle GameObject）——生成
+  （Spawner 读 Grid.Radiation）、飞行/衰减消失/撞击砖块/生物全在 C#（Grid 只读 +
+  ScenePartitioner）；唯一 sim 交互 = 撞击后 SimMessages.AddRemoveSubstance 生成 Fallout
+  （走 ModifyCell，已实现）。**不属 simDLL 范围，阶段 B 不含粒子系统**。
+
 ### 太阳光根因修复（2026-08-04，用户实测：仅顶部行亮 / 真空阻隔光）
 
 **根因（NaN 毒化阳光列）**：
