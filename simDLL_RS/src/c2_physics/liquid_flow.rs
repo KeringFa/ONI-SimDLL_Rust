@@ -51,6 +51,15 @@ use crate::a_framework::game_data::{SpawnFXInfo, SubstanceChangeInfo};
 /// 从 cells（源缓冲）读元素/质量，写 updatedCells（目标缓冲）。
 /// 元素表为空（测试环境）时安全跳过。
 pub fn update_liquids(sim: &mut crate::a_framework::sim_data::SimData) {
+    update_liquid_loop(sim);
+    post_process_loop(sim);
+}
+
+/// UpdateLiquid 遍历循环（原版 11_msvcrt_ignored.c L42408-42435）。
+/// 2026-08-04 拆分：与 post_process_loop 分离，供 update_data 在两者之间插入
+/// 太空真空任务（原版 worldZones 特判位于 UpdateLiquid 之后、PostProcessCell 之前，
+/// L145466-145520）。
+pub(crate) fn update_liquid_loop(sim: &mut crate::a_framework::sim_data::SimData) {
     let width = sim.width as usize;
     let height = sim.height as usize;
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
@@ -71,13 +80,93 @@ pub fn update_liquids(sim: &mut crate::a_framework::sim_data::SimData) {
             }
         }
     }
-    // K2 修复：post_process_cell 挂入生产路径（原版 UpdateData L43023 对每个内部格无条件调
-    // PostProcessCell）。post_process_cell 内部按真空/气体/固体/液体四分支处理，
-    // 元素表缺失时安全返回，故此处对全部内部格无条件调用。
-    // 挤压位移 / 密度分层 / 升华 accumulated_flow 累加由此在生产中真正执行。
+}
+
+/// PostProcessCell 遍历循环（原版 UpdateData L43023 对每个内部格无条件调
+/// PostProcessCell）。post_process_cell 内部按真空/气体/固体/液体四分支处理，
+/// 元素表缺失时安全返回，故此处对全部内部格无条件调用。
+/// 挤压位移 / 密度分层 / 升华 accumulated_flow 累加由此在生产中真正执行。
+pub(crate) fn post_process_loop(sim: &mut crate::a_framework::sim_data::SimData) {
+    let width = sim.width as usize;
+    let height = sim.height as usize;
+    if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
     for row in 1..height - 1 {
         for col in 1..width - 1 {
             post_process_cell(sim, row * width + col);
+        }
+    }
+}
+
+/// 太空真空特判（原版 UpdateData L145466-145520，split 11_msvcrt_ignored.c L42954-43020）。
+///
+/// 条件：worldZones[cell] == -1（0xFF，世界外部/太空格）且背墙为真空。
+/// 行为（读 updatedCells 元素 state，postProcessData.state & 3）：
+/// - 气体（state==1）：mass -= 1.0 × 0.02（每帧 0.02kg）
+/// - 液体（state==2）：mass -= 1000.0 × 0.02（每帧 20kg）
+/// - 固体/真空：跳过
+/// - mass 钳制 >= 0，写回 updatedCells；flow[cell] 重置 {-0.3, 0.3, 0.3, -0.3}
+///
+/// 2026-08-04 实现：此前缺失 → 太空暴露的液体/气体不被持续删除
+/// （用户实测：原版 Space exposure 持续删除至空，项目版不删）。
+pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimData) {
+    if sim.world_zones.ptr.is_null()
+        || sim.backwall.ptr.is_null()
+        || sim.updated_cells.ptr.is_null()
+        || sim.flow.ptr.is_null()
+    {
+        return;
+    }
+    let width = sim.width as usize;
+    let height = sim.height as usize;
+    if width < 3 || height < 3 {
+        return;
+    }
+    let total = width * height;
+    let world_zones = unsafe { std::slice::from_raw_parts(sim.world_zones.ptr, total) };
+    let backwall = unsafe { &*sim.backwall.ptr };
+    let vacuum = sim.vacuum_element_idx;
+    unsafe {
+        let updated = &mut *sim.updated_cells.ptr;
+        let flow = std::slice::from_raw_parts_mut(sim.flow.ptr, total);
+        for row in 1..height - 1 {
+            for col in 1..width - 1 {
+                let cell = row * width + col;
+                // 原版 L42962：worldZones[cell] == -1（0xFF）
+                if world_zones[cell] != 0xFF {
+                    continue;
+                }
+                // 原版 L42967-42970：背墙元素 == vacuum
+                if backwall.element_idx.get(cell) != vacuum {
+                    continue;
+                }
+                // 原版 L42979-42987：读 updatedCells 元素 state & 3
+                let elem = updated.element_idx.get(cell);
+                let state = match elements_table::get_element_post_process_data(elem) {
+                    Some(ppd) => ppd.state & 3,
+                    None => continue,
+                };
+                // 原版 L42989-42995：气体 1.0 / 液体 1000.0 / 固体跳过
+                let rate = match state {
+                    1 => 1.0,
+                    2 => 1000.0,
+                    _ => continue,
+                };
+                // 原版 L43000-43004：mass -= rate×0.02，钳制 >= 0
+                let mut m = updated.mass.get(cell) - rate * 0.02;
+                if m <= 0.0 {
+                    m = 0.0;
+                }
+                updated.mass.set(cell, m);
+                // 原版 L43005-43008：flow 重置 {-0.3, 0.3, 0.3, -0.3}
+                flow[cell] = crate::a_framework::vector_math::Vector4f {
+                    x: -0.3,
+                    y: 0.3,
+                    z: 0.3,
+                    w: -0.3,
+                };
+            }
         }
     }
 }
@@ -2447,6 +2536,7 @@ mod tests {
     use super::*;
     use crate::a_framework::buffer::{BinaryBufferReader, BinaryBufferWriter};
     use crate::a_framework::sim_data::SimData;
+    use crate::a_framework::stl_shim::UniquePtr;
     use crate::b_elements::element::Element;
     use crate::b_elements::elements_table::{CreateElementsTable, DestroyElementsTable};
     use crate::LIB_TESTS_LOCK;
@@ -2518,6 +2608,95 @@ mod tests {
             cells.element_idx.set(2, 0); // 气体
             cells.properties.set(2, 2); // 固体标志
             assert!(is_solid(cells, 2), "properties&2 置位时非固体元素也算固体");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 太空真空特判（2026-08-04 实现，原版 UpdateData L145466-145520）：
+    /// worldZones[cell]==0xFF（世界外部/太空）且背墙真空 →
+    /// 液体每帧减 1000×0.02=20kg、气体每帧减 1.0×0.02=0.02kg、固体跳过；
+    /// flow 重置 {-0.3, 0.3, 0.3, -0.3}。
+    #[test]
+    fn run_space_vacuum_task_removes_liquid_gas_skips_solid() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        // 模拟 SetWorldZones 后：内部格 cell14/15/16 标记太空（0xFF）
+        let mut wz = vec![0u8; 30];
+        wz[14] = 0xFF;
+        wz[15] = 0xFF;
+        wz[16] = 0xFF;
+        sd.world_zones = UniquePtr { ptr: wz.leak().as_mut_ptr() };
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1); // 液体 state=2
+            updated.mass.set(14, 500.0);
+            updated.element_idx.set(15, 0); // 气体 state=1
+            updated.mass.set(15, 1.0);
+            updated.element_idx.set(16, 2); // 固体 state=3
+            updated.mass.set(16, 100.0);
+            // backwall 默认填 vacuum（new_for_allocate with_size(vacuum_element_idx)）
+        }
+
+        run_space_vacuum_task(&mut sd);
+
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(14) - 480.0).abs() < 1e-3,
+                "液体 500 应减 20 → 480，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.mass.get(15) - 0.98).abs() < 1e-3,
+                "气体 1.0 应减 0.02 → 0.98，got {}",
+                updated.mass.get(15)
+            );
+            assert!(
+                (updated.mass.get(16) - 100.0).abs() < 1e-3,
+                "固体不应被删除"
+            );
+            // flow 重置 ±0.3
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 30);
+            assert_eq!(flow[14].x, -0.3);
+            assert_eq!(flow[14].y, 0.3);
+            assert_eq!(flow[14].z, 0.3);
+            assert_eq!(flow[14].w, -0.3);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 太空真空特判的门控：非太空格（worldZones != 0xFF）与背墙非真空格不删除。
+    #[test]
+    fn run_space_vacuum_task_gates_on_world_zone_and_backwall() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let mut wz = vec![0u8; 30];
+        // cell14 太空；cell15 非太空（0）；cell16 太空但背墙非真空
+        wz[14] = 0xFF;
+        wz[16] = 0xFF;
+        sd.world_zones = UniquePtr { ptr: wz.leak().as_mut_ptr() };
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(14, 1); // 液体，背墙真空 + 太空 → 应删除
+            updated.mass.set(14, 200.0);
+            updated.element_idx.set(15, 1); // 液体，非太空 → 不应删除
+            updated.mass.set(15, 200.0);
+            // cell16 太空但背墙非真空 → 不应删除
+            updated.element_idx.set(16, 1);
+            updated.mass.set(16, 200.0);
+            let bw = &mut *sd.backwall.ptr;
+            bw.element_idx.set(16, 5); // 非真空背墙
+        }
+
+        run_space_vacuum_task(&mut sd);
+
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(14) - 180.0).abs() < 1e-3, "太空+背墙真空应删除");
+            assert!((updated.mass.get(15) - 200.0).abs() < 1e-3, "非太空格不应删除");
+            assert!((updated.mass.get(16) - 200.0).abs() < 1e-3, "背墙非真空不应删除");
         }
         DestroyElementsTable();
     }

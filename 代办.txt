@@ -449,3 +449,34 @@
 
 **待实测**：部署 DLL → ① 加载/保存存档不回归；② 世界区域（SetWorldZones）若 C# 发送
 消息则 world_zones 开始填充；③ 液体/温度/液滴行为不回归（timers 初始 0x1F 激活写入路径）。
+
+---
+
+## [已完成] 太空真空删除（Space exposure）实现（2026-08-04）
+
+**现象**：用户实测——原版太空暴露（STATUS: Space exposure）的液体/气体持续删除直至为空，
+项目版不删除。
+
+**根因链**（日志证实）：
+1. C# 确实发送 SetWorldZones 消息（id=-457308393，size=225040 = 1160×194，日志
+   `SIM_HandleMessage entry id=-457308393` 出现；bd74b5a 实现 handler 后 world_zones
+   已被分配填充）；
+2. 但 PostProcessCell/UpdateData 侧**缺 worldZones==-1 特判分支**——原版 UpdateData
+   L145466-145520（split 11_msvcrt_ignored.c L42954-43020）对世界外部格
+   （worldZones==-1 即 0xFF）且背墙真空时持续删除液体/气体。
+
+**已实现**（严格对照原版 L145466-145520）：
+- `liquid_flow.rs::run_space_vacuum_task`：worldZones[cell]==0xFF + 背墙真空 →
+  气体（state&3==1）每帧减 1.0×0.02=0.02kg、液体（state&3==2）每帧减
+  1000×0.02=20kg、固体/真空跳过；mass 钳制>=0 写回 updatedCells；
+  flow[cell] 重置 {-0.3, 0.3, 0.3, -0.3}。
+- `update_liquids` 拆分为 `update_liquid_loop` + `post_process_loop`，
+  update_data 顺序改为：压力 → UpdateLiquid → **run_space_vacuum_task** →
+  PostProcessCell → ElementConsumer → 组件（原版 worldZones 特判位于
+  UpdateLiquid 之后、PostProcessCell 之前）。
+- 回归测试 2 条（液体/气体删除+固体跳过+flow 重置；worldZones/背墙门控）。
+- handle_set_world_zones 加 allocated 成功日志（确认 C# 发送 + 分配）。
+
+**验证**：全量 432 测试串行全过（430+2），Release 构建成功。
+**待实测**：部署 DLL → 太空暴露的液体/气体应持续减少直至清空；非太空格、
+背墙非真空格不删除；原版存档加载正常。

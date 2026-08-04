@@ -30,8 +30,14 @@ pub fn update_data(sim_data: &mut SimData) {
     // 置于 update_liquids 之前——此前液体→压力顺序与原版相反，同帧内先后不同）
     run_pressure_task(sim_data);
 
-    // C2 阶段实现：液体流动（UpdateLiquid + PostProcessCell；原版 L42408+）
-    crate::c2_physics::liquid_flow::update_liquids(sim_data);
+    // C2 阶段实现：液体流动（原版 L42408+）
+    crate::c2_physics::liquid_flow::update_liquid_loop(sim_data);
+    // 太空真空特判（原版 L145466-145520：worldZones==-1 且背墙真空 → 液体/气体
+    // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
+    // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
+    crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data);
+    // PostProcessCell（原版 L43023：挤压/密度分层/升华）
+    crate::c2_physics::liquid_flow::post_process_loop(sim_data);
     // ElementConsumer 逐帧消费（2026-08-02：水泵/涡轮取水；原版 UpdateData 调组件 Update）
     crate::c_simulation::frame_processor::process_element_consumers(sim_data);
 

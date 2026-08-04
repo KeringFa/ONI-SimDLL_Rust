@@ -1246,6 +1246,15 @@ pub fn handle_set_world_zones(reader: &mut BinaryBufferReader) -> *mut c_void {
         }
     }
     sim_data.world_zones = UniquePtr { ptr: zones.leak().as_mut_ptr() };
+    // 2026-08-04：成功日志供实测确认 C# 是否发送 SetWorldZones
+    //（若从不发送，world_zones 保持 null，太空泄漏特判不激活，与之前一致）。
+    tracing::info!(
+        width,
+        height,
+        rows,
+        row_len,
+        "SetWorldZones: world_zones allocated"
+    );
     std::ptr::null_mut()
 }
 
