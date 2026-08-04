@@ -1472,6 +1472,48 @@ fn process_element_chunk_messages(frame: &mut SimFrameInfo, sim_data: &mut SimDa
         }
         frame.element_chunk_messages.removes.clear_keep_capacity();
     }
+    // modifyBackwallData（16B）：{gameCell(i32), elemIdx(u16)+pad(u16), mass(f32), temperature(f32)}
+    // 原版 ProcessElementChunkMessages 尾部 L871-914：
+    //   uVar20 = (gc/(width-2)+1)*width + gc%(width-2) + 1（game→sim 内部格）
+    //   写 backwall.elementIdx/mass/temperature；元素变化推 BackwallElementChangedInfo(gameCell)。
+    // 2026-08-04 实现：此前 C2 桩只清空 → C# 设置的背墙（含太空格真空背墙）从未生效，
+    // 太空删除判定 backwall.elementIdx==vacuum 恒失败。
+    {
+        let bytes = frame.modify_backwall_data_messages.as_slice();
+        let n = bytes.len() / 16;
+        let game_w = sim_data.width - 2;
+        if n > 0
+            && game_w > 0
+            && !sim_data.backwall.ptr.is_null()
+            && !sim_data.sim_events.ptr.is_null()
+        {
+            let width = sim_data.width as usize;
+            let backwall = unsafe { &mut *sim_data.backwall.ptr };
+            let events = unsafe { &mut *sim_data.sim_events.ptr };
+            for i in 0..n {
+                let off = i * 16;
+                let game_cell = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                let elem_idx = u16::from_le_bytes(bytes[off + 4..off + 6].try_into().unwrap());
+                let mass = f32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+                let temp = f32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap());
+                // 原版 L879：sim_cell = (gc/gw+1)*width + gc%gw + 1
+                let sim_cell =
+                    ((game_cell / game_w + 1) * (width as i32) + game_cell % game_w + 1) as usize;
+                let old = backwall.element_idx.get(sim_cell);
+                backwall.element_idx.set(sim_cell, elem_idx);
+                backwall.mass.set(sim_cell, mass);
+                backwall.temperature.set(sim_cell, temp);
+                if old != elem_idx {
+                    events.backwall_element_changed_info.push(
+                        crate::a_framework::game_data::BackwallElementChangedInfo {
+                            game_cell: game_cell as u32,
+                        },
+                    );
+                }
+            }
+        }
+        frame.modify_backwall_data_messages.clear_keep_capacity();
+    }
 }
 
 /// ElementEmitter 消息：adds(16B)→modifies(32B)→removes(8B) + componentStateChanged 回调
@@ -1878,6 +1920,43 @@ mod tests {
         assert_eq!(sd.debug_properties.building_temperature_scale, 100.0);
         assert_eq!(sd.debug_properties.building_to_building_temperature_scale, 100.0);
         assert!(sd.debug_properties.is_debug_editing);
+    }
+
+    /// 2026-08-04 实现：ModifyBackwallData（16B）从 C2 桩改为真实处理
+    /// （原版 ProcessElementChunkMessages 尾部 L871-914）——C# 用它设置背墙
+    /// （含太空格真空背墙），此前丢弃 → 太空删除判定恒失败。
+    #[test]
+    fn process_element_chunk_processes_modify_backwall_data() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+        // 16B：gameCell=0, elemIdx=5, pad=0, mass=1.5, temperature=300
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0i32.to_le_bytes());
+        msg.extend_from_slice(&5u16.to_le_bytes());
+        msg.extend_from_slice(&0u16.to_le_bytes());
+        msg.extend_from_slice(&1.5f32.to_le_bytes());
+        msg.extend_from_slice(&300.0f32.to_le_bytes());
+        for b in msg {
+            frame.modify_backwall_data_messages.push(b);
+        }
+
+        process_element_chunk_messages(&mut frame, &mut sd);
+
+        unsafe {
+            let bw = &*sd.backwall.ptr;
+            // game_cell=0 → sim 内部格 (0/(6-2)+1)*6 + 0%4 + 1 = 7
+            assert_eq!(bw.element_idx.get(7), 5, "backwall element_idx 应更新");
+            assert!((bw.mass.get(7) - 1.5).abs() < 1e-6, "backwall mass 应更新");
+            assert!((bw.temperature.get(7) - 300.0).abs() < 1e-6, "backwall temp 应更新");
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(
+                events.backwall_element_changed_info.len(),
+                1,
+                "元素变化应推 BackwallElementChangedInfo"
+            );
+            assert_eq!(events.backwall_element_changed_info.as_slice()[0].game_cell, 0);
+        }
     }
 
     #[test]

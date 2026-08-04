@@ -509,9 +509,11 @@ impl SimFrameManager {
                 emplace_bytes(&mut frame.element_chunk_messages.removes, reader, 8)
             }
 
-            // ModifyBackwallData → modify_backwall_data_messages（C2 桩，12B）
+            // ModifyBackwallData → modify_backwall_data_messages（16B：
+            // gameCell(i32) + elemIdx(u16)+pad(u16) + mass(f32) + temperature(f32)）
+            // 2026-08-04 修正：此前 12B 尺寸错误（原版步进 4×i32，06_process_messages.c L871-914）。
             MSG_MODIFY_BACKWALL_DATA => {
-                emplace_bytes(&mut frame.modify_backwall_data_messages, reader, 12)
+                emplace_bytes(&mut frame.modify_backwall_data_messages, reader, 16)
             }
 
             // AddBuildingHeatExchange (0x67A75D28) -> adds, 44B
