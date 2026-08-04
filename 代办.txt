@@ -389,3 +389,39 @@
   Release 构建成功。
 - **待实测**：部署 DLL → ① 液体水平/向下扩散与合并不回归；② 大片水域铺开行为
   与原版一致（压力循环顺序/门控变化后重点回归）；③ 过压破坏与满格过压不回归。
+
+---
+
+## [已完成] a_framework 底层全量对照审查（2026-08-04）
+
+**背景**：用户确认 a_framework 布局/存档/FFI/纹理公式涉及底层，需重点关注；
+本轮把 review-full 未覆盖的 A 类底层全部过一遍。
+
+**计划**：docs/superpowers/plans/2026-08-04-a-framework-layout-review.md
+**报告**：.superpowers/sdd/review-a-framework-layout.md
+
+### 结论：无 Critical / Important，6 项 Minor（行为均等价）
+
+**布局零差异**（逐字段核对 + 断言）：
+- GameData 1024B（4×i32 + 29×MsvcVector 32B + 10×UniquePtr 8B）；
+- SimData 0x890（2192B，含 CellSOA 352B / BackwallSOA 104B / 8 组件壳
+  312/208/176B）；
+- GDU 496B（1×i32 + 12 指针 + 29 对 num+ptr + 6 指针，C# Pack=4）；
+- SimEvents 640B（20×MsvcVector）；MsvcVector 32B（含 _Container_proxy）正确；
+- 存档格式（SIMSAVE magic/version/header/cell 序列化/hash 替换/NaN 修复）一致；
+- FFI 9 导出签名（SIM_Initialize/Shutdown/HandleMessage/HandleMessages/BeginSave/
+  EndSave/DebugCrash + SYSINFO_Acquire/Release）与 01_sim_api.c 一致；
+- 纹理三函数（flow/exposed/liquid）与原版 05_liquid_flow.c 逐段一致。
+
+### Minor 6 项（写入维护清单，行为等价）
+
+1. GameData.flow 未分配（原版 16B/格；C# 不消费该字段——PropertyTextures 读的是
+   propertyTextureFlow Vector2f，已核对）。
+2. copy_sim_data_to_game 无 flow 拷贝（原版 copyFlowTasks；game.flow 恒 null）。
+3. SimData.world_zones 未分配（世界区域逻辑已知简化）。
+4. SimData.timers 未分配（稳定格计数语义未用；liquid_flow 有 null 守卫）。
+5. **MsvcString 32B vs 原版 basic_string 40B**（缺 _Container_proxy 8B）——
+   仅内部病菌名容器（C# 不读）；**日后实现病菌表 CreateDiseaseTable 前必须先改 40B**。
+6. powf 衰减参数 1.0 占位（原版 05_liquid_flow.c L397 反编译丢失，不可恢复）。
+
+**验证**：审查基于既有 426 测试（本轮无代码改动）；Release 构建不受影响。
