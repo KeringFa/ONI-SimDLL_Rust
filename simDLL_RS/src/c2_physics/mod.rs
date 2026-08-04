@@ -10,6 +10,7 @@ use crate::a_framework::sim_data::SimData;
 pub mod liquid_flow;
 pub mod property_texture;
 pub mod temperature;
+pub mod gas_flow;
 
 /// SimBase::UpdateData 的桩实现。
 ///
@@ -17,6 +18,10 @@ pub mod temperature;
 /// 原版调用 UpdateTemperature/UpdatePressure/UpdateLiquid 等物理更新。
 /// C1 桩：不执行任何物理计算，cell 状态保持不变。
 pub fn update_data(sim_data: &mut SimData) {
+    // 原版 UpdateData L144415：iterateDirection 每子步翻转（气体/液体压力扫描方向
+    // 交替 → 圆形振荡扩散）。
+    sim_data.iterate_direction = -sim_data.iterate_direction;
+
     // 2026-08-04 D1 探针（临时）：首帧统计整网格 vs 活动区域覆盖格数，
     // 量化"只算已发现世界矩形"的裁剪收益。
     static UPDATE_DATA_REGION_DIAG: std::sync::atomic::AtomicBool =
@@ -215,9 +220,16 @@ pub fn update_data(sim_data: &mut SimData) {
                 queue.wait_all();
             }
         } else {
-            crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+        crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
         }
         // 原版 L144548：温度后 CopyFrom，供后续压力/液体阶段读取新温度
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+
+        // 气体流动（原版 L144590-144950，温度任务与液体压力之间）：
+        // 1) 同元素气体/真空压力均衡（iterateDirection 扫描）；2) 异元素气体置换。
+        crate::c2_physics::gas_flow::run_gas_pressure_task(sim_data, bounds);
+        crate::c2_physics::gas_flow::run_gas_displacement_task(sim_data, bounds);
+        // 原版气体阶段后 CopyFrom（L144950），液体压力读更新后的 cells
         crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
 
         // 压力循环（原版顺序：温度任务 → CopyFrom → **压力循环** L42030-42320 →

@@ -778,7 +778,12 @@ pub(crate) fn add_mass_and_update_temperature(
 /// Disease::AddDiseaseToCell（原版 11_msvcrt_ignored.c L26163-26263）简化版。
 /// 病菌转移：同病菌累加 count；不同病菌替换（原版还有基于疾病强度的混合，
 /// 依赖 gDisease 全局疾病表，Rust 侧暂无此表，此处简化为直接替换）。
-fn add_disease_to_cell(cells: &mut CellSOA, cell: usize, disease_idx: u8, disease_count: i32) {
+pub(crate) fn add_disease_to_cell(
+    cells: &mut CellSOA,
+    cell: usize,
+    disease_idx: u8,
+    disease_count: i32,
+) {
     let cur_idx = cells.disease_idx.get(cell);
     let cur_count = cells.disease_count.get(cell);
     let (new_idx, new_count) = if cur_idx == disease_idx {
@@ -985,23 +990,24 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
         None => return 0.0,
     };
     let mut bvar12 = neighbor_pd.state & 3;
-    // 2026-08-03 修复：异元素非真空目标禁止压力质量转移。
-    // 原版压力只在同元素格或真空目标间转移（UpdateData 门控 L144628-144655）；
-    // 液体格向异元素气体/液体转移时接收格元素不变，源格质量被"吸收"成目标元素
-    // —— 实测 500kg 污染水 + 上方 0.5kg 污染氧 → 每子步 ~60kg 水变成污染氧，
-    // 直至 250/250 质量均衡（用户观察到的"一次性分出自身一半质量"）。
-    if bvar12 != 0 && neighbor_elem != cell_elem {
-        return 0.0;
-    }
-    // —— 质量（原版 L1469-1474：fVar15 = mass[cell]，fVar19 = mass[neighbor]）——
-    let mass_cell = cells.mass.get(cell);
-    let mass_neighbor = cells.mass.get(neighbor);
-    // —— 压力系数（原版 L1475-1477：param_7 != 1 时用 param_9 邻格元素 pressure_data.flow）——
     let cell_pd = match elements_table::get_element_pressure_data(cell_elem) {
         Some(p) => p,
         None => return 0.0,
     };
     let cell_state = cell_pd.state & 3; // 原版 param_7
+    // 2026-08-03 修复：**液体**源格禁止向异元素非真空目标转移。
+    // 原版压力只在同元素格或真空目标间转移（UpdateData 门控 L144628-144655）；
+    // 液体格向异元素气体/液体转移时接收格元素不变，源格质量被"吸收"成目标元素
+    // —— 实测 500kg 污染水 + 上方 0.5kg 污染氧 → 每子步 ~60kg 水变成污染氧，
+    // 直至 250/250 质量均衡（用户观察到的"一次性分出自身一半质量"）。
+    // 2026-08-04（气体模块）：真空(0)/气体(1)源格**允许**异元素 —— 气体↔真空压差
+    // 由真空源格驱动（气体扩散入真空），原版 UpdatePressure 对 state<2 源格不门控。
+    if cell_state == 2 && bvar12 != 0 && neighbor_elem != cell_elem {
+        return 0.0;
+    }
+    // —— 质量（原版 L1469-1474：fVar15 = mass[cell]，fVar19 = mass[neighbor]）——
+    let mass_cell = cells.mass.get(cell);
+    let mass_neighbor = cells.mass.get(neighbor);
     // K1 修复（方案 A）：系数选择从"本格状态"判定改为"邻格状态"判定。
     // 原版 L1475-1477：param_7（驱动格状态）!= 1 时取 param_9（邻格）的 flow ——
     // 原版从真空/气体格驱动、液体为邻格，驱动格非气体时取**液体邻格**的 flow。
@@ -1472,7 +1478,7 @@ pub fn do_density_displacement(sim: &mut SimData, cell: usize, param_5: f32) -> 
 /// DoDisplacement（原版 11_msvcrt_ignored.c L34357-34419）—— 把源格**全部**内容
 /// 移到目标格：质量/温度/病菌整体累加、目标格元素改为源格元素、源格 ClearCell，
 /// 产生 2 条 substance 事件（源 + 目标）。DisplaceGas 与挤压链路共用。
-fn do_displacement(sim: &mut SimData, src: usize, dst: usize) {
+pub(crate) fn do_displacement(sim: &mut SimData, src: usize, dst: usize) {
     let updated = unsafe { &mut *sim.updated_cells.ptr };
     let (mass, temp, d_idx, d_count) = (
         updated.mass.get(src),

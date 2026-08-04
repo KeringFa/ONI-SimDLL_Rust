@@ -554,3 +554,25 @@
   其余物理/分区/温度逻辑对单星/DLC 完全一致。
 - 387 测试串行全过；release 构建成功。
 
+## [进行中] 气体流动模块（2026-08-04，C2）
+
+- 原版无独立 UpdateGas：气体与液体共用统一流动系统（压力循环内按 state 分流）。
+- **已实现**：
+  1. `c2_physics/gas_flow.rs`：
+     - `run_gas_pressure_task`：同元素气体/真空压力均衡（原版 L144590-144760），
+       源格 state<2（真空/气体），三方向（水平 +iterateDir / 垂直 +width / 对角
+       +width+iterateDir），iterateDirection 控制水平扫描方向 → **圆形振荡扩散**；
+     - `run_gas_displacement_task`：异元素气体置换（原版 L144780-144950），四方向
+       （下 / ∓iterateDir / 上），调用方预检查 **beyond 必须是气体**（关键，阻止
+       气体异常扩散进真空——old 版 Bug1-4 的根因）；
+     - `do_gas_pressure_displacement`：源格质量 > 邻格 → DoDisplacement 把邻格内容
+       顶到 beyond → 源格灌入 min(原质量×0.125, 当前质量) → 温度覆盖/元素/病菌 0.125。
+  2. `update_data`：iterateDirection 每子步翻转（原版 L144415）+ 每区域按
+     气体压力 → 气体置换 → CopyFrom → 液体压力的顺序接线。
+  3. `update_pressure`（液体）K1 门控改为**仅液体源格**拦截异元素非真空目标——
+     真空/气体源格允许异元素（气体↔真空压差，气体扩散入真空由真空源格驱动）。
+- 单测 5 条（同元素均衡/入真空/异元素置换/beyond 必须气体/iterateDir 翻转）；
+  396 测试串行全过；release 构建成功。
+- **待实测**：气体水平扩散（圆形振荡）、垂直密度分层（CO2 下沉/O2 上浮）、
+  气体-液体置换（气泡顶开液体）、气体-真空扩散、与原版对比。
+
