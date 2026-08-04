@@ -254,13 +254,13 @@ impl RadiationEmitterRegistry {
         rec.emit_radius_y = msg.emit_radius_y.max(0) as u16;
         rec.emit_rads = msg.emit_rads;
         rec.emit_rate = msg.emit_rate;
-        rec.emit_speed = msg.emit_speed;
+        // 原版 Modify（L39168-39220）：emitSpeed = min(emitSpeed, emitRate)；
+        // 且不重置 emitTimer/emitStep/emitStepTimer（OnSimDeactivate 全零 Modify 后
+        // 重新激活时计时状态延续，与 Update 内 gating 语义一致）。
+        rec.emit_speed = msg.emit_speed.min(msg.emit_rate);
         rec.emit_direction = msg.emit_direction;
         rec.emit_angle = msg.emit_angle;
         rec.emit_type = msg.emit_type;
-        rec.emit_timer = 0.0;
-        rec.emit_step_timer = 0.0;
-        rec.emit_step = 0;
         true
     }
 
@@ -545,41 +545,60 @@ pub fn update_radiation_emitters(
         if !in_bounds || !active {
             continue;
         }
-        let emit = {
-            let rec = reg.record_mut(handle).unwrap();
-            rec.emit_timer += dt;
-            if rec.emit_rate == 0.0 {
-                true
-            } else {
-                rec.emit_timer >= rec.emit_rate
-            }
-        };
-        if !emit {
-            continue;
-        }
+        // 时序（原版 Update L39693-39881 反编译语义）：
+        // 1) emitTimer += dt；rate_ok = rate==0 || timer>=rate；
+        //    timer<=speed 恒可发（rate_ok 时重置 timer/step）；
+        //    timer>speed 且 !rate_ok → skip；timer>speed 且 rate_ok → 重置后发。
+        // 2) 发射次数 n = (int)(dt / step_time)，step_time = emitSpeed / max_r；
+        //    rate==0 恒 n=1；n<=1 且 step_time <= emitStepTimer（小数累加器）
+        //    → 补发 1 次；否则 n<1 不发（等累加器攒够一个 step_time）。
+        // 3) 每次发射 emitStep = (emitStep+1) % max_r，emitStepTimer -= step_time；
+        //    帧末 emitStepTimer += dt。
         let rec = reg.record_mut(handle).unwrap();
-        let max_r = rec.emit_radius_x.max(rec.emit_radius_y).max(1) as f32;
-        let step_time = rec.emit_speed / max_r;
-        let n = if rec.emit_rate == 0.0 || step_time <= 0.0 {
-            1
+        rec.emit_timer += dt;
+        let rate_ok = rec.emit_rate == 0.0 || rec.emit_timer >= rec.emit_rate;
+        if rec.emit_timer <= rec.emit_speed {
+            if rate_ok {
+                rec.emit_timer = 0.0;
+                rec.emit_step = 0;
+            }
         } else {
-            ((dt / step_time).ceil() as i32).max(1)
-        };
-        for _ in 0..n {
-            let rec = reg.record_mut(handle).unwrap();
-            match rec.emit_type {
-                0 => tick_constant(sim, bounds, rec, dt),
-                1 | 2 => tick_pulsing(sim, bounds, rec, dt),
-                _ => {} // SimplePulse/RadialBeams/Attractor：阶段 B 范围外，跳过
+            if !rate_ok {
+                continue;
             }
-            let rec = reg.record_mut(handle).unwrap();
-            rec.emit_step += 1;
-        }
-        let rec = reg.record_mut(handle).unwrap();
-        if rec.emit_timer > rec.emit_speed {
             rec.emit_timer = 0.0;
             rec.emit_step = 0;
         }
+        let rec = reg.record_mut(handle).unwrap();
+        let max_r = rec.emit_radius_x.max(rec.emit_radius_y) as f32;
+        if max_r <= 0.0 {
+            continue;
+        }
+        let step_time = rec.emit_speed / max_r;
+        let mut n = if step_time <= 0.0 {
+            1.0
+        } else {
+            dt / step_time
+        };
+        if rec.emit_rate == 0.0 || (n <= 1.0 && step_time <= rec.emit_step_timer) {
+            n = 1.0;
+        }
+        let count = n as i32;
+        if count > 0 {
+            for _ in 0..count {
+                let rec = reg.record_mut(handle).unwrap();
+                match rec.emit_type {
+                    0 => tick_constant(sim, bounds, rec, dt),
+                    1 | 2 => tick_pulsing(sim, bounds, rec, dt),
+                    _ => {} // SimplePulse/RadialBeams/Attractor：阶段 B 范围外，跳过
+                }
+                let rec = reg.record_mut(handle).unwrap();
+                rec.emit_step = (rec.emit_step + 1) % max_r as i32;
+                rec.emit_step_timer -= step_time;
+            }
+        }
+        let rec = reg.record_mut(handle).unwrap();
+        rec.emit_step_timer += dt;
     }
 }
 
@@ -692,7 +711,8 @@ mod tests {
     }
 
     /// 任务 3：Pulsing——step 0 中心 +emitRads；step 1 环（radius×2/2=2）内每格
-    /// +emitRads/linger（线吸收 1.0）；emitStep 随 tick 递增。
+    /// +emitRads/linger（线吸收 1.0）；dt=0.5=step_time(1/2)，每次更新发射 1 次；
+    /// rate=1 边界（timer>=1s）重置 emitStep。
     #[test]
     fn emitter_pulsing_expands_ring() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
@@ -711,15 +731,15 @@ mod tests {
         w.write_short(2);
         w.write_short(2);
         w.write_float(110.0);
-        w.write_float(0.0);
-        w.write_float(10.0); // speed=10 → 测试期间不重置 emitStep
+        w.write_float(1.0);  // rate=1：step 随 1s 边界重置
+        w.write_float(1.0);  // speed=1
         w.write_float(0.0);
         w.write_float(360.0);
         w.write_int(1); // Pulsing
         let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
         reg.register(&mut sd, &msg);
         let bounds = crate::d1_activity::full_grid_bounds(&sd);
-        // 更新 1：step 0 → 中心 +110
+        // 更新 1（dt=0.5=step_time）：step 0 → 中心 +110
         update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
         unsafe {
             assert!(
@@ -727,8 +747,61 @@ mod tests {
                 "step0 中心 +110"
             );
         }
-        // 更新 2：step 1 → 环（rx=ry=2）内每格 +110/1.1=100
+        // 更新 2（dt=0.5）：timer=1.0=rate → 重置 emitStep=0 → step 0 再次 +110
         update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.radiation.get(12) - 220.0).abs() < 1e-3,
+                "rate 重置后中心 110+110=220，got {}",
+                u.radiation.get(12)
+            );
+        }
+        // 更新 3（dt=0.5）：step 1 → 环（rx=ry=2）内每格 +110/1.1=100
+        update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.radiation.get(12) - 320.0).abs() < 1e-3,
+                "中心 220+100=320，got {}",
+                u.radiation.get(12)
+            );
+            assert!((u.radiation.get(13) - 100.0).abs() < 1e-3, "环内右邻 +100");
+            assert!((u.radiation.get(20) - 100.0).abs() < 1e-3, "环内上方 +100");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 3c：Pulsing 多步发射 + emitStep 在 max_r 后回环。
+    #[test]
+    fn emitter_pulsing_multistep_wraps_step() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(10.0); // rate=10：测试期间不重置
+        w.write_float(1.0);  // speed=1
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(1); // Pulsing
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        let h = reg.register(&mut sd, &msg);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        // dt=1.0 → n=(int)(1.0/0.5)=2：step 0 → 中心 +110，step 1 → 环 +100，
+        // emitStep 2 → max_r=2 → 环绕 0。
+        update_radiation_emitters(&mut sd, &mut reg, 1.0, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
             assert!(
@@ -737,7 +810,60 @@ mod tests {
                 u.radiation.get(12)
             );
             assert!((u.radiation.get(13) - 100.0).abs() < 1e-3, "环内右邻 +100");
-            assert!((u.radiation.get(20) - 100.0).abs() < 1e-3, "环内上方 +100");
+        }
+        let rec = reg.record(h).unwrap();
+        assert_eq!(rec.emit_step, 0, "emitStep 在 max_r=2 后回环");
+        DestroyElementsTable();
+    }
+
+    /// 任务 3d：stepTimer 小数累加器定时——dt<step_time 时不发射，
+    /// 累加够一个 step_time 后补发 1 次（每帧 0~1 次）。
+    #[test]
+    fn emitter_constant_ticks_paced_by_step_timer() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(1.0); // rate=1
+        w.write_float(1.0); // speed=1 → step_time = 1/2 = 0.5
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(0); // Constant
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        reg.register(&mut sd, &msg);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        // dt=0.2 < step_time=0.5：前 3 帧不发（stepTimer 0.2/0.4/0.6），
+        // 第 4 帧 stepTimer=0.6 ≥ 0.5 → 补发 1 次 → 中心 +100。
+        for _ in 0..3 {
+            update_radiation_emitters(&mut sd, &mut reg, 0.2, bounds);
+        }
+        unsafe {
+            assert_eq!(
+                (*sd.updated_cells.ptr).radiation.get(12),
+                0.0,
+                "stepTimer 未攒够 step_time 前不发射"
+            );
+        }
+        update_radiation_emitters(&mut sd, &mut reg, 0.2, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.radiation.get(12) - 100.0).abs() < 1e-3,
+                "stepTimer 攒够后补发 1 次 = 100，got {}",
+                u.radiation.get(12)
+            );
         }
         DestroyElementsTable();
     }
@@ -902,6 +1028,9 @@ mod tests {
         let mmsg = ModifyRadiationEmitterMsg::from_bytes(&bytes2).unwrap();
         assert!(reg.modify(&sd, &mmsg));
         assert_eq!(reg.record(h).unwrap().emit_radius_x, 5);
+        // 原版 Modify：emitSpeed = min(emitSpeed, emitRate)（rate=0 → 有效 speed=0），
+        // 且不重置 emitTimer/emitStep/emitStepTimer。
+        assert_eq!(reg.record(h).unwrap().emit_speed, 0.0, "speed 钳制 min(speed,rate)");
         // Remove（延迟两轮）→ 记录失效 + 回调推 -1
         reg.remove(h, 9);
         reg.release_queued_handles(&mut sd);
