@@ -24,7 +24,7 @@ L39374/39168/39693/40172/40263 + inRadialRange(L40033)/RadiationAbsorptionAlongL
 - 创建：`src/c_simulation/radiation_emitter.rs`（RadiationEmitterData + Registry）
 - 测试：`src/c_simulation/radiation_emitter.rs` tests
 
-- [ ] **步骤 1：写失败测试**（消息尺寸 + 注册/修改/释放 + 句柄版本）
+- [x] **步骤 1：写失败测试**（消息尺寸 + 注册/修改/释放 + 句柄版本）
 
 ```rust
 #[test]
@@ -59,8 +59,8 @@ fn radiation_emitter_register_modify_remove_and_handle_versions() {
 }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**（模块/函数未定义）
-- [ ] **步骤 3：实现**
+- [x] **步骤 2：运行测试确认失败**（模块/函数未定义）
+- [x] **步骤 3：实现**
   - frame_manager：`MSG_ADD_RADIATION_EMITTER` → emplace 36B；`MSG_MODIFY_RADIATION_EMITTER`
     → 40B；`MSG_REMOVE_RADIATION_EMITTER` → 8B（参照 building_heat_exchange 的 ComponentMessages
     入帧模式）。
@@ -72,14 +72,14 @@ fn radiation_emitter_register_modify_remove_and_handle_versions() {
       `(gc%gameW+1) + (gc/gameW+1)×simW`）→ 分配句柄 → callbackIdx≠-1 时回调推句柄；
       modify 40B 更新字段；remove 8B → 释放 + 回调推 -1；延迟释放两轮
       （Remove 入缓冲，`release_queued_handles` 两轮后 swap-remove）。
-- [ ] **步骤 4：运行测试确认通过**
-- [ ] **步骤 5：commit**（`feat(c2): radiation emitter registry - 44B records, version handles (task 1/4)`）
+- [x] **步骤 4：运行测试确认通过**
+- [x] **步骤 5：commit**（`feat(c2): radiation emitter registry - 44B records, version handles (task 1/4)`）
 
 ### 任务 2：Update 时序 + tickConstant + 辅助函数
 
 **文件：** 修改 `src/c_simulation/radiation_emitter.rs`
 
-- [ ] **步骤 1：写失败测试**（Constant 椭圆 falloff + 扇形 + 吸收沿直线 + 抖动）
+- [x] **步骤 1：写失败测试**（Constant 椭圆 falloff + 扇形 + 吸收沿直线 + 抖动）
 
 ```rust
 #[test]
@@ -101,8 +101,8 @@ fn radiation_emitter_constant_ticks_ellipse() {
 }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
-- [ ] **步骤 3：实现**
+- [x] **步骤 2：运行测试确认失败**
+- [x] **步骤 3：实现**
   - `update_radiation_emitters(sim, dt, bounds)`：门控 `radiationEnabled`；遍历区域内的
     发射器记录；`emitTimer += dt`；`emitRate==0` 恒发、否则 `emitTimer>=emitRate` 才发；
     `emitSpeed` 步进（超时重置 timer/step）；每 tick 步数 `n = dt/(emitSpeed/max(rx,ry))`
@@ -116,41 +116,41 @@ fn radiation_emitter_constant_ticks_ellipse() {
     `falloff = 1 − |dx|/rx − (|dy| − |dx·dy|/rx)/ry` →
     `radiation[cell] += line_absorption × (falloff × emitRads / lingerRate)`；
     `falloff < 0.25` 加 `random×(±12.5%)` 抖动（sim.random_seed）。
-- [ ] **步骤 4：运行测试确认通过**
-- [ ] **步骤 5：commit**（`feat(c2): radiation emitter constant tick + radial/line helpers (task 2/4)`）
+- [x] **步骤 4：运行测试确认通过**
+- [x] **步骤 5：commit**（`feat(c2): radiation emitter constant tick + radial/line helpers (task 2/4)`）
 
 ### 任务 3：tickPulsing + PulsingAveraged
 
 **文件：** 修改 `src/c_simulation/radiation_emitter.rs`
 
-- [ ] **步骤 1：写失败测试**（Pulsing 环扩散 + Averaged 均摊 + emitStep 递增）
-- [ ] **步骤 2：运行测试确认失败**
-- [ ] **步骤 3：实现 `tick_pulsing`（L40263）**
+- [x] **步骤 1：写失败测试**（Pulsing 环扩散 + Averaged 均摊 + emitStep 递增）
+- [x] **步骤 2：运行测试确认失败**
+- [x] **步骤 3：实现 `tick_pulsing`（L40263）**
   - 当前环半径 `w = max(1, round(rx × (emitStep+1)/max(rx,ry)))`、`h` 同理；
   - PulsingAveraged：`emitRads / ((w−1)×(h−1))` 均摊；
   - `emitStep == 0` → 中心格 `radiation += 均摊后 emitRads`；
   - 否则环内（椭圆）逐格 `radiation += line_absorption × (emitRads / lingerRate)`；
   - `emitStep++`（上限 max(rx,ry) 后重置）。
-- [ ] **步骤 4：运行测试确认通过**
-- [ ] **步骤 5：commit**（`feat(c2): radiation emitter pulsing + averaged (task 3/4)`）
+- [x] **步骤 4：运行测试确认通过**
+- [x] **步骤 5：commit**（`feat(c2): radiation emitter pulsing + averaged (task 3/4)`）
 
 ### 任务 4：接线（frame_processor + update_data）+ 门控 + 全量回归
 
 **文件：** 修改 `src/c_simulation/frame_processor.rs`、`src/c2_physics/mod.rs`、
 `src/c_simulation/radiation_emitter.rs`
 
-- [ ] **步骤 1：写失败测试**（门控：radiationEnabled=false 不更新；消息处理清空）
-- [ ] **步骤 2：运行测试确认失败**
-- [ ] **步骤 3：实现**
+- [x] **步骤 1：写失败测试**（门控：radiationEnabled=false 不更新；消息处理清空）
+- [x] **步骤 2：运行测试确认失败**
+- [x] **步骤 3：实现**
   - frame_processor：`process_radiation_emitter_messages`（真实实现）从
     `frame.radiation_emitter_messages` 处理 adds→modifies→removes（含延迟释放），
     从 `process_component_messages_stubs` 拆出；
   - update_data：`run_radiation_task` 之后调用
     `radiation_emitter::update_radiation_emitters(sim, 0.2, bounds)`；
   - `release_queued_handles_global`（延迟释放）挂到 sim_thread 每帧（与管道温度管理器一致）。
-- [ ] **步骤 4：运行测试确认通过**
-- [ ] **步骤 5：全量串行测试 + release 构建**
-- [ ] **步骤 6：commit**（`feat(c2): radiation emitter wiring + DLC gating + regression (task 4/4)`）
+- [x] **步骤 4：运行测试确认通过**
+- [x] **步骤 5：全量串行测试 + release 构建**
+- [x] **步骤 6：commit**（`feat(c2): radiation emitter wiring + DLC gating + regression (task 4/4)`）
 
 ---
 

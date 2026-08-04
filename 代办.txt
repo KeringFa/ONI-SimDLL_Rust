@@ -727,6 +727,24 @@ property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生�
     （Reactor.cs L182-184 meltdown.loop；正常态 L91 SetEmitting(false)），贴图/不可恢复
     为 C# 动画状态——阶段 B 覆盖，无新路径。
 
+## [进行中] 辐射模块·阶段 B（RadiationEmitter 组件，2026-08-04）
+
+- 规格：docs/superpowers/specs/2026-08-04-radiation-emitter-design.md
+- 计划：docs/superpowers/plans/2026-08-04-radiation-emitter.md
+- **已实现（内联执行，TDD，4 任务全提交）**：
+  1. 消息入帧（Add 36B / Modify 40B / Remove 8B）+ 44B 注册表 + 版本句柄 + 延迟释放
+    ——5363476；
+  2. Update 时序 + tickConstant（椭圆 falloff + inRadialRange 扇形 +
+    RadiationAbsorptionAlongLine 直线透射 + 低 falloff 抖动）+ 辅助函数——463c6c7；
+  3. tickPulsing（脉冲环扩散）+ PulsingAveraged（均摊）——73d739f；
+  4. 接线（frame_processor adds→modifies→removes、update_data 组件阶段、
+    sim_thread 延迟释放）+ radiationEnabled 门控——939094c。
+- 全量 464 测试串行全过（412 lib + 52 集成）；release 构建成功。
+- **待实测（DLC 存档 02）**：发光虫/冰息萝卜/蜜蜂辐射、蜂巢 Pulsing、人力粒子发生器、
+  核反应堆（含熔毁态持续发射）；单星零辐射不回归。
+- **后续**：SimplePulse/RadialBeams/Attractor（反应堆若为这些类型再补）；
+  辐射消费/生物辐射 C 阶段（CellRadiationModification 回调已就绪）。
+
 ### 太阳光根因修复（2026-08-04，用户实测：仅顶部行亮 / 真空阻隔光）
 
 **根因（NaN 毒化阳光列）**：
