@@ -127,6 +127,41 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
     let world_zones = unsafe { std::slice::from_raw_parts(sim.world_zones.ptr, total) };
     let backwall = unsafe { &*sim.backwall.ptr };
     let vacuum = sim.vacuum_element_idx;
+    // 2026-08-04 诊断：首次运行统计 world_zones 太空格/背墙真空/液体/气体分布，
+    // 用于定位太空删除不生效是数据问题还是条件问题（部署后看日志一次即可）。
+    static SPACE_VACUUM_DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SPACE_VACUUM_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let (mut n_ff, mut n_bw, mut n_liq, mut n_gas) = (0usize, 0usize, 0usize, 0usize);
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        for row in 1..height - 1 {
+            for col in 1..width - 1 {
+                let cell = row * width + col;
+                if world_zones[cell] != 0xFF {
+                    continue;
+                }
+                n_ff += 1;
+                if backwall.element_idx.get(cell) == vacuum {
+                    n_bw += 1;
+                }
+                match elements_table::get_element_post_process_data(updated.element_idx.get(cell)) {
+                    Some(ppd) => match ppd.state & 3 {
+                        1 => n_gas += 1,
+                        2 => n_liq += 1,
+                        _ => {}
+                    },
+                    None => {}
+                }
+            }
+        }
+        tracing::info!(
+            n_ff,
+            n_bw,
+            n_liq,
+            n_gas,
+            vacuum,
+            "space_vacuum: first-run diag"
+        );
+    }
     unsafe {
         let updated = &mut *sim.updated_cells.ptr;
         let flow = std::slice::from_raw_parts_mut(sim.flow.ptr, total);
