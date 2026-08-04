@@ -152,8 +152,12 @@ impl BackwallSOA {
 
     /// 构造具有 `n` 个元素的 BackwallSOA。
     /// element_idx 每个填 `fill`（原版默认 0xffff = 真空元素），mass/temperature 清零。
+    /// 2026-08-04 修复：原版 BackwallSOA::BackwallSOA(this, count, vacuumElementIdx)
+    /// 会把 vacuumElementIdx 存入首字段（11_msvcrt_ignored.c L21506-21507）；
+    /// 此前漏设 → vacuum_element_idx 恒 0（太空判定/背墙逻辑依赖该字段）。
     pub fn with_size(n: usize, fill: u16) -> Self {
         let mut s = BackwallSOA::new();
+        s.vacuum_element_idx = fill;
         s.element_idx.resize(n, fill);
         s.mass.resize(n, 0.0f32);
         s.temperature.resize(n, 0.0f32);

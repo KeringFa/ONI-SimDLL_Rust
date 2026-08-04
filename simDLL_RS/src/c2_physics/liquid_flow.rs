@@ -126,7 +126,10 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
     let total = width * height;
     let world_zones = unsafe { std::slice::from_raw_parts(sim.world_zones.ptr, total) };
     let backwall = unsafe { &*sim.backwall.ptr };
-    let vacuum = sim.vacuum_element_idx;
+    // 原版 L145470：backwall.elementIdx[cell] == backwall.vacuumElementIdx
+    //（backwall 首字段，BackwallSOA::BackwallSOA 构造时 = 传入的 vacuum 索引；
+    //  2026-08-04 修复 with_size 漏设该字段）
+    let vacuum = backwall.vacuum_element_idx;
     // 2026-08-04 诊断：首次运行统计 world_zones 太空格/背墙真空/液体/气体分布，
     // 用于定位太空删除不生效是数据问题还是条件问题（部署后看日志一次即可）。
     static SPACE_VACUUM_DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -165,6 +168,13 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
             vacuum,
             bw_vacuum_field = backwall.vacuum_element_idx,
             void_idx = sim.void_element_idx,
+            vac_hash = elements_table::get_element_by_idx(vacuum)
+                .map(|e| e.id)
+                .unwrap_or(-1),
+            void_hash = elements_table::get_element_by_idx(sim.void_element_idx)
+                .map(|e| e.id)
+                .unwrap_or(-1),
+            elem_count = elements_table::get_element_count_pub(),
             ?sample_backwall,
             "space_vacuum: first-run diag"
         );
