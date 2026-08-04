@@ -345,9 +345,6 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         let backwall_ptr = sim_data.backwall.ptr;
         if !backwall_ptr.is_null() {
             let backwall = unsafe { &mut *backwall_ptr };
-            // 2026-08-04 诊断：打印世界顶部行（row 1）前 3 个 backwall 原始 hash，
-            // 确认存档里太空格背墙的 hash 值（预期真空 0x2d39bf75）。
-            let mut diag_hashes: Vec<u32> = Vec::new();
 
             for row in 0..save_height as i64 {
                 let row_start = offset as i64 + row * (stride as i64);
@@ -362,21 +359,9 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
                             return std::ptr::null_mut();
                         }
                     };
-                    if row == 1 && col < 3 && diag_hashes.len() < 3 {
-                        diag_hashes.push(elem_hash);
-                    }
 
                     // L166: GetElementIndex
                     let bw_elem = elements_table::get_element_index_pub(elem_hash);
-                    if row == 1 && col < 3 {
-                        tracing::info!(
-                            row,
-                            col,
-                            elem_hash,
-                            bw_elem,
-                            "Load: backwall diag"
-                        );
-                    }
                     backwall.element_idx.set(cell_idx, bw_elem);
 
                     // L177-178: 读取 mass
@@ -1261,15 +1246,6 @@ pub fn handle_set_world_zones(reader: &mut BinaryBufferReader) -> *mut c_void {
         }
     }
     sim_data.world_zones = UniquePtr { ptr: zones.leak().as_mut_ptr() };
-    // 2026-08-04：成功日志供实测确认 C# 是否发送 SetWorldZones
-    //（若从不发送，world_zones 保持 null，太空泄漏特判不激活，与之前一致）。
-    tracing::info!(
-        width,
-        height,
-        rows,
-        row_len,
-        "SetWorldZones: world_zones allocated"
-    );
     std::ptr::null_mut()
 }
 
