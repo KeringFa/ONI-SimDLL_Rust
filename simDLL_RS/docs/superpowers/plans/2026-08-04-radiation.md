@@ -24,7 +24,7 @@
 - 修改：`src/c_simulation/frame_processor.rs`（新增 process_radiation_params 真实实现，替换桩）
 - 测试：`src/c_simulation/frame_processor.rs` tests 模块
 
-- [ ] **步骤 1：写失败测试**（params 8B 解析 + type 映射 + 未映射 type 跳过）
+- [x] **步骤 1：写失败测试**（params 8B 解析 + type 映射 + 未映射 type 跳过）
 
 ```rust
 #[test]
@@ -44,15 +44,15 @@ fn radiation_params_applies_mapping_and_skips_unknown() {
 }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**（process_radiation_params 未定义）
-- [ ] **步骤 3：实现**
+- [x] **步骤 2：运行测试确认失败**（process_radiation_params 未定义）
+- [x] **步骤 3：实现**
   - frame_manager：`emplace_bytes(&mut frame.radiation_params_modifications, reader, 12)` → `8`。
   - frame_processor：实现 `process_radiation_params(sim: &mut SimData, entries: &[u8])`——按 8B
     迭代原始字节，`type` 0→linger_rate、2→base_weight、3→density_weight、4→constructed_factor、
     5→max_mass，其余跳过；`process_radiation_params_frame` 从
     `frame.radiation_params_modifications` 取 slice 调用后清空。
-- [ ] **步骤 4：运行测试确认通过**
-- [ ] **步骤 5：commit**（`feat(c2): radiation params 8B message + parameter mapping`）
+- [x] **步骤 4：运行测试确认通过**
+- [x] **步骤 5：commit**（`feat(c2): radiation params 8B message + parameter mapping`）
 
 ### 任务 2：CellRadiationModification 处理 + 消费回调
 
@@ -60,7 +60,7 @@ fn radiation_params_applies_mapping_and_skips_unknown() {
 - 修改：`src/c_simulation/frame_processor.rs`（process_cell_radiation_changes 真实实现，替换桩）
 - 测试：`src/c_simulation/frame_processor.rs` tests 模块
 
-- [ ] **步骤 1：写失败测试**（delta 累加 + ≤0 清零 + callback 推入）
+- [x] **步骤 1：写失败测试**（delta 累加 + ≤0 清零 + callback 推入）
 
 ```rust
 #[test]
@@ -85,14 +85,14 @@ fn cell_radiation_modification_applies_delta_and_callback() {
 }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
-- [ ] **步骤 3：实现**——`process_cell_radiation_changes(sim: &mut SimData, entries: &[u8])` 按 12B 迭代：
+- [x] **步骤 2：运行测试确认失败**
+- [x] **步骤 3：实现**——`process_cell_radiation_changes(sim: &mut SimData, entries: &[u8])` 按 12B 迭代：
   `gameCell→sim cell`（`(gc % gameW + 1) + (gc / gameW + 1) × simW`）；
   `radiation += delta`，结果 ≤0 → 0；`callbackIdx != -1` → 推
   `RadiationConsumedCallback { gameCell, callbackIdx, radiation: delta }` 到
   `sim_events.radiation_consumed_callbacks`；frame 版本取 slice 调用后清空。
-- [ ] **步骤 4：运行测试确认通过**
-- [ ] **步骤 5：commit**（`feat(c2): cell radiation modification + consumption callback`）
+- [x] **步骤 4：运行测试确认通过**
+- [x] **步骤 5：commit**（`feat(c2): cell radiation modification + consumption callback`）
 
 ### 任务 3：run_radiation_task（宇宙 occlusion + 衰减 + 元素扩散 + cosmic 应用 + 钳制）
 
@@ -101,7 +101,7 @@ fn cell_radiation_modification_applies_delta_and_callback() {
 - 修改：`src/c2_physics/mod.rs`（pub mod radiation；update_data 接线 + 区域 cosmic 强度传入）
 - 修改：`src/c2_physics/mod.rs` tests（或 radiation.rs 内 tests）
 
-- [ ] **步骤 1：写失败测试**（单星门控 + 宇宙 occlusion + 元素扩散 + 衰减/钳制）
+- [x] **步骤 1：写失败测试**（单星门控 + 宇宙 occlusion + 元素扩散 + 衰减/钳制）
 
 ```rust
 // 门控：radiation_enabled=false → 零执行（cells.radiation 不变）
@@ -121,8 +121,8 @@ fn radiation_task_cosmic_occlusion_and_apply() { ... }
 fn radiation_task_decay_and_clamp() { ... }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**（radiation.rs 不存在）
-- [ ] **步骤 3：实现 `run_radiation_task(sim, bounds, cosmic_intensity)`**
+- [x] **步骤 2：运行测试确认失败**（radiation.rs 不存在）
+- [x] **步骤 3：实现 `run_radiation_task(sim, bounds, cosmic_intensity)`**
   - `if !sim.radiation_enabled { return; }`；
   - `cosmic_radiation_occlusion` resize 区域大小并填 1.0；
   - **第一遍（top→bottom，row 从 max_y 递减）**：
@@ -137,20 +137,20 @@ fn radiation_task_decay_and_clamp() { ... }
       目标 = cell + dy×width + dx，边界内 → `radiation[target] += mass[cell] × 0.001 × radsPer1000 × w`；
     - cosmic 应用：`occlusion[cell] > 0` → `radiation += (cosmic/linger) × occlusion`；
     - 钳制：clamp [0, 9e6]；≤0.01 → 0。
-- [ ] **步骤 4：接线 update_data**——`region_bounds` 循环改为带 cosmic 强度：
+- [x] **步骤 4：接线 update_data**——`region_bounds` 循环改为带 cosmic 强度：
   构建 `let region_cosmic: Vec<f32> = regions.iter().map(|r| r.current_cosmic_radiation_intensity).collect();`
   与 region_bounds 同步；在 `run_space_vacuum_task` 之后、`post_process_loop` 之前
   （原版 L42594 位于 UpdateComponents 前）调用 `run_radiation_task(sim, bounds, cosmic)`。
-- [ ] **步骤 5：运行测试确认通过**
-- [ ] **步骤 6：commit**（`feat(c2): radiation core - cosmic occlusion, element kernel, decay/clamp`）
+- [x] **步骤 5：运行测试确认通过**
+- [x] **步骤 6：commit**（`feat(c2): radiation core - cosmic occlusion, element kernel, decay/clamp`）
 
 ### 任务 4：全量回归 + 双模式验证
 
 **文件：** 无新增
 
-- [ ] **步骤 1：全量串行测试**（`cargo test -- --test-threads=1`，预期全部通过）
-- [ ] **步骤 2：release 构建**
-- [ ] **步骤 3：commit**（`test(c2): radiation phase A full regression`）
+- [x] **步骤 1：全量串行测试**（`cargo test -- --test-threads=1`，预期全部通过）
+- [x] **步骤 2：release 构建**
+- [x] **步骤 3：commit**（`test(c2): radiation phase A full regression`——验证并入任务 3 提交，无独立空提交）
 
 ---
 

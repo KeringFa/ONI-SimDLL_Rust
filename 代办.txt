@@ -686,6 +686,25 @@ property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生�
   无 Critical/Important；遗留 Minor 1 项（0x2531469c 分支，仅 PartialLightBlocking
   格触发，行为与原版一致）。光照模块完成。
 
+## [进行中] 辐射模块·阶段 A（格子级辐射核心，2026-08-04）
+
+- 规格：docs/superpowers/specs/2026-08-04-radiation-design.md
+- 计划：docs/superpowers/plans/2026-08-04-radiation.md
+- **已实现（内联执行，TDD）**：
+  1. RadiationParamsModification 8B 修正 + type 映射（0→linger/2→base/3→density/
+     4→constructed/5→maxMass，type 1 跳过）——提交 201dd87；
+  2. CellRadiationModification（12B：delta 累加、≤0 清零、RadiationConsumedCallback）
+    ——提交 979befc；
+  3. run_radiation_task（radiation.rs）：DLC 门控（radiation_enabled）、宇宙 occlusion
+    自顶向下（构造格 constructedFactor / 质量加权）、衰减（−r/linger，零值 −1）、
+    25 格权重核元素扩散、cosmic 应用、钳制 [0,9e6] 且 ≤0.01 清零；update_data 接入
+    （区域 cosmic 强度传入）——提交 fe67d91。
+- 全量 457 测试串行全过（405 lib + 52 集成）；release 构建成功。
+- **待实测（DLC 存档）**：辐射计读数、辐射叠层、放射性元素（铀矿）辐射扩散、
+  太空宇宙辐射；**单星存档应零辐射**（cells.radiation 恒 0）。
+- **依赖记录**：病菌贡献（RadiationSickness → +count×0.001）依赖病菌表，阶段 A 跳过；
+  RadiationEmitter（建造辐射）→ 阶段 B；生物辐射/辐射消费 → 阶段 C。
+
 ### 太阳光根因修复（2026-08-04，用户实测：仅顶部行亮 / 真空阻隔光）
 
 **根因（NaN 毒化阳光列）**：
