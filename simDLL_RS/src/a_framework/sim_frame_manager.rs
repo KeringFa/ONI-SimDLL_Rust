@@ -549,18 +549,30 @@ impl SimFrameManager {
             MSG_ADD_DISEASE_EMITTER
             | MSG_MODIFY_DISEASE_EMITTER
             | MSG_REMOVE_DISEASE_EMITTER
-            | MSG_ADD_DISEASE_CONSUMER
-            | MSG_MODIFY_DISEASE_CONSUMER
-            | MSG_REMOVE_DISEASE_CONSUMER
-            | MSG_ADD_RADIATION_EMITTER
-            | MSG_MODIFY_RADIATION_EMITTER
-            | MSG_REMOVE_RADIATION_EMITTER => {
-                tracing::trace!(
-                    "handle_message: ComponentMessages id={:x} accepted (C2 stub, no emplace)",
-                    id
-                );
-                true
-            }
+              | MSG_ADD_DISEASE_CONSUMER
+              | MSG_MODIFY_DISEASE_CONSUMER
+              | MSG_REMOVE_DISEASE_CONSUMER => {
+                  tracing::trace!(
+                      "handle_message: ComponentMessages id={:x} accepted (C2 stub, no emplace)",
+                      id
+                  );
+                  true
+              }
+
+              // ===== RadiationEmitter 消息（2026-08-04 阶段 B：adds 36B / modifies 40B / removes 8B）=====
+              // AddRadiationEmitter (0xA649D34E?) → adds 36B {callbackIdx, cell, radiusX(s16),
+              //   radiusY(s16), emitRads, emitRate, emitSpeed, emitDirection, emitAngle, emitType}
+              MSG_ADD_RADIATION_EMITTER => {
+                  emplace_bytes(&mut frame.radiation_emitter_messages.adds, reader, 36)
+              }
+              // ModifyRadiationEmitter → modifies 40B {handle, cell, callbackIdx, ...同 Add 尾部}
+              MSG_MODIFY_RADIATION_EMITTER => {
+                  emplace_bytes(&mut frame.radiation_emitter_messages.modifies, reader, 40)
+              }
+              // RemoveRadiationEmitter → removes 8B {handle, callbackIdx}
+              MSG_REMOVE_RADIATION_EMITTER => {
+                  emplace_bytes(&mut frame.radiation_emitter_messages.removes, reader, 8)
+              }
 
             // ===== 特殊处理类：NewGameFrame =====
             // 对照源码 08_sim_frame_manager.c L594-636。

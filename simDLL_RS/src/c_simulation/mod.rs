@@ -9,4 +9,5 @@ pub mod conduit_temperature;
 pub mod element_emitter;
 pub mod element_chunk;
 pub mod frame_processor;
+pub mod radiation_emitter;
 pub mod sim_data_ops;
