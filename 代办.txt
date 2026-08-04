@@ -718,6 +718,14 @@ property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生�
   （Spawner 读 Grid.Radiation）、飞行/衰减消失/撞击砖块/生物全在 C#（Grid 只读 +
   ScenePartitioner）；唯一 sim 交互 = 撞击后 SimMessages.AddRemoveSubstance 生成 Fallout
   （走 ModifyCell，已实现）。**不属 simDLL 范围，阶段 B 不含粒子系统**。
+- **原版细致实测覆盖确认（用户，2026-08-04）**：
+  - 铀元素砖/气闸类建筑发射辐射 = 阶段 A 元素辐射（doReplaceElement=true → 格内铀材料
+    +质量 → 25 格核）；非密实建筑不替换格内元素 → 不辐射，无新路径；
+  - 人力粒子发生器 ManualHighEnergyParticleSpawner = RadiationEmitter **Constant**
+    （emitRads=120），被操作时发射——阶段 B 覆盖；
+  - 熔毁的研究性反应堆持续发射 = 同一 RadiationEmitter 的 SetEmitting(true) 熔毁态
+    （Reactor.cs L182-184 meltdown.loop；正常态 L91 SetEmitting(false)），贴图/不可恢复
+    为 C# 动画状态——阶段 B 覆盖，无新路径。
 
 ### 太阳光根因修复（2026-08-04，用户实测：仅顶部行亮 / 真空阻隔光）
 
