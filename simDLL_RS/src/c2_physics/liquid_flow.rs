@@ -132,6 +132,7 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
     static SPACE_VACUUM_DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SPACE_VACUUM_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
         let (mut n_ff, mut n_bw, mut n_liq, mut n_gas) = (0usize, 0usize, 0usize, 0usize);
+        let mut sample_backwall: Vec<u16> = Vec::new();
         let updated = unsafe { &*sim.updated_cells.ptr };
         for row in 1..height - 1 {
             for col in 1..width - 1 {
@@ -140,6 +141,9 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
                     continue;
                 }
                 n_ff += 1;
+                if sample_backwall.len() < 5 {
+                    sample_backwall.push(backwall.element_idx.get(cell));
+                }
                 if backwall.element_idx.get(cell) == vacuum {
                     n_bw += 1;
                 }
@@ -159,6 +163,9 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
             n_liq,
             n_gas,
             vacuum,
+            bw_vacuum_field = backwall.vacuum_element_idx,
+            void_idx = sim.void_element_idx,
+            ?sample_backwall,
             "space_vacuum: first-run diag"
         );
     }
