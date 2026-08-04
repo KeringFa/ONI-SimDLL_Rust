@@ -812,7 +812,10 @@ fn pair_allowed(sim: &SimData, a: usize, b: usize) -> bool {
 /// SimUpdateTemperatureTask::InternalDoTask 单线程等价（原版 L144205-144310）。
 /// 遍历内部格：背墙换热 → 右邻（ΔT≥1 且 TC>0 且无 0x10）→ 下邻（同门控）→ DoStateTransition。
 /// 读 `cells` 稳定缓冲、写 `updatedCells` 增量（opening CopyFrom 后 == 子步初态）。
-pub(crate) fn run_temperature_task(sim: &mut SimData) {
+pub(crate) fn run_temperature_task(
+    sim: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     if sim.cells.ptr.is_null()
         || sim.updated_cells.ptr.is_null()
         || sim.backwall.ptr.is_null()
@@ -825,8 +828,11 @@ pub(crate) fn run_temperature_task(sim: &mut SimData) {
     if w < 3 || h < 3 {
         return;
     }
-    for row in 1..h - 1 {
-        for col in 1..w - 1 {
+    for row in bounds.min_y..=bounds.max_y {
+        for col in bounds.min_x..=bounds.max_x {
+            if row >= h - 1 || col >= w - 1 {
+                continue;
+            }
             let cell = row * w + col;
             // 1. 背墙换热（cells.mass>0 且 backwall.mass>0，原版 L144222-144234）
             {
@@ -1520,7 +1526,8 @@ mod tests {
                 (26, 1, 100.0, 300.0, 255),
             ],
         );
-        run_temperature_task(&mut sd);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_temperature_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
             assert!(u.temperature.get(14) > 300.0, "水平相邻应换热");
@@ -1543,7 +1550,8 @@ mod tests {
         }
         let mut sd = make_sim();
         fill_pair_cells(&mut sd, &[(14, 1, 100.0, 300.0, 255), (15, 2, 200.0, 400.0, 255)]);
-        run_temperature_task(&mut sd);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_temperature_task(&mut sd, bounds);
         unsafe {
             assert_eq!(
                 (*sd.updated_cells.ptr).temperature.get(14),

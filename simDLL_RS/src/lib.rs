@@ -8,6 +8,7 @@ pub mod a_framework;
 pub mod b_elements;
 pub mod c_simulation;
 pub mod c2_physics;
+pub mod d1_activity;
 
 pub mod globals {
     //! 全局静态变量，对应原版 simDLL 的全局状态。

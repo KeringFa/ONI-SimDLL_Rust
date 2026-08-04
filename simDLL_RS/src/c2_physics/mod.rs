@@ -44,25 +44,47 @@ pub fn update_data(sim_data: &mut SimData) {
     }
     // 原版 UpdateData L144415：每子步开头 CopyFrom(cells, updatedCells)
     crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
-    // 温度任务（原版 L144430-144548：读 cells 稳定缓冲、写 updatedCells 增量；
-    // 含背墙换热、右/下邻换热、逐格 DoStateTransition）
-    crate::c2_physics::temperature::run_temperature_task(sim_data);
-    // 原版 L144548：温度后 CopyFrom，供后续压力/液体阶段读取新温度
-    crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
 
-    // 压力循环（原版顺序：温度任务 → CopyFrom → **压力循环** L42030-42320 →
-    // CopyFrom → 液体任务 L42408+ → PostProcessCell；2026-08-03 对照源码修正，
-    // 置于 update_liquids 之前——此前液体→压力顺序与原版相反，同帧内先后不同）
-    run_pressure_task(sim_data);
+    // 2026-08-04 D1：主物理循环按活动区域（已发现世界矩形）裁剪。
+    // 原版 L144410-144430：遍历 activeRegions，每个区域内依次执行
+    // 温度任务 → CopyFrom → 压力 → 液体 → 太空真空 → PostProcess。
+    // 无活动区域时回退整张内部网格（测试环境无区域数据；原版此时区域循环不执行，
+    // 但生产环境始终 ≥1 个已发现世界，回退不会改变生产行为）。
+    let region_bounds: Vec<crate::d1_activity::RegionBounds> = {
+        let regions = sim_data.active_regions.as_slice();
+        if regions.is_empty() {
+            vec![crate::d1_activity::full_grid_bounds(sim_data)]
+        } else {
+            regions
+                .iter()
+                .map(|r| crate::d1_activity::compute_region_bounds(sim_data, r))
+                .collect()
+        }
+    };
+    for bounds in region_bounds {
+        if bounds.is_empty() {
+            continue;
+        }
+        // 温度任务（原版 L144430-144548：读 cells 稳定缓冲、写 updatedCells 增量；
+        // 含背墙换热、右/下邻换热、逐格 DoStateTransition）
+        crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+        // 原版 L144548：温度后 CopyFrom，供后续压力/液体阶段读取新温度
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
 
-    // C2 阶段实现：液体流动（原版 L42408+）
-    crate::c2_physics::liquid_flow::update_liquid_loop(sim_data);
-    // 太空真空特判（原版 L145466-145520：worldZones==-1 且背墙真空 → 液体/气体
-    // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
-    // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
-    crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data);
-    // PostProcessCell（原版 L43023：挤压/密度分层/升华）
-    crate::c2_physics::liquid_flow::post_process_loop(sim_data);
+        // 压力循环（原版顺序：温度任务 → CopyFrom → **压力循环** L42030-42320 →
+        // CopyFrom → 液体任务 L42408+ → PostProcessCell；2026-08-03 对照源码修正，
+        // 置于 update_liquids 之前——此前液体→压力顺序与原版相反，同帧内先后不同）
+        run_pressure_task(sim_data, bounds);
+
+        // C2 阶段实现：液体流动（原版 L42408+）
+        crate::c2_physics::liquid_flow::update_liquid_loop(sim_data, bounds);
+        // 太空真空特判（原版 L145466-145520：worldZones==-1 且背墙真空 → 液体/气体
+        // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
+        // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
+        crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, bounds);
+        // PostProcessCell（原版 L43023：挤压/密度分层/升华）
+        crate::c2_physics::liquid_flow::post_process_loop(sim_data, bounds);
+    }
     // ElementConsumer 逐帧消费（2026-08-02：水泵/涡轮取水；原版 UpdateData 调组件 Update）
     crate::c_simulation::frame_processor::process_element_consumers(sim_data);
 
@@ -84,7 +106,10 @@ pub fn update_data(sim_data: &mut SimData) {
 ///   flow[本格].z += f39、flow[邻格].w −= f39（垂直）
 ///
 /// 提取为独立函数以便回归测试直接隔离门控（update_liquid 的水平扩散会干扰同场景断言）。
-pub(crate) fn run_pressure_task(sim_data: &mut SimData) {
+pub(crate) fn run_pressure_task(
+    sim_data: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     let sim_w = sim_data.width as usize;
     let sim_h = sim_data.height as usize;
     if sim_w < 3 || sim_h < 3 || sim_data.updated_cells.ptr.is_null() {
@@ -96,8 +121,11 @@ pub(crate) fn run_pressure_task(sim_data: &mut SimData) {
     }
     let total = sim_w * sim_h;
     let flow = unsafe { std::slice::from_raw_parts_mut(flow_ptr, total) };
-    for row in 1..sim_h - 1 {
-        for col in 1..sim_w - 1 {
+    for row in bounds.min_y..=bounds.max_y {
+        for col in bounds.min_x..=bounds.max_x {
+            if row >= sim_h - 1 || col >= sim_w - 1 {
+                continue;
+            }
             let cell = row * sim_w + col;
             // 仅液体格（state & 3 == 2 且 mass > 0）——与 update_liquids 同判定
             let is_liquid = {
@@ -402,7 +430,8 @@ mod tests {
                 b.temperature.set(c, 300.0);
             }
         });
-        run_pressure_task(&mut sd);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_pressure_task(&mut sd, bounds);
         unsafe {
             let updated = &*sd.updated_cells.ptr;
             assert!(
@@ -439,7 +468,8 @@ mod tests {
                 b.temperature.set(c, 300.0);
             }
         });
-        run_pressure_task(&mut sd);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_pressure_task(&mut sd, bounds);
         unsafe {
             let updated = &*sd.updated_cells.ptr;
             assert_eq!(updated.element_idx.get(15), 1, "真空邻格应变为液体元素");

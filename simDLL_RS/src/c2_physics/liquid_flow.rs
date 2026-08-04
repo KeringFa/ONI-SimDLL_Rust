@@ -51,22 +51,29 @@ use crate::a_framework::game_data::{SpawnFXInfo, SubstanceChangeInfo};
 /// 从 cells（源缓冲）读元素/质量，写 updatedCells（目标缓冲）。
 /// 元素表为空（测试环境）时安全跳过。
 pub fn update_liquids(sim: &mut crate::a_framework::sim_data::SimData) {
-    update_liquid_loop(sim);
-    post_process_loop(sim);
+    let bounds = crate::d1_activity::full_grid_bounds(sim);
+    update_liquid_loop(sim, bounds);
+    post_process_loop(sim, bounds);
 }
 
 /// UpdateLiquid 遍历循环（原版 11_msvcrt_ignored.c L42408-42435）。
 /// 2026-08-04 拆分：与 post_process_loop 分离，供 update_data 在两者之间插入
 /// 太空真空任务（原版 worldZones 特判位于 UpdateLiquid 之后、PostProcessCell 之前，
 /// L145466-145520）。
-pub(crate) fn update_liquid_loop(sim: &mut crate::a_framework::sim_data::SimData) {
+pub(crate) fn update_liquid_loop(
+    sim: &mut crate::a_framework::sim_data::SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     let width = sim.width as usize;
     let height = sim.height as usize;
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
         return;
     }
-    for row in 1..height - 1 {
-        for col in 1..width - 1 {
+    for row in bounds.min_y..=bounds.max_y {
+        for col in bounds.min_x..=bounds.max_x {
+            if row >= height - 1 || col >= width - 1 {
+                continue;
+            }
             let idx = row * width + col;
             let cells = unsafe { &*sim.cells.ptr };
             let e = cells.element_idx.get(idx);
@@ -86,14 +93,20 @@ pub(crate) fn update_liquid_loop(sim: &mut crate::a_framework::sim_data::SimData
 /// PostProcessCell）。post_process_cell 内部按真空/气体/固体/液体四分支处理，
 /// 元素表缺失时安全返回，故此处对全部内部格无条件调用。
 /// 挤压位移 / 密度分层 / 升华 accumulated_flow 累加由此在生产中真正执行。
-pub(crate) fn post_process_loop(sim: &mut crate::a_framework::sim_data::SimData) {
+pub(crate) fn post_process_loop(
+    sim: &mut crate::a_framework::sim_data::SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     let width = sim.width as usize;
     let height = sim.height as usize;
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
         return;
     }
-    for row in 1..height - 1 {
-        for col in 1..width - 1 {
+    for row in bounds.min_y..=bounds.max_y {
+        for col in bounds.min_x..=bounds.max_x {
+            if row >= height - 1 || col >= width - 1 {
+                continue;
+            }
             post_process_cell(sim, row * width + col);
         }
     }
@@ -110,7 +123,10 @@ pub(crate) fn post_process_loop(sim: &mut crate::a_framework::sim_data::SimData)
 ///
 /// 2026-08-04 实现：此前缺失 → 太空暴露的液体/气体不被持续删除
 /// （用户实测：原版 Space exposure 持续删除至空，项目版不删）。
-pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimData) {
+pub(crate) fn run_space_vacuum_task(
+    sim: &mut crate::a_framework::sim_data::SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     if sim.world_zones.ptr.is_null()
         || sim.backwall.ptr.is_null()
         || sim.updated_cells.ptr.is_null()
@@ -138,8 +154,11 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
     unsafe {
         let updated = &mut *sim.updated_cells.ptr;
         let flow = std::slice::from_raw_parts_mut(sim.flow.ptr, total);
-        for row in 1..height - 1 {
-            for col in 1..width - 1 {
+        for row in bounds.min_y..=bounds.max_y {
+            for col in bounds.min_x..=bounds.max_x {
+                if row >= height - 1 || col >= width - 1 {
+                    continue;
+                }
                 let cell = row * width + col;
                 // 原版 L42962：worldZones[cell] == -1（0xFF）
                 if world_zones[cell] != 0xFF {
@@ -2646,7 +2665,8 @@ mod tests {
             // backwall 默认填 vacuum（new_for_allocate with_size(vacuum_element_idx)）
         }
 
-        run_space_vacuum_task(&mut sd);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_space_vacuum_task(&mut sd, bounds);
 
         unsafe {
             let updated = &*sd.updated_cells.ptr;
@@ -2698,7 +2718,8 @@ mod tests {
             bw.element_idx.set(16, 5); // 非真空背墙
         }
 
-        run_space_vacuum_task(&mut sd);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_space_vacuum_task(&mut sd, bounds);
 
         unsafe {
             let updated = &*sd.updated_cells.ptr;
