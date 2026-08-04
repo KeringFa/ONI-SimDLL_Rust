@@ -126,10 +126,12 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
     let total = width * height;
     let world_zones = unsafe { std::slice::from_raw_parts(sim.world_zones.ptr, total) };
     let backwall = unsafe { &*sim.backwall.ptr };
-    // 原版 L145470：backwall.elementIdx[cell] == backwall.vacuumElementIdx
-    //（backwall 首字段，BackwallSOA::BackwallSOA 构造时 = 传入的 vacuum 索引；
-    //  2026-08-04 修复 with_size 漏设该字段）
-    let vacuum = backwall.vacuum_element_idx;
+    // 原版 L145470：backwall.elementIdx[cell] == *(short*)backwall（backwall 首 2 字节）。
+    // old 稳定版（已实测太空删除）解析为 backwall.element_idx[0]——"backwall 模板元素"：
+    // backwall[0]（边界格）加载后 = 存档解析值（本存档 hash=0 → 65535），太空格同为
+    // 65535 → 判定通过。此前我们用 vacuum_element_idx 字段（=211，真空在元素表）→
+    // 65535 ≠ 211 恒失败。2026-08-04 修正：改用 backwall.element_idx[0]。
+    let bw_template = backwall.element_idx.get(0);
     // 2026-08-04 诊断：首次运行统计 world_zones 太空格/背墙真空/液体/气体分布，
     // 用于定位太空删除不生效是数据问题还是条件问题（部署后看日志一次即可）。
     static SPACE_VACUUM_DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -147,7 +149,7 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
                 if sample_backwall.len() < 5 {
                     sample_backwall.push(backwall.element_idx.get(cell));
                 }
-                if backwall.element_idx.get(cell) == vacuum {
+                if backwall.element_idx.get(cell) == bw_template {
                     n_bw += 1;
                 }
                 match elements_table::get_element_post_process_data(updated.element_idx.get(cell)) {
@@ -165,10 +167,12 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
             n_bw,
             n_liq,
             n_gas,
-            vacuum,
+            vacuum = sim.vacuum_element_idx,
             bw_vacuum_field = backwall.vacuum_element_idx,
             void_idx = sim.void_element_idx,
-            vac_hash = elements_table::get_element_by_idx(vacuum)
+            bw_template,
+            bw0_elem = backwall.element_idx.get(0),
+            vac_hash = elements_table::get_element_by_idx(sim.vacuum_element_idx)
                 .map(|e| e.id)
                 .unwrap_or(-1),
             void_hash = elements_table::get_element_by_idx(sim.void_element_idx)
@@ -190,7 +194,7 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
                     continue;
                 }
                 // 原版 L42967-42970：背墙元素 == vacuum
-                if backwall.element_idx.get(cell) != vacuum {
+                if backwall.element_idx.get(cell) != bw_template {
                     continue;
                 }
                 // 原版 L42979-42987：读 updatedCells 元素 state & 3
