@@ -181,8 +181,42 @@ pub fn update_data(sim_data: &mut SimData) {
             continue;
         }
         // 温度任务（原版 L144430-144548：读 cells 稳定缓冲、写 updatedCells 增量；
-        // 含背墙换热、右/下邻换热、逐格 DoStateTransition）
-        crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+        // 含背墙换热、右/下邻换热、逐格 DoStateTransition）。
+        // D2：按 worker 数切行带提交到 ParallelTaskQueue（原版 L144430-144527），
+        // 等待全部完成后再继续；队列未初始化（测试环境）时内联整区执行。
+        let queue_ptr = crate::globals::G_PARALLEL_TASK_QUEUE.lock().0;
+        if !queue_ptr.is_null() {
+            let queue = unsafe { &*queue_ptr };
+            let n_workers = queue.worker_count().max(1);
+            let total_rows = bounds.max_y + 1 - bounds.min_y;
+            let base = total_rows / n_workers;
+            let extra = total_rows % n_workers;
+            let mut row = bounds.min_y;
+            let mut submitted = 0usize;
+            for i in 0..n_workers {
+                let band_rows = base + if i < extra { 1 } else { 0 };
+                if band_rows == 0 {
+                    break;
+                }
+                let row_end = row + band_rows;
+                let ptr = crate::globals::SendSyncPtr(sim_data as *mut SimData);
+                let b = bounds;
+                // 温度任务只写各自行带内的 updatedCells/背墙，行带互不重叠；
+                // 1 worker 串行执行（原版即 1 worker），原始指针模型与原版一致。
+                queue.submit(Box::new(move || {
+                    crate::c2_physics::temperature::run_temperature_band_task(
+                        ptr, b, row, row_end,
+                    );
+                }));
+                row = row_end;
+                submitted += 1;
+            }
+            if submitted > 0 {
+                queue.wait_all();
+            }
+        } else {
+            crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+        }
         // 原版 L144548：温度后 CopyFrom，供后续压力/液体阶段读取新温度
         crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
 

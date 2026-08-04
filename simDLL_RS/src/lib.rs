@@ -9,6 +9,7 @@ pub mod b_elements;
 pub mod c_simulation;
 pub mod c2_physics;
 pub mod d1_activity;
+pub mod d2_thread;
 
 pub mod globals {
     //! 全局静态变量，对应原版 simDLL 的全局状态。
@@ -85,6 +86,40 @@ pub mod globals {
     /// 对照源码 Sim::Main L2133-2145 的 `*(float *)&this->_padding_`。
     /// 用于累积帧时间不足一个 200ms 子步的余量。
     pub static G_SIM_TIME_REMAINDER: AtomicU32 = AtomicU32::new(0);
+
+    /// D2：全局 ParallelTaskQueue（原版 Sim 对象上的 taskQueue，SimBase::InitializeTasks
+    /// 创建，1 worker）。Box 堆分配保证地址稳定（worker 持有队列指针），
+    /// SIM_Initialize 重建 / SIM_Shutdown 释放。更新数据里温度任务经它分发；
+    /// d3（rayon）可增加 worker 数。
+    pub static G_PARALLEL_TASK_QUEUE: Mutex<SendSyncPtr<crate::d2_thread::ParallelTaskQueue>> =
+        Mutex::new(SendSyncPtr(std::ptr::null_mut()));
+
+    /// 初始化全局任务队列（原版 SimBase::InitializeTasks：1 worker）。
+    pub fn init_parallel_task_queue() {
+        let mut g = G_PARALLEL_TASK_QUEUE.lock();
+        if !g.0.is_null() {
+            unsafe {
+                (*g.0).shutdown();
+                let _ = Box::from_raw(g.0);
+            }
+            g.0 = std::ptr::null_mut();
+        }
+        let q = Box::new(crate::d2_thread::ParallelTaskQueue::new(1));
+        q.start_workers();
+        g.0 = Box::into_raw(q);
+    }
+
+    /// 关闭并释放全局任务队列（原版析构：置 mShuttingDown + join workers）。
+    pub fn shutdown_parallel_task_queue() {
+        let mut g = G_PARALLEL_TASK_QUEUE.lock();
+        if !g.0.is_null() {
+            unsafe {
+                (*g.0).shutdown();
+                let _ = Box::from_raw(g.0);
+            }
+            g.0 = std::ptr::null_mut();
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────

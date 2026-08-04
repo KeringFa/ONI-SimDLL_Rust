@@ -64,6 +64,10 @@ pub extern "C" fn SIM_Initialize(handler: Option<GameMessageHandler>) {
             fs.clear();
         }
 
+        // 原版 Sim::Sim → SimBase::InitializeTasks（L132419-132433）：创建 1-worker
+        // ParallelTaskQueue 作为 this->taskQueue。D2：全局队列，温度任务分发用。
+        crate::globals::init_parallel_task_queue();
+
         // L330-333: 创建 gSim
         // Sim::Sim(this, &gFrameSync) 需要指向 gFrameSync 的地址。
         // G_FRAME_SYNC 是 static 的 OnceCell<Mutex<FrameSync>>，
@@ -102,6 +106,8 @@ pub extern "C" fn SIM_Shutdown() {
         super::sim_thread::join_sim_thread();
 
         // 2. 清理全局资源（释放 gSim/gSimData/gDisease/SaveBuffer）
+        // 先关停任务队列（join worker），再释放 sim 资源
+        crate::globals::shutdown_parallel_task_queue();
         save_load::clean_up();
 
         // 3. flush 日志

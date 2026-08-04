@@ -816,6 +816,17 @@ pub(crate) fn run_temperature_task(
     sim: &mut SimData,
     bounds: crate::d1_activity::RegionBounds,
 ) {
+    run_temperature_band(sim, bounds, bounds.min_y, bounds.max_y + 1);
+}
+
+/// 温度行带任务（D2：原版 UpdateData L144430 把每个区域的温度按 worker 数切行带，
+/// 提交到 ParallelTaskQueue 执行）。行范围 [row_start, row_end)，列范围取区域边界。
+pub(crate) fn run_temperature_band(
+    sim: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+    row_start: usize,
+    row_end: usize,
+) {
     if sim.cells.ptr.is_null()
         || sim.updated_cells.ptr.is_null()
         || sim.backwall.ptr.is_null()
@@ -828,7 +839,7 @@ pub(crate) fn run_temperature_task(
     if w < 3 || h < 3 {
         return;
     }
-    for row in bounds.min_y..=bounds.max_y {
+    for row in row_start..row_end {
         for col in bounds.min_x..=bounds.max_x {
             if row >= h - 1 || col >= w - 1 {
                 continue;
@@ -870,6 +881,18 @@ pub(crate) fn run_temperature_task(
             }
         }
     }
+}
+
+/// D2 温度行带任务入口：经 SendSyncPtr 捕获整个 SimData 指针（避免 edition-2021
+/// disjoint capture 只捕获 `ptr.0` 裸字段导致闭包 !Send）。worker 内 1 个 &mut。
+pub(crate) fn run_temperature_band_task(
+    sim_ptr: crate::globals::SendSyncPtr<SimData>,
+    bounds: crate::d1_activity::RegionBounds,
+    row_start: usize,
+    row_end: usize,
+) {
+    let sim = unsafe { &mut *sim_ptr.0 };
+    run_temperature_band(sim, bounds, row_start, row_end);
 }
 
 #[cfg(test)]
