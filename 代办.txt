@@ -576,3 +576,144 @@
 - **待实测**：气体水平扩散（圆形振荡）、垂直密度分层（CO2 下沉/O2 上浮）、
   气体-液体置换（气泡顶开液体）、气体-真空扩散、与原版对比。
 
+### 实测回归修复（2026-08-04 用户实测：① 扩散正常；② 分层很慢/不分层；③ 液体不挤气体）
+
+**Bug 2 根因（分层失效）**：气体分支"随机交换"的摩尔质量约束挂错候选。
+原版标志位 `[false,false,true]`（SimDLL_Source.c L149459 CONCAT13 0x10000，
+逐字节迭代 → 第 3 个候选 = 下方格 cell-width 受限），我们此前挂在 `idx==0`
+（水平候选）→ O2 可随机与下方更重的 CO2 交换 → CO2 上浮、分层失效（全图混合）。
+**修复**：约束改挂 `idx==2`（下方候选）——与 old 稳定版最终态一致
+（old 注释记录了 [false,true,false] 回退导致 Bug 3"CO2 上扩"的历史教训）。
+回归验证：12×8 房间 CO2 100kg 上 / O2 200kg 下 → 1000 帧时 95% CO2 已沉入
+下半区，45000 帧上半区 CO2 归零（全量沉底），trend 采样验证收敛。
+
+**Bug 3 根因（液体不水平挤气体）**：`update_neighbour_liquid_mass` 对气体目标
+直接 `return false`（YAGNI 占位）。原版 L1252-1257：目标气体 → 先
+`DisplaceGas(目标格, 气体元素)` 把气体单方向全量挤到 [上/左/右/下] 候选
+（原版 L136841-136844），挤不走才返回 false；成功则把目标格元素改为源液体 +
+AddMassAndUpdateTemperature + ChangeSubstance。
+**修复**：调用已有 `displace_gas`（与 DisplaceLiquid 挤压链路共用）再灌入液体；
+重构函数借用（共享读元素 → displace_gas → 重新可变借用写回）。
+回归测试：液体左侧气体 → 气体逃逸到上方真空候选、目标格变液体、源格减质量。
+
+- 全量 450 测试串行全过（398 lib + 52 集成，新增 2 条回归）；release 构建成功。
+
+### 气体流动全量对照审查（2026-08-04 内联，用户实测三项通过后执行）
+
+- 报告：.superpowers/sdd/review-gas-flow.md
+- **结论：无 Critical/Important 遗留；3 项修正（审查发现）+ 6 项核对通过。**
+
+**修正 1（审查纠正此前误判）**：`do_density_displacement` 分支 B 门控读反——
+CellSOA 布局（SimDLL_Source.c L11008-11020）0x28=**temperature**、0x48=mass；
+原版分支 B 唯一门控 = `temp[below] > temp[cell]`（下方更暖），**无 mass 门控**。
+此前一轮误删温度检查、保留多余质量检查（方向反了）；本轮恢复温度、移除质量。
+气体 → 交换（暖上升）；液体 → 质量加权合并温度写回两格。
+
+**修正 2（随机交换误用 mass）**：原版 L149467 读 updatedCells+0x28 = temperature
+数组 → 候选选择"**最低温度**"气体格；此前实现取最低 mass（old 版亦取温度）。
+已改为温度选择；分层回归（45000 帧上半区 CO2 归零）仍通过。
+
+**修正 3（beyond 真空预检）**：`run_gas_displacement_task` 调用方"beyond 必须
+气体"预检是 old 版修 Bug1-4 的额外限制；原版 DoGasPressureDisplacement
+L147502-147512 允许 beyond == dst 元素 **或真空**。已删除调用方预检，
+交由内部检查（本就与原版一致）；测试 `beyond_vacuum_blocked` 改为
+`beyond_vacuum_allowed`（气体B 全量顶入真空格）。
+
+**核对通过**：run_gas_pressure_task（三方向/角落检查/flow 记账）、
+do_gas_pressure_displacement 内部、displace_gas（候选顺序/对角）、
+update_neighbour_liquid_mass、post_process_cell 气体分支（蒸发/挤压/随机交换
+顺序与约束）、update_pressure 流率系数（K1 角色对调）。
+
+**备注**：真空源格 re-check 与位移 flow 记账两处反编译噪声无法逐行确认，
+判为等价近似（用户实测扩散/分层/置换均正常），记录在案。
+
+- **待实测（本轮审查改动后）**：① 气体圆形振荡/真空扩散不回归（beyond 真空
+  放开后重点回归）；② 分层速度/效果不回归（温度选择语义下仍收敛）；③ 液体
+  水平推挤气体不回归；④ 部署前确认 DLL 替换路径。
+
+### 实测验收（2026-08-04 用户确认）
+
+- ① 圆形振荡/真空扩散正常；② 分层速度与效果正常（CO2 全部沉底）；③ 液体
+  水平推挤气体正常。气体流动模块闭环。
+
+## [记录] 1x 相机移动间歇性卡顿（2026-08-04，轻微，暂缓）
+
+- **现象**：多星图 02（当前世界已清空只剩真空、其余星球未探索），1x 速度下
+  移动相机有轻微间歇性卡顿（对比之前已大幅减轻）；2x/3x 无；原版一/二/三倍
+  均无。单星图无此问题。
+- **定位结论**：
+  - D1 活动区域裁剪已把大头修掉（此前全倍速卡顿 → 现在仅 1x 轻微）。
+  - 头号嫌疑 = 元素表每格 Mutex 锁（`G_ELEMENTS_TABLE`，std Mutex，c2_physics
+    约 68 处调用点）：225K 格地图每子步约 150 万次加锁，实测为纯开销大头
+    （已知代办性能项）。但单线程下无锁竞争，且 2x/3x 更忙却不卡 → 非 1x 卡顿
+    的唯一/主因，更可能是帧提交节奏（1x 低频率突发）与同步偶合。
+  - 正确修法：元素表读路径无锁化（子步内快照/不可变冻结）——跨模块重构，
+    有回归风险；以及定位 C# 侧 SetVisibleCells（visible_grid 屏幕级门控）。
+- **决策**：暂缓。待 c2 光照/辐射等模块收尾后专项处理（与"元素表每格加锁
+  性能"项合并立项）。若用户希望立即处理，先做"子步内元素表快照"重构 +
+  游戏内对比 1x/2x/3x 卡顿。
+
+## [进行中] 光照模块（2026-08-04，C2）
+
+**范围结论（探索 + 对照审查）**：sim 侧光照只有一块——`update_exposed_to_sun_
+property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生物光/建筑光/
+装饰光/太阳光渲染全部在 C# Light2D（LightCount），simDLL 不参与**。
+
+- **审查报告**：.superpowers/sdd/review-lighting.md
+- **结论**：代码与原版 L145676-145960 逐行一致，无功能缺口；仅注释方向标签
+  误标（"下方格 cell+width" → 上方格）已修正（变量 below → above_cell）。
+- **关键依赖确认**：
+  - DefineWorldOffsets 单星也发（SaveLoader L443 读档 / L1032 新档），handler
+    已注册（id 3399120745 == C# -895846551）→ `sim.worlds` 有数据；
+  - GameData 曝光缓冲已分配；调用点顺序（Flow→Exposed→Liquid）与原版一致；
+  - C# 消费：`Grid.LightIntensity = exposed/255 × world.currentSunlightIntensity
+    + LightCount`（Grid.cs L558-564）；光线传感器/毛刺花读同一值。
+- 全量 450 测试串行全过；release 构建成功。
+- **待实测（用户：光线传感器 + 毛刺花 + 光照叠层）**：
+  ① 传感器读数随昼夜/遮挡变化；② 毛刺花光照需求满足；③ 太阳光透过透气砖/网格砖；
+  ④ 若异常，优先查 sim.worlds 是否填充（日志 DefineWorldOffsets handler）。
+- **遗留记录**：液体纹理同类"下方格"注释误标（原版液体纹理读 cell+width 做
+  表面检测），代码与原版一致，待液体模块后续顺带更正注释。
+
+### 光照模块闭环（2026-08-04 用户实测验收）
+
+- 太阳光恢复正常（NaN 根因已修复，见下方"太阳光根因修复"条目）；空间生态区
+  满曝光、阳光穿透真空；光线传感器/毛刺花/光照叠层正常；流星尾气可照亮。
+- **完整性结论**：sim 侧光照 = UpdateExposedToSunPropertyTexture + 元素吸光表
+  + 区域阳光强度解析，全部实现；生物光/建筑光/装饰光/太阳光渲染为 C# Light2D
+  （LightCount），simDLL 不参与。
+- **对照审查闭环**：报告 .superpowers/sdd/review-lighting.md（最终版）——
+  无 Critical/Important；遗留 Minor 1 项（0x2531469c 分支，仅 PartialLightBlocking
+  格触发，行为与原版一致）。光照模块完成。
+
+### 太阳光根因修复（2026-08-04，用户实测：仅顶部行亮 / 真空阻隔光）
+
+**根因（NaN 毒化阳光列）**：
+- 真空 `defaultMass=0`（元素 YAML）→ `massScale = 1.0/0.0 = INFINITY`
+  （03_elements.c L362-368 反编译：非固体 = 1/defaultMass）；
+- 空间生态区真空格质量=0 → 曝光函数 `absorb = massScale × mass =
+  INFINITY × 0 = NaN`；`absorb >= 1.0` 对 NaN 为 false → NaN 进入
+  `sun -= absorb×factor` 与 sun 缓冲 → 整列阳光被毒化 → 除顶部填充行（0xff）
+  外全 0 → "太阳光只显示在世界顶部第一层"；
+- 流星雨期间空间区有流星质量>0 → 该列 absorb 有限 → 阳光可传播 →
+  用户观察"阳光可在气体/有质量物质传播、被纯真空阻隔"（符合 NaN 症状）。
+
+**证据链**：
+- 存档解析（03_only.sav）：世界顶部行（sim 384）为真空质量 0；空间区
+  sim 344-383 真空；世界 (0,0,256,384) 与 DefineWorldOffsets 一致；
+- old 稳定版对 `mass_per_unit==0` 用 multiplier=1.0（默认值）→ 无 NaN →
+  光照工作——本修复同款；
+- C# 顺序确认：原版也是 `Sim.Start()` 先于 `DefineWorldOffsets`
+  （SaveLoader.LoadGame L421/L443）→ "首帧 worlds 空"非本项目独有、非根因。
+
+**修复**：
+1. `elements_table.rs`：非固体 `defaultMass > 0` → 1/mass；`defaultMass <= 0`
+   （真空等）→ massScale = 1.0（固体仍 INFINITY 全遮光）；
+2. `property_texture.rs`：曝光吸收 `absorb.is_nan() → 0.0`（防御，双分支）。
+3. 回归测试 `exposed_sun_passes_through_vacuum_space_biome`：全真空列
+   （空间区）曝光=255。
+- 全量 451 测试串行全过（399 lib + 52 集成）；release 构建成功。
+- 临时诊断（sun-diag / DefineWorldOffsets world_list）已清理。
+- **待实测**：部署 → 空间生态区应满曝光、阳光可穿透真空；光线传感器/
+  毛刺花/光照叠层回归；流星雨期间与平静期对比。
+
