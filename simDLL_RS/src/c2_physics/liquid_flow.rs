@@ -705,14 +705,17 @@ fn update_neighbour_liquid_mass(
         let cells = unsafe { &*sim.cells.ptr };
         cells.temperature.get(src_cell)
     };
-    let updated = unsafe { &mut *sim.updated_cells.ptr };
-    if dst_cell >= updated.element_idx.len() {
-        return false;
-    }
-    // 目标格当前元素（原版 L1235 uVar2）
-    let dst_elem_now = updated.element_idx.get(dst_cell);
+    // 目标格当前元素（原版 L1235 uVar2）——共享借用读取，避免跨 &mut SimData 调用
+    let dst_elem_now = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        if dst_cell >= updated.element_idx.len() {
+            return false;
+        }
+        updated.element_idx.get(dst_cell)
+    };
     // 原版 L1236：目标已是同元素 → AddMassAndUpdateTemperature + return true
     if src_elem == dst_elem_now {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
         add_mass_and_update_temperature(updated, dst_cell, amount, src_temp, disease_idx, disease_count);
         return true;
     }
@@ -722,6 +725,7 @@ fn update_neighbour_liquid_mass(
     }
     // 原版 L1243：目标是 void → 目标格质量清零
     if dst_elem_now == sim.void_element_idx {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
         updated.mass.set(dst_cell, 0.0);
         return true;
     }
@@ -734,10 +738,21 @@ fn update_neighbour_liquid_mass(
         return false;
     }
     if dst_state == 1 {
-        // 原版调 DisplaceGas（气体置换）；本任务 YAGNI 不实现气体置换，保守拒绝
-        return false;
+        // 原版 L1252-1257：目标气体 → 先 DisplaceGas 把气体**挤走**（单方向全量转移
+        // 到 [下/左/右/上] 候选），挤不走（四周均非目标元素/真空）→ 液体无法流入，返回 false。
+        // 2026-08-04 修复：此前直接 return false（YAGNI 占位）→ 液体永不水平推挤气体。
+        if !displace_gas(sim, dst_cell, dst_elem_now) {
+            return false;
+        }
+        // DisplaceGas 已把目标格清空（元素=真空、质量=0），继续按原版 L1261-1265 改回源液体元素。
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(dst_cell, src_elem);
+        add_mass_and_update_temperature(updated, dst_cell, amount, src_temp, disease_idx, disease_count);
+        push_substance_change(sim, dst_cell);
+        return true;
     }
     // 目标格元素改为源元素（原版 L1261）
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
     updated.element_idx.set(dst_cell, src_elem);
     add_mass_and_update_temperature(updated, dst_cell, amount, src_temp, disease_idx, disease_count);
     // 事件：ChangeSubstance（原版 L1265）—— 元素类型变化必须通知 C# 刷新画面
@@ -1453,11 +1468,11 @@ pub fn do_density_displacement(sim: &mut SimData, cell: usize, param_5: f32) -> 
             updated.temperature.get(cell),
         )
     };
-    // 原版 L1809-1811：mass[below] <= mass[cell] → false
-    if mass_below <= mass_cell {
-        return false;
-    }
-    // 原版 L1809-1811：temp[below] <= temp[cell] → false
+    // 原版分支 B（SimDLL_Source.c L147862-147900，CellSOA 布局 L11008-11020：
+    // 0x28=temperature、0x48=mass）：唯一门控 = **temp[below] > temp[cell]**
+    // （下方更暖才处理），**无 mass 门控**。气体 → 交换（暖上升）；液体 → 合并温度。
+    // 2026-08-04 审查纠正：基线自带的是 mass 检查（多余，误读 0x28/0x48），
+    // 温度检查才是原版语义——此前一度误删温度检查，已恢复。
     if temp_below <= temp_cell {
         return false;
     }
@@ -1526,7 +1541,8 @@ pub fn displace_gas(sim: &mut SimData, cell: usize, gas_elem: u16) -> bool {
         return false;
     }
     let len = updated.element_idx.len();
-    // 原版 L34068-34074：候选 = [下, 左, 右, 上]
+    // 原版 L34068-34074：候选 = [上(+width), 左(-1), 右(+1), 下(-width)]
+    //（原版 L136841-136844 local_60[0]=+width、[3]=-width；本项目约定 +width=上）
     let candidates = [cell + width, cell.wrapping_sub(1), cell + 1, cell.wrapping_sub(width)];
     let tick = sim.tick_count as usize;
     // 循环 1（L34075-34092）
@@ -1542,8 +1558,8 @@ pub fn displace_gas(sim: &mut SimData, cell: usize, gas_elem: u16) -> bool {
             return true;
         }
     }
-    // 循环 2（L34093-34121）：对角向下
-    let diag = [cell + width - 1, cell + width + 1]; // 左下、右下
+    // 循环 2（L34093-34121）：对角（+width 侧 = 上方）
+    let diag = [cell + width - 1, cell + width + 1]; // 左上、右上
     let sides = [cell.wrapping_sub(1), cell + 1]; // 左、右
     for i in 0..2 {
         let dir = (tick + i) & 1;
@@ -2304,10 +2320,14 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                         continue;
                     }
                     let updated = unsafe { &*sim.updated_cells.ptr };
-                    let mass = updated.mass.get(cand);
+                    // 原版 L149467：fVar24 读 updatedCells + 0x28 = **temperature** 数组
+                    //（CellSOA 布局 L11008-11020：elementIdx/temperature/mass/properties...）
+                    // → 候选选择"最低温度"气体格，非最低质量；old 版亦取温度。
+                    // 2026-08-04 审查修正：此前误读为 mass。
+                    let cand_temp = updated.temperature.get(cand);
                     if let Some((_, best_mass)) = best {
-                        if mass > best_mass {
-                            continue; // 原版 L2496：fVar24 <= fVar23（质量不优于当前最优）
+                        if cand_temp > best_mass {
+                            continue; // 原版 L2496：fVar24 <= fVar23（温度不优于当前最优）
                         }
                     }
                     if next_random(sim) <= 0.5 {
@@ -2319,15 +2339,18 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
                     if !is_gas {
                         continue;
                     }
-                    // 原版 L2506-2510：首次迭代（idx==0）不进入更重/等重气体
-                    if idx == 0 {
+                    // 原版 L2506-2510 标志位 [false,false,true]（L149459 CONCAT13 0x10000）：
+                    // 摩尔质量约束只作用于**第 3 个候选（下方格 cell-width）**——
+                    // 防止 O2 与下方更重 CO2 交换（CO2 上浮）；水平候选不受约束。
+                    // 2026-08-04 修正：此前误挂在 idx==0（水平候选），导致分层失效。
+                    if idx == 2 {
                         if let Some(cp) = cand_ppd {
                             if ppd.molar_mass <= cp.molar_mass {
                                 continue;
                             }
                         }
                     }
-                    best = Some((cand, mass));
+                    best = Some((cand, cand_temp));
                 }
                 if let Some((b, _)) = best {
                     let updated = unsafe { &mut *sim.updated_cells.ptr };
@@ -5088,6 +5111,69 @@ mod tests {
                 .collect();
             cells.sort();
             assert_eq!(cells, vec![5, 9]);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 气液水平置换（2026-08-04 修复，用户实测 Bug 3）：
+    /// 液体格 cell14（元素1）左侧 cell13 是气体（元素3）。
+    /// 原版 UpdateNeighbourLiquidMass 对气体目标先 DisplaceGas 把气体挤走，
+    /// 再把目标格改为液体元素并灌入流量 —— 此前直接 return false（液体不挤气体）。
+    /// 期望：cell13 变为液体（元素1）、气体（元素3）全量移到候选格、源格质量减少。
+    #[test]
+    fn update_liquid_displaces_gas_horizontally() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        // tick=0 → displace_gas 候选起始方向 = 下（cell7）
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                // cell14 = 液体（元素1）mass 100
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                // cell13 = 气体（元素3）mass 10
+                buf.element_idx.set(13, 3);
+                buf.mass.set(13, 10.0);
+                buf.temperature.set(13, 300.0);
+                // cell8 = 下方固体（阻止液体下落）；cell7 = 左下固体（阻止液滴斜落路径）
+                buf.element_idx.set(8, 4);
+                buf.mass.set(8, 1000.0);
+                buf.temperature.set(8, 300.0);
+                buf.element_idx.set(7, 4);
+                buf.mass.set(7, 1000.0);
+                buf.temperature.set(7, 300.0);
+                // cell12 = 气体左侧真空（气体逃逸候选）
+                buf.element_idx.set(12, 0);
+                buf.mass.set(12, 0.0);
+                buf.temperature.set(12, 0.0);
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(
+                updated.element_idx.get(13),
+                1,
+                "气体目标格应被液体占据（元素1）"
+            );
+            assert!(
+                updated.mass.get(13) > 0.0,
+                "液体应流入目标格，got {}",
+                updated.mass.get(13)
+            );
+            assert_eq!(
+                updated.element_idx.get(19),
+                3,
+                "气体应被挤到候选格（cell19 上方真空，tick=0 起始候选）"
+            );
+            assert!((updated.mass.get(19) - 10.0).abs() < 1e-3, "气体全量转移");
+            assert!(
+                updated.mass.get(14) < 100.0,
+                "源格质量应减少，got {}",
+                updated.mass.get(14)
+            );
         }
         DestroyElementsTable();
     }

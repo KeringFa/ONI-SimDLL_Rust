@@ -210,7 +210,8 @@ pub(crate) fn run_gas_displacement_task(
         return;
     }
     let iterate_dir = sim.iterate_direction;
-    // 4 方向：(dst_off, beyond_off) —— 下 / -iterateDir / +iterateDir / 上
+    // 4 方向：(dst_off, beyond_off) —— 下(-w) / -iterateDir / +iterateDir / 上(+w)
+    //（本项目约定 cell-width=下、cell+width=上，与 update_liquid 一致）
     let dirs: [(i32, i32); 4] = [
         (-w, -2 * w),
         (-iterate_dir, -2 * iterate_dir),
@@ -250,14 +251,11 @@ pub(crate) fn run_gas_displacement_task(
                 if cells.properties.get(dst) & 1 != 0 {
                     continue; // GasImpermeable
                 }
-                let beyond_elem = cells.element_idx.get(beyond);
-                let beyond_state = match elements_table::get_element_pressure_data(beyond_elem) {
-                    Some(pd) => pd.state & 3,
-                    None => continue,
-                };
-                if beyond_state != 1 {
-                    continue; // beyond 必须是气体（关键检查，阻止异常扩散进真空）
-                }
+                // beyond 检查由 do_gas_pressure_displacement 内部完成（原版
+                // L147502-147512：beyond 元素 == dst 元素 **或** vacuum，且可渗透）。
+                // ⚠️ 2026-08-04 审查修正：调用方不再预检"beyond 必须是气体"——
+                // 原版允许 beyond 为真空（气体可被推入真空格）；old 版为修 Bug1-4
+                // 加的预检是额外限制，与原始源码不符。
                 let f = do_gas_pressure_displacement(sim, src_elem, src, dst, beyond);
                 if f > 0.0 && !sim.flow.ptr.is_null() {
                     let flow = unsafe {
@@ -485,11 +483,12 @@ mod tests {
     }
 
     #[test]
-    fn different_gas_displacement_beyond_vacuum_blocked() {
+    fn different_gas_displacement_beyond_vacuum_allowed() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         init_gas_table();
         let mut sd = make_sim();
-        // cell 27 = 气体A 100kg；cell 28 = 气体B 10kg；cell 29 = 真空（beyond 非气体）
+        // cell 27 = 气体A 100kg；cell 28 = 气体B 10kg；cell 29 = 真空（beyond）
+        // 原版 L147502-147512：beyond 允许 == vacuum → 气体B 被顶入真空格。
         fill_both(&mut sd, |b| {
             b.element_idx.set(27, 1);
             b.mass.set(27, 100.0);
@@ -499,14 +498,17 @@ mod tests {
             b.temperature.set(28, 200.0);
             b.element_idx.set(29, 0);
             b.mass.set(29, 0.0);
+            b.temperature.set(29, 0.0);
         });
         let b = crate::d1_activity::full_grid_bounds(&sd);
         run_gas_displacement_task(&mut sd, b);
         unsafe {
             let u = &*sd.updated_cells.ptr;
-            // beyond 非气体 → 调用方预检查阻断 → dst 不变为气体A
-            assert_eq!(u.element_idx.get(28), 2, "beyond 为真空时不应发生异元素置换");
-            assert_eq!(u.mass.get(28), 10.0);
+            // beyond 真空 → 原版允许：dst 变为气体A、气体B 被顶到真空格
+            assert_eq!(u.element_idx.get(28), 1, "dst 应变气体A");
+            assert!(u.mass.get(28) > 10.0, "dst 应有气体A 流入");
+            assert_eq!(u.element_idx.get(29), 2, "beyond 真空格应收到气体B");
+            assert!((u.mass.get(29) - 10.0).abs() < 1e-3, "气体B 全量转移");
         }
     }
 
@@ -525,5 +527,125 @@ mod tests {
     /// 只翻转 iterateDirection 的 update_data 替身（避免整链依赖）。
     fn update_data_noop(sd: &mut SimData) {
         sd.iterate_direction = -sd.iterate_direction;
+    }
+
+    /// 复现表：0=真空、1=CO2(气体, molar 44)、2=O2(气体, molar 32)、3=固体。
+    fn init_stratify_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        table.elements.clear();
+        table.element_names.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        let specs = [
+            (0i32, 0u8, 0.0f32, 0.0f32),   // 真空
+            (1i32, 1u8, 1.0f32, 44.0f32),  // CO2
+            (2i32, 1u8, 1.0f32, 32.0f32),  // O2
+            (3i32, 3u8, 0.0f32, 100.0f32), // 固体
+        ];
+        for (id, state, flow, molar) in specs {
+            let mut elem = Element::default();
+            elem.id = id;
+            elem.state = state;
+            elem.flow = flow;
+            elem.molar_mass = molar;
+            table.elements.push(elem);
+            table.state_data.push(ElementStateData { state });
+            table.liquid_data.push(crate::b_elements::element::ElementLiquidData {
+                state,
+                flow,
+                viscosity: 50.0,
+                max_mass: 1000.0,
+                ..Default::default()
+            });
+            table.pressure_data.push(ElementPressureData { state, flow });
+            table.post_process_data.push(crate::b_elements::element::ElementPostProcessData {
+                state,
+                molar_mass: molar,
+                max_mass: 1000.0,
+                ..Default::default()
+            });
+        }
+        table.element_indices.insert(0u32, 0u16);
+        table.element_indices.insert(1u32, 1u16);
+        table.element_indices.insert(2u32, 2u16);
+        table.element_indices.insert(3u32, 3u16);
+    }
+
+    /// 回归（2026-08-04 用户实测 Bug 2）：12×8 真空房间（含边界 14×10），
+    /// 上 4 行 CO2 100kg、下 4 行 O2 200kg。原版运行一会后 CO2 全部沉底。
+    /// 修复前随机交换的摩尔质量约束误挂在水平候选上 → 分层失效（CO2/O2 全图混合）；
+    /// 修复后约束挂在下方候选（原版标志位 [false,false,true]）→ CO2 全部沉底。
+    #[test]
+    fn gas_stratification_co2_sinks_below_o2() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_stratify_table();
+        let mut sd = SimData::new_for_allocate(14, 10, 12345, false, true);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        let w = sd.width as usize;
+        let h = sd.height as usize;
+        fill_both(&mut sd, |b| {
+            for y in 0..h {
+                for x in 0..w {
+                    let c = y * w + x;
+                    // 边界（row 0/9、col 0/13）= 固体
+                    if y == 0 || y == h - 1 || x == 0 || x == w - 1 {
+                        b.element_idx.set(c, 3);
+                        b.mass.set(c, 1000.0);
+                        b.temperature.set(c, 300.0);
+                        continue;
+                    }
+                    // 内部：row 1..4 = O2(2)，row 5..8 = CO2(1)
+                    let elem = if y >= 5 { 1u16 } else { 2u16 };
+                    let mass = if elem == 1 { 100.0 } else { 200.0 };
+                    b.element_idx.set(c, elem);
+                    b.mass.set(c, mass);
+                    b.temperature.set(c, 300.0);
+                }
+            }
+        });
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        // 每帧 = 原版 UpdateData 气体阶段 + PostProcess 阶段
+        let mut trend: Vec<(usize, f32, f32)> = Vec::new();
+        for frame in 0..50000 {
+            unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
+            sd.iterate_direction = -sd.iterate_direction;
+            crate::c2_physics::gas_flow::run_gas_pressure_task(&mut sd, b);
+            crate::c2_physics::gas_flow::run_gas_displacement_task(&mut sd, b);
+            unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
+            crate::c2_physics::liquid_flow::post_process_loop(&mut sd, b);
+
+            if [1000usize, 5000, 15000, 30000, 45000].contains(&(frame + 1)) {
+                let (mut co2_bottom, mut co2_top) = (0.0f32, 0.0f32);
+                for y in 1..h - 1 {
+                    for x in 1..w - 1 {
+                        let c = y * w + x;
+                        let e = unsafe { (*sd.updated_cells.ptr).element_idx.get(c) };
+                        if e == 1 {
+                            if y <= 4 {
+                                co2_bottom += unsafe { (*sd.updated_cells.ptr).mass.get(c) };
+                            } else {
+                                co2_top += unsafe { (*sd.updated_cells.ptr).mass.get(c) };
+                            }
+                        }
+                    }
+                }
+                trend.push((frame + 1, co2_bottom, co2_top));
+            }
+        }
+        let last = trend.last().copied().unwrap_or((0, 0.0, 0.0));
+        eprintln!("gas_stratification trend={trend:?}");
+        // 趋势：1000 帧时大部分 CO2 已沉入下半区；45000 帧时上半区 CO2 应归零。
+        assert!(
+            trend.len() >= 5 && trend[0].1 > 4000.0,
+            "1000 帧时下半区 CO2 应 >4000kg（总 4800kg），趋势={trend:?}"
+        );
+        assert!(
+            last.2 < 1.0,
+            "45000 帧时上半区 CO2 应归零（全部沉底），趋势={trend:?}"
+        );
     }
 }
