@@ -64,6 +64,12 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     // 步骤 14+: 其他 Component 消息处理（C2 桩）
     process_component_messages_stubs(frame, sim_data);
 
+    // RadiationEmitter 消息（阶段 B：adds→modifies→removes）
+    crate::c_simulation::radiation_emitter::process_radiation_emitter_messages(frame, sim_data);
+    frame.radiation_emitter_messages.adds.clear_keep_capacity();
+    frame.radiation_emitter_messages.modifies.clear_keep_capacity();
+    frame.radiation_emitter_messages.removes.clear_keep_capacity();
+
     // 原版 ProcessFrame 末尾（L117034-117046）：frame.debugProperties → simData.debugProperties。
     // 缺失导致 building_temperature_scale 恒 0 → 建筑↔格子换热 k=0 失效，is_debug_editing 恒 false。
     sim_data.debug_properties = frame.debug_properties;
@@ -1843,11 +1849,6 @@ fn process_component_messages_stubs(frame: &mut SimFrameInfo, _sim_data: &mut Si
     frame.disease_consumer_messages.adds.clear_keep_capacity();
     frame.disease_consumer_messages.modifies.clear_keep_capacity();
     frame.disease_consumer_messages.removes.clear_keep_capacity();
-
-    // radiation_emitter_messages
-    frame.radiation_emitter_messages.adds.clear_keep_capacity();
-    frame.radiation_emitter_messages.modifies.clear_keep_capacity();
-    frame.radiation_emitter_messages.removes.clear_keep_capacity();
 
     // radiation_params_modifications
     frame.radiation_params_modifications.clear_keep_capacity();

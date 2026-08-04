@@ -256,6 +256,12 @@ pub fn update_data(sim_data: &mut SimData) {
         // 辐射模拟（原版 L42594-42914：UpdateComponents 前；radiationEnabled 门控，
         // 单星零执行；cosmic_intensity = 当前区域 currentCosmicRadiationIntensity）
         crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
+        // RadiationEmitter 组件（阶段 B：建筑/生物辐射；radiationEnabled 门控，单星零执行）
+        crate::c_simulation::radiation_emitter::update_radiation_emitters_global(
+            sim_data,
+            0.2,
+            bounds,
+        );
         // PostProcessCell（原版 L43023：挤压/密度分层/升华）
         crate::c2_physics::liquid_flow::post_process_loop(sim_data, bounds);
     }

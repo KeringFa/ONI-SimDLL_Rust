@@ -12,6 +12,8 @@
 use crate::a_framework::game_data::ComponentStateChangedMessage;
 use crate::a_framework::sim_data::SimData;
 use crate::d1_activity::RegionBounds;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 
 /// RadiationEmitterType（00_types_reference.c L8574-8581）。
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -163,6 +165,7 @@ pub struct RadiationEmitterRegistry {
     versions: Vec<u8>,
     free_handles: Vec<i32>,
     pending_remove: Vec<(i32, i32)>, // (handle, callback_idx) 延迟释放缓冲
+    release_rounds: u32,
 }
 
 impl RadiationEmitterRegistry {
@@ -173,6 +176,7 @@ impl RadiationEmitterRegistry {
             versions: Vec::new(),
             free_handles: Vec::new(),
             pending_remove: Vec::new(),
+            release_rounds: 0,
         }
     }
 
@@ -182,6 +186,7 @@ impl RadiationEmitterRegistry {
         self.versions.clear();
         self.free_handles.clear();
         self.pending_remove.clear();
+        self.release_rounds = 0;
     }
 
     pub fn record(&self, handle: i32) -> Option<&RadiationEmitterData> {
@@ -264,16 +269,16 @@ impl RadiationEmitterRegistry {
         self.pending_remove.push((handle, callback_idx));
     }
 
-    /// 延迟释放：每帧调用；记录已排队两轮 → 释放 + 回调推 -1。
-    pub fn release_queued_handles(&mut self, sim: &mut SimData, rounds: &mut u32) {
+    /// 延迟释放：每帧调用一次；记录已排队两轮 → 释放 + 回调推 -1。
+    pub fn release_queued_handles(&mut self, sim: &mut SimData) {
         if self.pending_remove.is_empty() {
             return;
         }
-        *rounds += 1;
-        if *rounds < 2 {
+        self.release_rounds += 1;
+        if self.release_rounds < 2 {
             return;
         }
-        *rounds = 0;
+        self.release_rounds = 0;
         let pending = std::mem::take(&mut self.pending_remove);
         for (handle, callback_idx) in pending {
             let index = (handle & 0xffffff) as usize;
@@ -287,6 +292,50 @@ impl RadiationEmitterRegistry {
             }
         }
     }
+}
+
+// ===== 全局管理器（仿 element_emitter）=====
+
+static RADIATION_EMITTER_MANAGER: Lazy<Mutex<RadiationEmitterRegistry>> =
+    Lazy::new(|| Mutex::new(RadiationEmitterRegistry::new()));
+
+pub fn clear_radiation_emitters() {
+    RADIATION_EMITTER_MANAGER.lock().clear();
+}
+
+pub fn radiation_emitter_count() -> usize {
+    RADIATION_EMITTER_MANAGER.lock().active_count()
+}
+
+/// 处理帧内 radiation_emitter_messages：adds → modifies → removes（含延迟释放）。
+pub fn process_radiation_emitter_messages(frame: &crate::a_framework::sim_frame_manager::SimFrameInfo, sim: &mut SimData) {
+    let mut mgr = RADIATION_EMITTER_MANAGER.lock();
+    for b in frame.radiation_emitter_messages.adds.as_slice().chunks(36) {
+        if let Some(msg) = AddRadiationEmitterMsg::from_bytes(b) {
+            mgr.register(sim, &msg);
+        }
+    }
+    for b in frame.radiation_emitter_messages.modifies.as_slice().chunks(40) {
+        if let Some(msg) = ModifyRadiationEmitterMsg::from_bytes(b) {
+            mgr.modify(sim, &msg);
+        }
+    }
+    for b in frame.radiation_emitter_messages.removes.as_slice().chunks(8) {
+        if let Some(msg) = RemoveRadiationEmitterMsg::from_bytes(b) {
+            mgr.remove(msg.handle, msg.callback_idx);
+        }
+    }
+}
+
+/// 延迟释放（sim 线程每帧调用一次）。
+pub fn release_queued_handles_global(sim: &mut SimData) {
+    RADIATION_EMITTER_MANAGER.lock().release_queued_handles(sim);
+}
+
+/// 组件 Update（全局版）。
+pub fn update_radiation_emitters_global(sim: &mut SimData, dt: f32, bounds: RegionBounds) {
+    let mut mgr = RADIATION_EMITTER_MANAGER.lock();
+    update_radiation_emitters(sim, &mut mgr, dt, bounds);
 }
 
 fn push_state_changed(sim: &mut SimData, callback_idx: i32, sim_handle: i32) {
@@ -730,6 +779,74 @@ mod tests {
         DestroyElementsTable();
     }
 
+    /// 任务 4a：DLC 门控——radiationEnabled=false → update 零执行。
+    #[test]
+    fn emitter_gated_by_enabled_flag() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        sd.radiation_enabled = false;
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(0.0);
+        w.write_float(1.0);
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(0);
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        reg.register(&mut sd, &msg);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_radiation_emitters(&mut sd, &mut reg, 1.0, bounds);
+        unsafe {
+            assert_eq!(
+                (*sd.updated_cells.ptr).radiation.get(12),
+                0.0,
+                "单星门控：发射器零执行"
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 4b：帧消息处理——adds 36B 注册进全局管理器。
+    #[test]
+    fn emitter_frame_messages_register_global() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        clear_radiation_emitters();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(0.0);
+        w.write_float(1.0);
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(0);
+        let bytes = w.into_bytes();
+        let mut frame = crate::a_framework::sim_frame_manager::SimFrameInfo::default();
+        for &b in &bytes {
+            frame.radiation_emitter_messages.adds.push_unchecked(b);
+        }
+        process_radiation_emitter_messages(&frame, &mut sd);
+        assert_eq!(radiation_emitter_count(), 1, "36B Add 应注册 1 个发射器");
+        clear_radiation_emitters();
+        DestroyElementsTable();
+    }
+
     #[test]
     fn emitter_message_sizes() {
         assert_eq!(std::mem::size_of::<AddRadiationEmitterMsg>(), 36);
@@ -787,10 +904,9 @@ mod tests {
         assert_eq!(reg.record(h).unwrap().emit_radius_x, 5);
         // Remove（延迟两轮）→ 记录失效 + 回调推 -1
         reg.remove(h, 9);
-        let mut rounds = 0u32;
-        reg.release_queued_handles(&mut sd, &mut rounds);
+        reg.release_queued_handles(&mut sd);
         assert!(reg.record(h).is_some(), "第一轮不释放");
-        reg.release_queued_handles(&mut sd, &mut rounds);
+        reg.release_queued_handles(&mut sd);
         assert!(reg.record(h).is_none(), "第二轮释放");
         unsafe {
             let events = &*sd.sim_events.ptr;

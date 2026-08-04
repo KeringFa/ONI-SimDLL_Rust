@@ -88,6 +88,15 @@ pub fn sim_main_loop(sim_ptr: *mut Sim) {
         // 对照源码 L2113-2116: if (gConduitTemperatureManager != null) ReleaseQueuedHandles
         // 回收上一轮延迟释放的管道温度句柄（Remove 后两轮真正释放，防止遍历中复用）
         crate::c_simulation::conduit_temperature::release_queued_handles_global();
+        // RadiationEmitter 延迟释放（两轮后回收，同管道温度管理器模式）
+        {
+            let sim_data_ptr = globals::G_SIM_DATA.lock().0;
+            if !sim_data_ptr.is_null() {
+                crate::c_simulation::radiation_emitter::release_queued_handles_global(
+                    unsafe { &mut *sim_data_ptr },
+                );
+            }
+        }
 
         // 4. 获取 gSimData
         // 对照源码 L2117: this_00 = gSimData
