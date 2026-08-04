@@ -11,6 +11,7 @@ pub mod liquid_flow;
 pub mod property_texture;
 pub mod temperature;
 pub mod gas_flow;
+pub mod radiation;
 
 /// SimBase::UpdateData 的桩实现。
 ///
@@ -170,18 +171,27 @@ pub fn update_data(sim_data: &mut SimData) {
     // 温度任务 → CopyFrom → 压力 → 液体 → 太空真空 → PostProcess。
     // 无活动区域时回退整张内部网格（测试环境无区域数据；原版此时区域循环不执行，
     // 但生产环境始终 ≥1 个已发现世界，回退不会改变生产行为）。
-    let region_bounds: Vec<crate::d1_activity::RegionBounds> = {
+    let (region_bounds, region_cosmic): (Vec<crate::d1_activity::RegionBounds>, Vec<f32>) = {
         let regions = sim_data.active_regions.as_slice();
         if regions.is_empty() {
-            vec![crate::d1_activity::full_grid_bounds(sim_data)]
+            (
+                vec![crate::d1_activity::full_grid_bounds(sim_data)],
+                vec![0.0],
+            )
         } else {
-            regions
-                .iter()
-                .map(|r| crate::d1_activity::compute_region_bounds(sim_data, r))
-                .collect()
+            (
+                regions
+                    .iter()
+                    .map(|r| crate::d1_activity::compute_region_bounds(sim_data, r))
+                    .collect(),
+                regions
+                    .iter()
+                    .map(|r| r.current_cosmic_radiation_intensity)
+                    .collect(),
+            )
         }
     };
-    for bounds in region_bounds {
+    for (bounds, cosmic_intensity) in region_bounds.into_iter().zip(region_cosmic.into_iter()) {
         if bounds.is_empty() {
             continue;
         }
@@ -243,6 +253,9 @@ pub fn update_data(sim_data: &mut SimData) {
         // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
         // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
         crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, bounds);
+        // 辐射模拟（原版 L42594-42914：UpdateComponents 前；radiationEnabled 门控，
+        // 单星零执行；cosmic_intensity = 当前区域 currentCosmicRadiationIntensity）
+        crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
         // PostProcessCell（原版 L43023：挤压/密度分层/升华）
         crate::c2_physics::liquid_flow::post_process_loop(sim_data, bounds);
     }

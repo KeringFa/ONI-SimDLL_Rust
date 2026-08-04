@@ -1,0 +1,333 @@
+//! C2 辐射模拟（阶段 A：格子级辐射核心）。
+//!
+//! 对照原版 11_msvcrt_ignored.c L42594-42914（UpdateData 辐射段）：
+//! 1. 宇宙辐射 occlusion（自顶向下，元素 radiationAbsorptionFactor 遮挡）；
+//! 2. 衰减（radiation -= radiation/lingerRate，零值 −1 清理）；
+//! 3. 元素辐射扩散（25 格权重核，mass×0.001×radsPer1000×weight）；
+//! 4. 宇宙辐射应用（occlusion>0 → radiation += cosmic/lingerRate × occlusion）；
+//! 5. 钳制 [0, 9e6]，≤0.01 → 0。
+//!
+//! ⚠️ DLC 专属门控：全部逻辑包在 `sim.radiation_enabled` 内（原版 L42594），
+//! 单星（AllocateCells flag1=false）零执行，cells.radiation 恒 0。
+use crate::a_framework::sim_data::SimData;
+use crate::b_elements::elements_table;
+use crate::d1_activity::RegionBounds;
+
+/// 25 格元素辐射权重核（原版 L42602-42658 adjacentOffsets：dx, dy, weight）。
+const KERNEL: [(i32, i32, f32); 25] = [
+    (-2, -2, 0.1),
+    (-1, -2, 0.15),
+    (0, -2, 0.25),
+    (1, -2, 0.15),
+    (2, -2, 0.1),
+    (-2, -1, 0.15),
+    (-1, -1, 0.5),
+    (0, -1, 0.75),
+    (1, -1, 0.5),
+    (2, -1, 0.15),
+    (-2, 0, 0.25),
+    (-1, 0, 0.75),
+    (0, 0, 1.0),
+    (1, 0, 0.75),
+    (2, 0, 0.25),
+    (-2, 1, 0.15),
+    (-1, 1, 0.5),
+    (0, 1, 0.75),
+    (1, 1, 0.5),
+    (2, 1, 0.15),
+    (-2, 2, 0.1),
+    (-1, 2, 0.15),
+    (0, 2, 0.25),
+    (1, 2, 0.15),
+    (2, 2, 0.1),
+];
+
+/// 原版 SIM_MAX_RADIATION（L42903）。
+const SIM_MAX_RADIATION: f32 = 9e6;
+
+/// 辐射模拟（原版 UpdateData L42594-42914，radiationEnabled 门控）。
+/// `cosmic_intensity` = 当前 active region 的 currentCosmicRadiationIntensity。
+pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intensity: f32) {
+    if !sim.radiation_enabled {
+        return;
+    }
+    let w = sim.width as usize;
+    let h = sim.height as usize;
+    if w < 3 || h < 3 || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let total = w * h;
+    let (min_x, min_y, max_x, max_y) = (bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y);
+    if min_x > max_x || min_y > max_y || max_x >= w || max_y >= h {
+        return;
+    }
+    let max_mass = sim.radiation_max_mass;
+    let linger = sim.radiation_linger_rate;
+    let base_w = sim.radiation_base_weight;
+    let dens_w = sim.radiation_density_weight;
+    let const_f = sim.radiation_constructed_factor;
+
+    // occlusion 缓冲：全网格填 1.0（原版 L42688 resize 初值 1.0）
+    sim.cosmic_radiation_occlusion.resize(total, 1.0);
+    for i in 0..total {
+        sim.cosmic_radiation_occlusion.set(i, 1.0);
+    }
+
+    // —— 第一遍：top→bottom（y 从 max_y 递减，上方格 cell+width 先算）——
+    // occlusion + 衰减
+    for y in (min_y..=max_y).rev() {
+        for x in min_x..=max_x {
+            let cell = y * w + x;
+            let (elem, props, mass, rad) = {
+                let u = unsafe { &*sim.updated_cells.ptr };
+                (
+                    u.element_idx.get(cell),
+                    u.properties.get(cell),
+                    u.mass.get(cell),
+                    u.radiation.get(cell),
+                )
+            };
+            let factor = match elements_table::get_element_radiation_data(elem) {
+                Some(d) => d.factor,
+                None => 0.0,
+            };
+            // block：构造格（props & 0x80）→ factor×constructedFactor；否则质量加权
+            let block = if props & 0x80 != 0 {
+                factor * const_f
+            } else {
+                (mass / max_mass) * factor * dens_w + factor * base_w
+            };
+            let block = block.clamp(0.0, 1.0);
+            let above_occ = if cell + w < total {
+                sim.cosmic_radiation_occlusion.get(cell + w)
+            } else {
+                1.0
+            };
+            sim.cosmic_radiation_occlusion.set(cell, (1.0 - block) * above_occ);
+
+            // 衰减（原版 L42785-42810）
+            let f = rad / linger;
+            let new_rad = if f == 0.0 {
+                (rad - 1.0).max(0.0)
+            } else {
+                (rad - f).max(0.0)
+            };
+            let u = unsafe { &mut *sim.updated_cells.ptr };
+            u.radiation.set(cell, new_rad);
+        }
+    }
+
+    // —— 第二遍：元素扩散 → 宇宙应用 → 钳制 ——
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let cell = y * w + x;
+            let (elem, mass) = {
+                let u = unsafe { &*sim.updated_cells.ptr };
+                (u.element_idx.get(cell), u.mass.get(cell))
+            };
+            let rads_per_1000 = match elements_table::get_element_radiation_data(elem) {
+                Some(d) => d.rads_per_1000,
+                None => 0.0,
+            };
+            // 元素辐射扩散（原版 L42810-42850）
+            if rads_per_1000 > 0.0 {
+                for &(dx, dy, weight) in &KERNEL {
+                    let tx = x as i32 + dx;
+                    let ty = y as i32 + dy;
+                    if tx >= min_x as i32
+                        && tx <= max_x as i32
+                        && ty >= min_y as i32
+                        && ty <= max_y as i32
+                    {
+                        let t = (ty as usize) * w + (tx as usize);
+                        let add = mass * 0.001 * rads_per_1000 * weight;
+                        let u = unsafe { &mut *sim.updated_cells.ptr };
+                        u.radiation.set(t, u.radiation.get(t) + add);
+                    }
+                }
+            }
+            // 宇宙辐射应用（原版 L42875-42884）
+            let occ = sim.cosmic_radiation_occlusion.get(cell);
+            if occ > 0.0 {
+                let u = unsafe { &mut *sim.updated_cells.ptr };
+                u.radiation.set(cell, u.radiation.get(cell) + (cosmic_intensity / linger) * occ);
+            }
+            // 钳制（原版 L42885-42910）
+            let u = unsafe { &mut *sim.updated_cells.ptr };
+            let mut r = u.radiation.get(cell).clamp(0.0, SIM_MAX_RADIATION);
+            if r <= 0.01 {
+                r = 0.0;
+            }
+            u.radiation.set(cell, r);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a_framework::sim_data::SimData;
+    use crate::b_elements::element::Element;
+    use crate::b_elements::elements_table::{DestroyElementsTable, G_ELEMENTS_TABLE};
+    use crate::LIB_TESTS_LOCK;
+
+    /// 最小元素表：0=真空（factor=0）、1=固体（factor=0.5, rads=0）、
+    /// 2=放射性元素（factor=0.2, radsPer1000=1000）。
+    fn init_radiation_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        table.elements.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        table.radiation_data.clear();
+        for (id, state, factor, rads) in [
+            (0i32, 0u8, 0.0f32, 0.0f32),
+            (1i32, 3u8, 0.5f32, 0.0f32),
+            (2i32, 3u8, 0.2f32, 1000.0f32),
+        ] {
+            let mut e = Element::default();
+            e.id = id;
+            e.state = state;
+            table.elements.push(e);
+            table.state_data.push(crate::b_elements::element::ElementStateData { state });
+            table.liquid_data.push(crate::b_elements::element::ElementLiquidData {
+                state,
+                ..Default::default()
+            });
+            table.pressure_data.push(crate::b_elements::element::ElementPressureData {
+                state,
+                ..Default::default()
+            });
+            table.post_process_data.push(crate::b_elements::element::ElementPostProcessData {
+                state,
+                ..Default::default()
+            });
+            table.radiation_data.push(crate::b_elements::element::ElementRadiationData {
+                factor,
+                rads_per_1000: rads,
+            });
+        }
+        table
+            .element_indices
+            .insert(0u32, 0u16);
+        table.element_indices.insert(1u32, 1u16);
+        table.element_indices.insert(2u32, 2u16);
+    }
+
+    fn make_sim() -> SimData {
+        let mut sd = SimData::new_for_allocate(8, 8, 1, true, false); // radiation_enabled=true
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        sd.radiation_linger_rate = 1.1;
+        sd.radiation_max_mass = 2000.0;
+        sd.radiation_base_weight = 0.3;
+        sd.radiation_density_weight = 0.7;
+        sd.radiation_constructed_factor = 0.8;
+        sd
+    }
+
+    fn fill_both(sd: &mut SimData, f: impl Fn(&mut crate::a_framework::sim_data::CellSOA)) {
+        unsafe {
+            f(&mut *sd.cells.ptr);
+            f(&mut *sd.updated_cells.ptr);
+        }
+    }
+
+    /// 任务 3a：DLC 门控——radiation_enabled=false → 零执行（辐射不变、occlusion 不被填）。
+    #[test]
+    fn radiation_task_gated_by_enabled_flag() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        let mut sd = make_sim();
+        sd.radiation_enabled = false;
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(14, 2);
+            b.mass.set(14, 10.0);
+            b.radiation.set(14, 5.0);
+        });
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, b, 100.0);
+        unsafe {
+            assert_eq!((*sd.updated_cells.ptr).radiation.get(14), 5.0, "单星门控：辐射不变");
+        }
+        assert_eq!(sd.cosmic_radiation_occlusion.len(), 0, "门控：occlusion 缓冲不被填");
+        DestroyElementsTable();
+    }
+
+    /// 任务 3b：元素辐射扩散——cell14 放射性元素（mass=10, rads=1000）
+    /// → 中心格 +10×0.001×1000×1.0 = 10；距离 1 权重 0.75 → +7.5。
+    #[test]
+    fn radiation_task_spreads_element_kernel() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(14, 2);
+            b.mass.set(14, 10.0);
+        });
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, b, 0.0);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!((u.radiation.get(14) - 10.0).abs() < 1e-4, "中心格 +10");
+            assert!((u.radiation.get(13) - 7.5).abs() < 1e-4, "左邻 0.75 权重 +7.5");
+            assert!((u.radiation.get(12) - 2.5).abs() < 1e-4, "距离2 0.25 权重 +2.5");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 3c：宇宙 occlusion + 应用——上方真空 → occlusion=1 → cosmic 累加；
+    /// 固体（factor=0.5, mass 大）→ occlusion 衰减。
+    #[test]
+    fn radiation_task_cosmic_occlusion_and_apply() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        let mut sd = make_sim();
+        // cell 13（行1 列5）= 固体 1；cell 21（行2 列5）= 真空 0；cell 29（行3 列5）= 真空 0（顶）
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(13, 1);
+            b.mass.set(13, 2000.0);
+            b.element_idx.set(21, 0);
+            b.element_idx.set(29, 0);
+        });
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, b, 110.0);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            // 顶行 29：occlusion=1 → cosmic/linger × 1 = 110/1.1 = 100
+            assert!((u.radiation.get(29) - 100.0).abs() < 1e-3, "顶行 cosmic 应用 100");
+            // 行2 真空：occlusion=1 → +100
+            assert!((u.radiation.get(21) - 100.0).abs() < 1e-3, "真空行 cosmic 100");
+            // 行1 固体：block=(2000/2000)×0.5×0.7 + 0.5×0.3 = 0.5；occlusion=0.5 → +50
+            assert!((u.radiation.get(13) - 50.0).abs() < 1e-3, "固体遮挡后 cosmic 50");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 3d：衰减 + 钳制——radiation=5，linger=1.1 → 5−5/1.1≈0.4545；
+    /// 极小值（0.005）→ 清零；超大值（1e7）→ 钳到 9e6。
+    #[test]
+    fn radiation_task_decay_and_clamp() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(14, 0);
+            b.radiation.set(14, 5.0);
+            b.radiation.set(21, 0.005);
+            b.radiation.set(28, 1e8);
+        });
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, b, 0.0);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            let expect = 5.0 - 5.0 / 1.1;
+            assert!((u.radiation.get(14) - expect).abs() < 1e-3, "衰减 5−5/1.1");
+            assert_eq!(u.radiation.get(21), 0.0, "≤0.01 清零");
+            assert!((u.radiation.get(28) - 9e6).abs() < 1.0, "钳到 9e6（衰减后仍超上限）");
+        }
+        DestroyElementsTable();
+    }
+}

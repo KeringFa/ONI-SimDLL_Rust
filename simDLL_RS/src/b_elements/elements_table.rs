@@ -202,6 +202,16 @@ pub fn get_element_light_absorption_data(elem_idx: u16) -> Option<ElementLightAb
     }
 }
 
+/// 查询元素辐射数据（gElementRadiationData，8B）。
+/// 辐射模块（阶段 A）：factor 参与宇宙辐射遮挡，rads_per_1000 参与元素辐射扩散。
+pub fn get_element_radiation_data(elem_idx: u16) -> Option<ElementRadiationData> {
+    let idx = elem_idx as usize;
+    match G_ELEMENTS_TABLE.lock() {
+        Ok(table) => table.radiation_data.get(idx).copied(),
+        Err(e) => e.into_inner().radiation_data.get(idx).copied(),
+    }
+}
+
 // ===== 内部实现函数 =====
 
 /// 销毁元素表（清空 11 个数据 vector + element_indices）。
