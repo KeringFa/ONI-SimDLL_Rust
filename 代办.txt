@@ -859,3 +859,37 @@ StepTheSim 从 GDU 重取（无 C# 缓存），残留必来自旧发射器继续
   改共享原语需全量回归（所有组件都用它）。
 - **待办**：与"元素表每格加锁性能"合并立项，专项处理。
 
+## [已完成] 辐射模块全量对照审查（2026-08-04 内联）
+
+- 报告：.superpowers/sdd/review-radiation.md
+- **结论：可以继续**——无 Critical/Important 遗留；4 项修复（bdc4b18）全部
+  有回归测试；全量 473 测试串行全过；release 构建成功。
+
+**本轮修复（对照原版反编译，均经 TDD）**：
+1. **RadiationAbsorptionAlongLine 整数 Bresenham → 原版半步 DDA**
+   （L39249）：|dy|>|dx| 斜率下两者访问的格子集合不同（实测差一格），
+   斜射经过的遮挡格因此不同；重写并按原版"主轴从较小坐标走到较大者"
+   处理方向（原版排序后主轴恒 +1）。
+2. **tickConstant 低 falloff 抖动公式**（L40280-40291）：next_random 此前
+   归一化到 [0,1] 后调用处仍乘 7.629627e-06 → 随机项趋零，抖动退化为恒定
+   −12.5%；改为返回原始 (seed>>16 & 0x7fff)，恢复 ±12.5% 均匀抖动。
+3. **CellRadiationModification 钳零回调**（06_process_messages.c L341-372）：
+   结果 ≤0 清零时回调 radiation 记**修改前原值**（此前记 delta，辐射消费者
+   收到的消耗量错误）。
+4. **occlusion < 0.01 → 0 阈值**（L42760-42775）：近全遮挡格不再累加 cosmic。
+
+**核对通过（无差异）**：消息布局（Add 36B/Modify 40B/Remove 8B/CellRad 12B/
+Params 8B）、Update 时序与 stepTimer 累加器、tickConstant 椭圆 falloff、
+tickPulsing/SetCircleAA 轮廓环（上轮修复）、inRadialRange、Modify 钳制与
+时序不重置、版本句柄与延迟释放、辐射任务公式（occlusion/衰减/25 格核/
+cosmic/钳制）、接线顺序（辐射任务→UpdateComponents(0.2,region)）、DLC 门控。
+
+**记录（依赖未实现）**：病菌辐射贡献（RadiationSickness → +count×0.001，
+L42860-42870）依赖病菌表，留待病菌模块实现时补。
+
+**保留的等价防御（Minor）**：tickConstant 0 半径 max(1)（原版除零）、
+线走查越界跳过（原版断言）。
+
+**下一步**：阶段 C（辐射消费/生物辐射）待用户决策；或按计划推进
+（气体模拟之后的模块）。
+
