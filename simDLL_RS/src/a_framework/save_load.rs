@@ -359,12 +359,6 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         let backwall_ptr = sim_data.backwall.ptr;
         if !backwall_ptr.is_null() {
             let backwall = unsafe { &mut *backwall_ptr };
-            // 2026-08-04 诊断（临时）：存档背墙 hash 统计 + 顶部（太空）行样本，
-            // 用于确认原版存档太空背墙 = 真空 hash(0x2d39bf75) 时，加载后索引是否还原为真空。
-            let mut diag_top_vac = 0u64;
-            let mut diag_top_zero = 0u64;
-            let mut diag_top_void = 0u64;
-            let mut diag_samples: Vec<(i64, i64, u32, u16)> = Vec::new();
 
             for row in 0..save_height as i64 {
                 let row_start = offset as i64 + row * (stride as i64);
@@ -382,17 +376,6 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
 
                     // L166: GetElementIndex
                     let bw_elem = elements_table::get_element_index_pub(elem_hash);
-                    if row >= save_height as i64 - 25 {
-                        match elem_hash {
-                            0x2d39bf75 => diag_top_vac += 1,
-                            0xa9360b34 => diag_top_void += 1,
-                            0 => diag_top_zero += 1,
-                            _ => {}
-                        }
-                        if diag_samples.len() < 3 && row == save_height as i64 - 1 {
-                            diag_samples.push((row, col, elem_hash, bw_elem));
-                        }
-                    }
                     backwall.element_idx.set(cell_idx, bw_elem);
 
                     // L177-178: 读取 mass
@@ -415,17 +398,6 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
                     };
                     backwall.temperature.set(cell_idx, bw_temp);
                 }
-            }
-            if save_height > 0 {
-                tracing::info!(
-                    diag_top_vac,
-                    diag_top_zero,
-                    diag_top_void,
-                    vacuum_idx = sim_data.vacuum_element_idx,
-                    void_idx = sim_data.void_element_idx,
-                    ?diag_samples,
-                    "Load: backwall top-25 rows diag (space)"
-                );
             }
         }
     }
@@ -1435,42 +1407,6 @@ pub fn begin_save(
             let bw_mass_slice = backwall.mass.as_slice();
             let bw_temp_slice = backwall.temperature.as_slice();
 
-            // 2026-08-04 诊断（临时）：BeginSave 时背墙 element_idx 分布统计。
-            // 根因确认后：原版存档背墙实为真空 hash（0x2d39bf75）；
-            // 此前"全 0"是 handle_load 漏读 disease_count（4B/格 → 应为 8B/格）
-            // 导致背墙段偏移 4B/格、把 disease_count 当成背墙 hash 的假象。
-            {
-                let vacuum_idx = elements_table::get_element_index_pub(0x2d39bf75);
-                let mut n_ffff = 0u64;
-                let mut n_zero = 0u64;
-                let mut n_vac = 0u64;
-                let mut n_other = 0u64;
-                let mut other_samples: Vec<(usize, u16)> = Vec::new();
-                for i in 0..total_cells {
-                    let v = bw_elem_idx_slice.get(i).copied().unwrap_or(0xffff);
-                    match v {
-                        0xffff => n_ffff += 1,
-                        0 => n_zero += 1,
-                        x if x == vacuum_idx => n_vac += 1,
-                        x => {
-                            n_other += 1;
-                            if other_samples.len() < 8 {
-                                other_samples.push((i, x));
-                            }
-                        }
-                    }
-                }
-                tracing::info!(
-                    n_ffff,
-                    n_zero,
-                    n_vac,
-                    n_other,
-                    vacuum_idx,
-                    ?other_samples,
-                    "BeginSave: backwall element_idx distribution diag"
-                );
-            }
-
             for i in 0..total_cells {
                 // L124: backwall_element_idx[i] (u16)
                 let bw_elem_idx = bw_elem_idx_slice.get(i).copied().unwrap_or(0xffff);
@@ -1912,14 +1848,7 @@ mod tests {
         let mut size: std::os::raw::c_int = -1;
         let result = begin_save(&mut size, 0, 0);
         assert!(!result.is_null());
-        let vac_idx = crate::b_elements::elements_table::get_element_index_pub(0x2d39bf75);
-        let vac_hash = crate::b_elements::elements_table::get_element_id_by_idx(vac_idx);
-        tracing::info!(vac_idx, ?vac_hash, "test: vacuum lookup at begin_save time");
-        eprintln!("TEST vac_idx={} vac_hash={:?}", vac_idx, vac_hash);
         let bytes = unsafe { std::slice::from_raw_parts(result as *const u8, size as usize) };
-        // 检查 cells 段第一个记录的 hash（cell element 默认 0 → 应写元素0的id）
-        let cell0_hsh = u32::from_le_bytes(bytes[29..33].try_into().unwrap());
-        eprintln!("TEST cell0 hash = {:#x}", cell0_hsh);
 
         // 解析 backwall 段：header 29 + cells 16*16 + disease 16*8 + backwall 16*12
         let bw_start = 29 + 16 * 16 + 16 * 8;

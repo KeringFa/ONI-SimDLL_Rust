@@ -1,4 +1,4 @@
-# 代办清单
+﻿# 代办清单
 
 ## [进行中] 全量代码审查（2026-08-02）
 
@@ -501,3 +501,21 @@
 **验证**：433 测试串行全过，Release 构建成功。
 **待实测**：部署 → 原版存档（背墙 65535）太空格不删（符合原版）；新档或
   背墙真空（211）的太空格持续删除（原版"Space exposure"行为）。
+
+> ⚠️ **本条"背墙 hash=0 → 65535"结论已被推翻（见下方 [已修复] 条目）**：
+> 原版 DLC 存档背墙实为真空 hash（0x2d39bf75）；"全 0"是 handle_load 漏读
+> disease_count（4B/格 → 应为 8B/格）导致背墙段偏移 4B/格、把 disease_count
+> 当成背墙 hash 的解析/加载错位假象。加载对齐后原版存档太空格背墙 = 真空，
+> 原版确实删除，项目版此前不删是加载 bug。
+
+## [已修复] 太空删除不生效——handle_load 漏读 disease_count（2026-08-04）
+
+**现象**：DLC 多星图（02_test_02.sav，原版创建并保存）太空删除不生效；单星图（03_only.sav）正常。
+**根因**（最终定位）：handle_load 的 disease 段每格只读 4B（disease_hash），原版 Load（02_save_load.c L133-147）是 8B/格（hash + count）。漏读 4B/格 → reader 每格落后 4B → 背墙段整体偏移 4B/格 → 把 disease_count（无病菌时为 0）当成背墙元素 hash → 全图背墙读成 0xFFFF → 太空删除判定 backwall.elementIdx == vacuumElementIdx 恒失败。
+**验证链**：
+- 解压 .sav（zlib 容器 + SIMSAVE 流）逐字节核对：原版 DLC 存档背墙实为真空 hash（0x2d39bf75，227,752 条全真空），此前"全 0"是解析/加载错位假象；
+- 原版 BeginSave（01_sim_api.c）disease 段 8B/格、背墙 0xFFFF→真空 hash 转换均正确；
+- 修复后加载两个真实存档（03_only / 02_test_02）：背墙全部还原为真空索引（0xFFFF=0），回归测试通过（383 全绿）。
+**修复**：handle_load disease 循环补读 disease_count（4B）并按原版语义写入（idx==0xff 时清零）。BeginSave 本就写 8B/格，无需改。
+**附带结论**：元素表无 id==0 元素、真空 DLC=211/单星=201；原版 simDLL 无 DLC 多星分支，判定全图统一。临时诊断代码（元素表/BeginSave/太空首帧）待实测确认后清理。
+
