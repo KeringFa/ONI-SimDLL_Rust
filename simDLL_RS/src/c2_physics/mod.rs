@@ -42,16 +42,18 @@ pub fn update_data(sim_data: &mut SimData) {
             "update_data: grid vs active-region coverage diag"
         );
     }
-    // 2026-08-04 D1 探针（临时）：验证活动区域之外的格（未发现星球/太空缝隙）
-    // 状态不变化（原版"UNKNOWN 永不变化"机制）。取 3 个区域外样本，第 1 次与
-    // 第 200 次 update_data 各记录一次元素/质量/温度，比较是否冻结。
+    // 2026-08-04 D1 探针（临时）：验证
+    // ① 活动区域之外的格（未发现星球/太空缝隙）状态不变化（原版"UNKNOWN 永不变化"）；
+    // ② 活动区域内（含已发现世界里的 UNKNOWN 迷雾格）状态应变化（区域=整块世界矩形，
+    //    已发现世界内没有逐格可见性门控）。
+    // 区域外 2 样本 + 区域内 2 样本（优先选液体/气体格），第 1 次与第 60 次各记录比较。
     {
         use std::sync::atomic::{AtomicU32, Ordering};
         static FROZEN_PROBE_COUNT: AtomicU32 = AtomicU32::new(0);
-        static FROZEN_PROBE_RECORDED: std::sync::Mutex<Option<Vec<(u16, f32, f32)>>> =
+        static FROZEN_PROBE_RECORDED: std::sync::Mutex<Option<Vec<(usize, u16, f32, f32)>>> =
             std::sync::Mutex::new(None);
         let n = FROZEN_PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if n == 0 || n == 200 {
+        if n == 0 || n == 60 {
             // 采样：活动区域之外的格（取区域矩形外固定偏移，含世界之间缝隙/未发现世界）。
             let bounds_list: Vec<crate::d1_activity::RegionBounds> = sim_data
                 .active_regions
@@ -67,45 +69,90 @@ pub fn update_data(sim_data: &mut SimData) {
                 (w / 2, h / 4),
                 (w * 3 / 4, h / 2),
             ];
+            // 区域外样本
             for (x, y) in candidates {
                 let cell = y * w + x;
                 let in_region = bounds_list.iter().any(|b| {
                     x >= b.min_x && x <= b.max_x && y >= b.min_y && y <= b.max_y
                 });
-                if !in_region && !sim_data.updated_cells.ptr.is_null() {
+                if !in_region && samples.len() < 2 && !sim_data.updated_cells.ptr.is_null() {
                     let c = unsafe { &*sim_data.updated_cells.ptr };
                     if cell < c.element_idx.len() {
                         samples.push((cell, c.element_idx.get(cell), c.mass.get(cell), c.temperature.get(cell)));
                     }
                 }
             }
+            // 区域内样本：优先选液体(state&3==2)/气体(state&3==1)格
+            if let Some(first) = bounds_list.first() {
+                let mid_x = (first.min_x + first.max_x) / 2;
+                let mid_y = (first.min_y + first.max_y) / 2;
+                let mut picked = Vec::new();
+                for dy in 0..8i64 {
+                    for dx in 0..8i64 {
+                        let x = mid_x as i64 + dx * 16;
+                        let y = mid_y as i64 + dy * 16;
+                        if x > first.max_x as i64 || y > first.max_y as i64 {
+                            continue;
+                        }
+                        let cell = (y as usize) * w + (x as usize);
+                        if !sim_data.updated_cells.ptr.is_null() {
+                            let c = unsafe { &*sim_data.updated_cells.ptr };
+                            if cell < c.element_idx.len() {
+                                let e = c.element_idx.get(cell);
+                                let state = crate::b_elements::elements_table::get_element_post_process_data(e)
+                                    .map(|p| p.state & 3)
+                                    .unwrap_or(0);
+                                if (state == 1 || state == 2) && c.mass.get(cell) > 0.0 {
+                                    picked.push((cell, e, c.mass.get(cell), c.temperature.get(cell)));
+                                    if picked.len() >= 2 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if picked.len() >= 2 {
+                        break;
+                    }
+                }
+                if picked.is_empty() {
+                    // 回退：区域内任意格（含固体）
+                    let cell = mid_y * w + mid_x;
+                    if !sim_data.updated_cells.ptr.is_null() {
+                        let c = unsafe { &*sim_data.updated_cells.ptr };
+                        if cell < c.element_idx.len() {
+                            picked.push((cell, c.element_idx.get(cell), c.mass.get(cell), c.temperature.get(cell)));
+                        }
+                    }
+                }
+                samples.extend(picked);
+            }
             if n == 0 {
                 if samples.is_empty() {
                     tracing::info!("frozen-probe: no cells outside active regions (single-star or full coverage)");
                 } else {
-                    *FROZEN_PROBE_RECORDED.lock().unwrap() = Some(
-                        samples.iter().map(|s| (s.1, s.2, s.3)).collect(),
-                    );
+                    *FROZEN_PROBE_RECORDED.lock().unwrap() = Some(samples.clone());
                     tracing::info!(
                         ?samples,
-                        "frozen-probe: first sample (cells outside active regions)"
+                        "frozen-probe: first sample (first 2 = outside region, rest = inside region)"
                     );
                 }
-            } else if n == 200 {
+            } else if n == 60 {
                 let first = FROZEN_PROBE_RECORDED.lock().unwrap().clone();
-                let changed = match &first {
-                    Some(f) => {
-                        f.len() == samples.len()
-                            && f.iter()
-                                .zip(samples.iter())
-                                .all(|(a, s)| a.0 == s.1 && (a.1 - s.2).abs() < 1e-6 && (a.2 - s.3).abs() < 1e-6)
+                let mut changed = Vec::new();
+                if let Some(f) = &first {
+                    for (a, s) in f.iter().zip(samples.iter()) {
+                        let same = a.0 == s.0
+                            && a.1 == s.1
+                            && (a.2 - s.2).abs() < 1e-6
+                            && (a.3 - s.3).abs() < 1e-6;
+                        changed.push((s.0, !same));
                     }
-                    None => false,
-                };
+                }
                 tracing::info!(
                     ?samples,
-                    frozen = changed,
-                    "frozen-probe: 200th sample vs first (expect frozen=true)"
+                    ?changed,
+                    "frozen-probe: 60th sample vs first (outside expect false=unchanged; inside expect true=changed)"
                 );
             }
         }
