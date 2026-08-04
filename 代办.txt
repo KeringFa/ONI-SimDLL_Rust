@@ -534,3 +534,23 @@
 - 其余空桩记录：SetSavedOptions（L466-484）、CreateDiseaseTable（L494-518）仍在，
   属病菌/选项模块，留待病菌表实现时一并补。
 
+## [已完成] save_load 格式复核 + DLC handler 收尾（2026-08-04）
+
+- **新增 FreeGridCells（SimData_FreeCells，原 L123019-123208）**：DLC 移除世界/火箭舱时
+  C# 调用（Grid.FreeGridSpace → SimDataFreeCells）——清空 (width+2)×(height+2) 矩形
+  （含边界一圈）为真空 + 从 SimData.worlds 移除 offset/尺寸匹配条目。与
+  ResizeAndInitializeVacuumCells 成对（一个加世界、一个删世界）。
+- **复核修正 1**：原版 BeginSave 的 cells/disease 循环读 `gSimData+0x28` =
+  **updatedCells**（非 cells）；此前用 cells（稳定缓冲）可能保存上一帧状态。已改。
+- **复核修正 2**：原版 Load 的旧版辐射 skip 条件是 `version-8U < 7`（8..14），
+  此前 `version < 15` 会把 ≤7 的远古存档也跳过；已改 8..14。
+- 复核确认无差异：CellRead 两处旧 hash 别名重映射（0x280cf79→0x987dac06、
+  0x2391c22b→0x4c76ae31）、非有限值回退（temp 300 / mass 100 / radiation 0）、
+  0xffff→真空兜底、cells/disease/backwall 各段尺寸（16/8/12B）、version>13 radiation、
+  version>14 backwall、InitializeFromCells 三结构尺寸（16/12/12B）全部一致。
+- **DLC 专属面清单（simDLL 侧就这 4 条消息）**：DefineWorldOffsets / ClearUnoccupiedCells /
+  ResizeAndInitializeVacuumCells / FreeGridCells——现已全部实现；worlds 向量只被
+  前两者读写，游戏→sim 格坐标换算不依赖世界偏移（簇网格就是一块大网格），
+  其余物理/分区/温度逻辑对单星/DLC 完全一致。
+- 387 测试串行全过；release 构建成功。
+

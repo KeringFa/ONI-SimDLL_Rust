@@ -402,8 +402,9 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         }
     }
 
-    // L193-195: if version < 15, skip width × height × 4 字节（旧版辐射数据）
-    if version < 0xf && save_height > 0 && save_width > 0 {
+    // L193-195: if version - 8U < 7（即 8..14）, skip width × height × 4 字节。
+    // 2026-08-04 复核修正：此前 `version < 0xf` 会连 ≤7 的旧版本也跳过（原版不会）。
+    if (8..0xf).contains(&version) && save_height > 0 && save_width > 0 {
         let skip_bytes = (save_height as usize) * (save_width as usize) * 4;
         let _ = reader.skip(skip_bytes);
     }
@@ -1400,11 +1401,95 @@ pub fn handle_initialize_from_cells(reader: &mut BinaryBufferReader) -> *mut c_v
     num_cells as *mut c_void
 }
 
-/// SimData_FreeCells handler 桩。
-/// 对照源码 11_msvcrt_ignored.c L23727。
-/// A3 阶段返回 null（不处理），C 类阶段实现真实逻辑。
-pub fn handle_free_grid_cells(_reader: &mut BinaryBufferReader) -> *mut c_void {
-    tracing::debug!("FreeGridCells handler stub (A3)");
+/// SimData_FreeCells handler。
+/// 对照源码 SimDLL_Source.c L123019-123208（SimData::FreeGridCells）。
+///
+/// 消息：width(i32) + height(i32) + x_offset(i32) + y_offset(i32)。
+/// DLC 移除世界/火箭舱时 C# 调用（Grid.FreeGridSpace → SimDataFreeCells）：
+/// 1. 把 (x_offset, y_offset) 处 (width+2)×(height+2) 矩形（含边界一圈）
+///    的 cells/updatedCells 清为真空、backwall 清为真空；
+/// 2. 从 SimData.worlds 移除 offset/尺寸完全匹配的世界条目。
+pub fn handle_free_grid_cells(reader: &mut BinaryBufferReader) -> *mut c_void {
+    let sim_data_ptr = globals::G_SIM_DATA.lock().0;
+    if sim_data_ptr.is_null() {
+        tracing::warn!("FreeGridCells: gSimData is null");
+        return std::ptr::null_mut();
+    }
+    let mut read_int = || match reader.read_int() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(?e, "FreeGridCells: read failed");
+            -1
+        }
+    };
+    let width = read_int();
+    let height = read_int();
+    let x_offset = read_int();
+    let y_offset = read_int();
+    if width < 0 || height < 0 {
+        tracing::warn!(width, height, "FreeGridCells: invalid size");
+        return std::ptr::null_mut();
+    }
+    let sim_data = unsafe { &mut *sim_data_ptr };
+    if sim_data.cells.ptr.is_null()
+        || sim_data.updated_cells.ptr.is_null()
+        || sim_data.backwall.ptr.is_null()
+    {
+        tracing::warn!("FreeGridCells: buffers null");
+        return std::ptr::null_mut();
+    }
+    let vacuum = sim_data.vacuum_element_idx;
+    let sim_w = sim_data.width as i64;
+
+    // 清空矩形（原版 L123030-123160）：行 y_offset..y_offset+height+1，
+    // 列 x_offset..x_offset+width+1，双缓冲 + 背墙全置真空。
+    for y in 0..height as i64 + 2 {
+        for x in 0..width as i64 + 2 {
+            let cell = (y_offset as i64 + y) * sim_w + (x_offset as i64 + x);
+            if cell < 0 {
+                continue;
+            }
+            let cell = cell as usize;
+            for buf_ptr in [sim_data.cells.ptr, sim_data.updated_cells.ptr] {
+                let cells = unsafe { &mut *buf_ptr };
+                if cell >= cells.element_idx.len() {
+                    continue;
+                }
+                cells.element_idx.set(cell, vacuum);
+                cells.mass.set(cell, 0.0);
+                cells.temperature.set(cell, 0.0);
+                cells.disease_count.set(cell, 0);
+                cells.disease_idx.set(cell, 0xff);
+                cells.radiation.set(cell, 0.0);
+            }
+            let backwall = unsafe { &mut *sim_data.backwall.ptr };
+            if cell < backwall.element_idx.len() {
+                backwall.element_idx.set(cell, vacuum);
+                backwall.mass.set(cell, 0.0);
+                backwall.temperature.set(cell, 0.0);
+            }
+        }
+    }
+
+    // 从 worlds 移除匹配条目（原版 L123164-123208：offset_x/offset_y/width/height
+    // 完全一致才移除，vector 通过 memcpy 前移 + _Mylast-=16 实现 erase）。
+    let old_len = sim_data.worlds.len();
+    let keep: Vec<WorldOffsetData> = sim_data
+        .worlds
+        .as_slice()
+        .iter()
+        .copied()
+        .filter(|w| {
+            !(w.width == width && w.height == height && w.offset_x == x_offset && w.offset_y == y_offset)
+        })
+        .collect();
+    if keep.len() != old_len {
+        sim_data.worlds.clear();
+        for w in keep {
+            sim_data.worlds.push(w);
+        }
+    }
+    tracing::info!(width, height, x_offset, y_offset, "FreeGridCells done");
     std::ptr::null_mut()
 }
 
@@ -1528,8 +1613,10 @@ pub fn begin_save(
     // L52: WriteByte(gSimData->saved_options)
     buffer.push(sim_data.saved_options);
 
-    // L57: cells = gSimData->cells
-    let cells_ptr = sim_data.cells.ptr;
+    // 2026-08-04 复核修正：原版 BeginSave 的 cells/disease 循环读取的是
+    // `*(longlong *)(gSimData + 0x28)` = updatedCells（非 cells）。
+    // 此前用 cells（稳定缓冲）→ 保存的可能是上一帧状态，与 C# 读取的最新帧不一致。
+    let cells_ptr = sim_data.updated_cells.ptr;
     let backwall_ptr = sim_data.backwall.ptr;
 
     if total_cells > 0 {
@@ -2528,6 +2615,71 @@ mod tests {
                     assert_eq!(cells.mass.get(cell), 9999.0);
                 }
             }
+        }
+        clean_up();
+    }
+
+    #[test]
+    fn handle_free_grid_cells_clears_region_and_removes_world() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+        init_min_elements_for_dlc_handlers();
+
+        let mut alloc_w = BinaryBufferWriter::new();
+        alloc_w.write_int(10);
+        alloc_w.write_int(10);
+        alloc_w.write_bool(false);
+        alloc_w.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&alloc_w.into_bytes());
+        let _ = handle_allocate_cells(&mut reader); // sim 12x12 = 144 cells
+
+        // 先塞两个世界条目
+        unsafe {
+            let sd = &mut *globals::G_SIM_DATA.lock().0;
+            sd.worlds.push(WorldOffsetData { offset_x: 3, offset_y: 2, width: 4, height: 3 });
+            sd.worlds.push(WorldOffsetData { offset_x: 9, offset_y: 9, width: 1, height: 1 });
+        }
+        // 在区域里放点数据
+        unsafe {
+            let sd = &mut *globals::G_SIM_DATA.lock().0;
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let cells = &mut *buf_ptr;
+                for i in 0..144usize {
+                    cells.element_idx.set(i, 5);
+                    cells.mass.set(i, 77.0);
+                }
+            }
+        }
+
+        // FreeGridCells：width=4 height=3 x_offset=3 y_offset=2
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(4);
+        w.write_int(3);
+        w.write_int(3);
+        w.write_int(2);
+        let mut reader = BinaryBufferReader::new(&w.into_bytes());
+        handle_free_grid_cells(&mut reader);
+
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            // worlds 移除匹配条目，保留另一个
+            assert_eq!(sd.worlds.len(), 1);
+            let a = sd.worlds.as_slice();
+            assert_eq!(a[0].offset_x, 9);
+            assert_eq!(a[0].offset_y, 9);
+            // 矩形（行 2..=6、列 3..=8，含边界一圈）清为真空
+            let w = sd.width as usize;
+            let cells = &*sd.cells.ptr;
+            for y in 2..=6usize {
+                for x in 3..=8usize {
+                    let cell = y * w + x;
+                    assert_eq!(cells.element_idx.get(cell), 211, "cleared @{}", cell);
+                    assert_eq!(cells.mass.get(cell), 0.0);
+                }
+            }
+            // 区域外保持原值
+            let outside = 0 * w + 0;
+            assert_eq!(cells.element_idx.get(outside), 5);
         }
         clean_up();
     }
