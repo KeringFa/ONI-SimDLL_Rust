@@ -437,9 +437,10 @@ impl SimFrameManager {
                 emplace_bytes(&mut frame.cell_radiation_modifications, reader, 12)
             }
 
-            // RadiationParamsModification (0x167A4883) → radiation_params_modifications（C2 桩，12B）
+            // RadiationParamsModification (0x167A4883) → radiation_params_modifications（8B：
+            // {int type, float value}，原版/C# 结构一致；2026-08-04 修正 12B→8B）
             MSG_RADIATION_PARAMS_MOD => {
-                emplace_bytes(&mut frame.radiation_params_modifications, reader, 12)
+                emplace_bytes(&mut frame.radiation_params_modifications, reader, 8)
             }
 
             // ===== ElementConsumer 消息（2026-08-02 实现，原版 ProcessFrame L116710-116790）=====

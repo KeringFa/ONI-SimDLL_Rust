@@ -40,8 +40,8 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     // 步骤 8: 内联处理 cell_disease_modifications（C2 桩）
     process_cell_disease_modifications(frame, sim_data);
 
-    // 步骤 9: ProcessCellRadiationChanges（C2 桩）
-    process_cell_radiation_changes(frame, sim_data);
+    // 步骤 9: ProcessRadiationChanges（原版 06_process_messages.c L370-414）
+    process_frame_radiation(frame, sim_data);
 
     // 步骤 10: ProcessDigPoints（C1 真实实现）
     process_dig_points(frame, sim_data);
@@ -1736,8 +1736,70 @@ fn process_cell_disease_modifications(frame: &mut SimFrameInfo, _sim_data: &mut 
     frame.cell_disease_modifications.clear_keep_capacity();
 }
 
-fn process_cell_radiation_changes(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
+/// 步骤 9：ProcessRadiationChanges（原版 06_process_messages.c L370-414）。
+/// 1) radiation_params_modifications（8B/条：type, value）→ 参数映射；
+/// 2) cell_radiation_modifications（12B/条：gameCell, radiationDelta, callbackIdx）→ 格子辐射 + 消费回调。
+fn process_frame_radiation(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    process_radiation_params(sim_data, frame.radiation_params_modifications.as_slice());
+    frame.radiation_params_modifications.clear_keep_capacity();
+    process_cell_radiation_changes(sim_data, frame.cell_radiation_modifications.as_slice());
     frame.cell_radiation_modifications.clear_keep_capacity();
+}
+
+/// RadiationParamsModification（8B：int type + float value）→ SimData 辐射参数。
+/// type 映射（原版 06_process_messages.c L392-410）：0→linger、2→base、3→density、
+/// 4→constructed、5→maxMass；type 1 与其余无映射，跳过。
+pub fn process_radiation_params(sim: &mut SimData, entries: &[u8]) {
+    let mut off = 0usize;
+    while off + 8 <= entries.len() {
+        let typ = i32::from_le_bytes([entries[off], entries[off + 1], entries[off + 2], entries[off + 3]]);
+        let value = f32::from_le_bytes([entries[off + 4], entries[off + 5], entries[off + 6], entries[off + 7]]);
+        match typ {
+            0 => sim.radiation_linger_rate = value,
+            2 => sim.radiation_base_weight = value,
+            3 => sim.radiation_density_weight = value,
+            4 => sim.radiation_constructed_factor = value,
+            5 => sim.radiation_max_mass = value,
+            _ => {} // 原版无 case，跳过
+        }
+        off += 8;
+    }
+}
+
+/// CellRadiationModification（12B：int gameCell + float delta + int callbackIdx）。
+/// gameCell → sim cell（+1 边界）；radiation += delta，≤0 清零；
+/// callbackIdx != -1 → 推 RadiationConsumedCallback（12B）。
+pub fn process_cell_radiation_changes(sim: &mut SimData, entries: &[u8]) {
+    if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
+        return;
+    }
+    let game_w = (sim.width - 2).max(1) as i32;
+    let mut off = 0usize;
+    while off + 12 <= entries.len() {
+        let game_cell = i32::from_le_bytes([entries[off], entries[off + 1], entries[off + 2], entries[off + 3]]);
+        let delta = f32::from_le_bytes([entries[off + 4], entries[off + 5], entries[off + 6], entries[off + 7]]);
+        let callback_idx = i32::from_le_bytes([entries[off + 8], entries[off + 9], entries[off + 10], entries[off + 11]]);
+        let sim_cell = ((game_cell % game_w + 1) + (game_cell / game_w + 1) * sim.width) as usize;
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        if sim_cell >= updated.radiation.len() {
+            off += 12;
+            continue;
+        }
+        let mut r = updated.radiation.get(sim_cell) + delta;
+        if r <= 0.0 {
+            r = 0.0;
+        }
+        updated.radiation.set(sim_cell, r);
+        if callback_idx != -1 {
+            let events = unsafe { &mut *sim.sim_events.ptr };
+            events.radiation_consumed_callbacks.push(crate::a_framework::game_data::RadiationConsumedCallback {
+                game_cell,
+                callback_idx,
+                radiation: delta,
+            });
+        }
+        off += 12;
+    }
 }
 
 /// 清空所有 ComponentMessages 的 adds/modifies/removes（C2 桩：不处理，只清空）。
@@ -1798,6 +1860,7 @@ mod tests {
     use crate::a_framework::sim_events::SimEvents;
     use crate::a_framework::sim_frame_manager::SimFrameInfo;
     use crate::a_framework::stl_shim::UniquePtr;
+    use crate::a_framework::buffer::BinaryBufferWriter;
     use crate::b_elements::element::{Element, ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData};
     use crate::b_elements::elements_table::{G_ELEMENTS_TABLE, DestroyElementsTable};
 
@@ -1809,6 +1872,37 @@ mod tests {
         assert_eq!(insulation_u8(0.01), 2); // 0.01×255 = 2.55 → 2（隔热砖）
         assert_eq!(insulation_u8(0.5), 127); // 127.5 → 127
         assert_eq!(insulation_u8(-1.0), 0); // 负值截断为 0
+    }
+
+    /// 任务 1：RadiationParamsModification（8B：type + value）→ 参数映射；
+    /// type 0→linger、2→base、3→density、4→constructed、5→maxMass，其余（1 等）跳过。
+    #[test]
+    fn radiation_params_applies_mapping_and_skips_unknown() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        assert!((sd.radiation_linger_rate - 1.1).abs() < 1e-6);
+        assert!((sd.radiation_base_weight - 0.3).abs() < 1e-6);
+        assert!((sd.radiation_density_weight - 0.7).abs() < 1e-6);
+        assert!((sd.radiation_constructed_factor - 0.8).abs() < 1e-6);
+        assert!((sd.radiation_max_mass - 2000.0).abs() < 1e-6);
+
+        let mut w = BinaryBufferWriter::new();
+        // 8B/条：type, value
+        w.write_int(0);  w.write_float(2.0);    // linger_rate
+        w.write_int(2);  w.write_float(0.9);    // base_weight
+        w.write_int(3);  w.write_float(0.15);   // density_weight
+        w.write_int(4);  w.write_float(1.25);   // constructed_factor
+        w.write_int(5);  w.write_float(3000.0); // max_mass
+        w.write_int(1);  w.write_float(123.0);  // 原版无映射 → 跳过
+        w.write_int(99); w.write_float(456.0);  // 越界 → 跳过
+        let data = w.into_bytes();
+
+        process_radiation_params(&mut sd, &data);
+        assert!((sd.radiation_linger_rate - 2.0).abs() < 1e-6);
+        assert!((sd.radiation_base_weight - 0.9).abs() < 1e-6);
+        assert!((sd.radiation_density_weight - 0.15).abs() < 1e-6);
+        assert!((sd.radiation_constructed_factor - 1.25).abs() < 1e-6);
+        assert!((sd.radiation_max_mass - 3000.0).abs() < 1e-6);
     }
 
     #[test]
