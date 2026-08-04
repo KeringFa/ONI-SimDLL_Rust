@@ -810,3 +810,52 @@ property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生�
   间歇（正确）；蜂巢 Pulsing 节奏；运行态/熔毁态反应堆持续辐射且熔毁
   5 周期（3000s）后归零；单星零辐射不回归。
 
+### 阶段 B 实测修复 2：蜂巢波环 + 加载辐射残留（2026-08-04 内联）
+
+**蜂巢辐射机制全解（用户实测 + C# 源码）**：
+- BaseBeeHiveConfig：RadiationEmitter **Pulsing**、radius 7×6、emitRate=3、
+  emitRads=0；蜂巢进食时 HiveEatingStates.TurnOn `emitRads = 600×emitRate`
+  = **1800**（TurnOff 归零）→ "最初的单格辐射强度 1800" 即 step 0 中心爆发。
+- 波环 = tickPulsing step 1+ 的 **SetCircleAA 抗锯齿椭圆轮廓**（1~2px 边界，
+  每像素强度 roundf(frac×emitRads)，无 linger 除），step_time=1/7≈0.14s 步进、
+  rad−rad/linger 衰减 → 环向外扩散渐隐 = "类气体圆形波浪"。
+
+**Bug 1（蜂巢画成填充椭圆）根因**：我们此前 tickPulsing 画**填充圆盘**（椭圆内
+全部格子 + 除 linger）。原版是**轮廓环**（L39482 SetCircleAA + L40110 setPulsing）。
+
+**修复（80e022f）**：
+- tickPulsing 重写为原版语义：rx/ry=ceil(radius×step_f)（原版 movmskps 取整
+  hack）、step 0 中心 +emitRads、step 1+ SetCircleAA 轮廓环（两循环边界像素
+  + 内侧补像素、亚像素强度插值、四象限镜像含轴向重复写怪癖）、**Pulsing 不除
+  linger**（Constant 仍除）；
+- 回归测试：环非填充（内部格 0 / 环上格 220 / 外侧格 0）、轴向双写 278、
+  多步+环绕、Averaged 不变。
+
+**Bug 2（加载其他存档残留辐射）根因**：RadiationEmitter 注册表是全局静态，
+生产代码从未清空；原版注册表在 Sim 内（Sim 生命周期跨存档，靠 Remove 消息
+清理），本项目跨存档依赖同一 Remove 链路但无兜底。Grid.radiation 每帧由
+StepTheSim 从 GDU 重取（无 C# 缓存），残留必来自旧发射器继续向新世界发射。
+
+**修复（80e022f）**：
+- AllocateCells / InitializeFromCells（新世界分配 = 存档切换）→ 显式
+  `clear_radiation_emitters()`；旧发射器不可能属于新世界；
+- `release_queued_handles` 增加**版本校验**：旧存档延迟 Remove 到达时若 index
+  已被新注册复用，不会误杀新发射器；
+- 回归测试 `allocate_cells_clears_radiation_emitter_registry`。
+- 其余组件注册表（conduit/chunk/consumer/emitter）同为全局静态、未在生产清空，
+  理论上有同类隐患（用户未报告，暂不扩大改动；若日后出现类似残留，同样在
+  AllocateCells 清空）。
+
+### [新发现·性能] MsvcVector::resize 每帧全量重分配（2026-08-04 日志实证）
+
+- **现象**：simdll 日志显示 PrepareGameDataUpdate 的 GDU 指针每帧变化，
+  2.4 分钟内 radiation 缓冲出现 **62 个不同地址**（双缓冲本应只有 2 个）。
+- **根因**：stl_shim.rs `MsvcVector::resize` **无条件 alloc + 零填充 + 释放旧缓冲**
+  （不看现有容量）。`copy_sim_data_to_game` 每帧对 GameData cells 的 11 个字段
+  resize（225040 格 × 2 缓冲 × ~27B/格 ≈ 12MB/帧 分配+释放）→ 内存抖动，
+  疑为 1x 相机卡顿的主要嫌疑之一。
+- **正确修法**（未做，留待专项）：resize 改为容量感知——new_len ≤ 容量时只
+  调整 size 指针（按需零填充新增段），仅增长时分配；`clear` 语义保持释放。
+  改共享原语需全量回归（所有组件都用它）。
+- **待办**：与"元素表每格加锁性能"合并立项，专项处理。
+
