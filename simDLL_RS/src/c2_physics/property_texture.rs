@@ -23,15 +23,18 @@ const OPAQUE_ELEMENT_HASH: u32 = 0x2531469c;
 /// 3. 从世界顶行向下一行行处理（原版 L96-205）：
 ///    - 格 properties & 0x30 == 0x30（不透明/密封）：用不透明元素的吸光数据衰减该列
 ///      （L118-147）；
-///    - 否则：用**下方格**（cell+width）元素的吸光数据衰减（L149-190）；
+///    - 否则：用**上方格**（cell+width，阳光自上而下先经过）元素的吸光数据衰减（L149-190）；
 ///      若本格 properties & 0x20 置位（背墙/密封）该列阳光归零（L191-194）。
 ///    - 把衰减后强度 × 255 写入本格对应 game 索引（L197）。
 ///
 /// **吸光公式**（原版指针算术可解码，任务 8 修复轮）：
-/// L102 `lVar17 = (offset_y+row+2)*width + offset_x+1` = 当前格 + width = **下方格**；
+/// L102 `lVar17 = (offset_y+row+2)*width + offset_x+1` = 当前格 + width = **上方格**
+///（阳光自上而下，行循环 top→bottom，上方格先被处理）；
 /// 第一次乘法（L133/L176）用 `gElementLightAbsorptionData` 的 `+4` 字段 = **massScale**，
 /// 第二次乘法（L142/L185）用 `+0` 字段 = **factor**：
-/// `sun = sun - min(massScale[下方元素] × mass[下方格], 1.0) × factor[下方元素]`
+/// `sun = sun - min(massScale[上方元素] × mass[上方格], 1.0) × factor[上方元素]`
+/// ⚠️ 2026-08-04 审查勘误：此前注释误标"下方格"（cell+width 实为上方格，
+/// 与本项目液体约定 below=cell-width 一致）。
 pub fn update_exposed_to_sun_property_texture(sim: &SimData, game: &mut GameData) {
     let sim_w = sim.width as usize;
     let sim_h = sim.height as usize;
@@ -66,7 +69,8 @@ pub fn update_exposed_to_sun_property_texture(sim: &SimData, game: &mut GameData
             if w_w == 0 || w_h == 0 {
                 continue;
             }
-            // 原版 L54-63：先把"天空行"（世界上方一行）清零为 0xff（满曝）。
+            // 原版 L54-63：先把世界**顶部行**（= 天空行，game 行 w_y+w_h-1）填 0xff（满曝）；
+            // 下方各行走计算路径。
             // 原版 uVar9 = w_x + 1 + (w_y + w_h) * sim_w，对应 game 行 = w_y + w_h - 1。
             let sky_row = w_y + w_h;
             if sky_row > 0 {
@@ -93,9 +97,9 @@ pub fn update_exposed_to_sun_property_texture(sim: &SimData, game: &mut GameData
                         continue;
                     }
                     let props = updated.properties.get(cell);
-                    // 原版 L102：lVar17 = (offset_y+row+2)*width + offset_x+1 = 当前格 + width = **下方格**。
-                    // 吸光计算读取的是下方格的元素与质量（L133/L163/L176），不是本格。
-                    let below = cell + sim_w;
+                    // 原版 L102：lVar17 = (offset_y+row+2)*width + offset_x+1 = 当前格 + width = **上方格**。
+                    // 吸光计算读取的是上方格的元素与质量（L133/L163/L176），不是本格。
+                    let above_cell = cell + sim_w;
                     let mut f22: f32;
                     if props & 0x30 == 0x30 {
                         // 不透明/密封格（原版 L118-147）：用不透明元素的吸光数据（massScale + factor）
@@ -104,8 +108,12 @@ pub fn update_exposed_to_sun_property_texture(sim: &SimData, game: &mut GameData
                                 Some(d) => (d.mass_scale, d.factor),
                                 None => (0.0, 0.0),
                             };
-                        // 原版 L133-137：fVar22 = massScale × mass[下方格]，>= 1.0 → 1.0
-                        let mut absorb = mscale * updated.mass.get(below);
+                        // 原版 L133-137：fVar22 = massScale × mass[上方格]，>= 1.0 → 1.0
+                        let mut absorb = mscale * updated.mass.get(above_cell);
+                        // 2026-08-04 防御：INFINITY×0 = NaN 时按"无遮挡"处理（真空不挡光）
+                        if absorb.is_nan() {
+                            absorb = 0.0;
+                        }
                         if absorb >= 1.0 {
                             absorb = 1.0;
                         }
@@ -116,15 +124,19 @@ pub fn update_exposed_to_sun_property_texture(sim: &SimData, game: &mut GameData
                         }
                         sun[col] = f22;
                     } else {
-                        // 普通格（原版 L149-194）：读**下方格**元素（L163），用其 massScale/factor
-                        let below_elem = updated.element_idx.get(below);
+                        // 普通格（原版 L149-194）：读**上方格**元素（L163），用其 massScale/factor
+                        let below_elem = updated.element_idx.get(above_cell);
                         let (mscale, factor) =
                             match elements_table::get_element_light_absorption_data(below_elem) {
                                 Some(d) => (d.mass_scale, d.factor),
                                 None => (0.0, 0.0),
                             };
-                        // 原版 L176-180：fVar22 = massScale[下方元素] × mass[下方格]，>= 1.0 → 1.0
-                        let mut absorb = mscale * updated.mass.get(below);
+                        // 原版 L176-180：fVar22 = massScale[上方元素] × mass[上方格]，>= 1.0 → 1.0
+                        let mut absorb = mscale * updated.mass.get(above_cell);
+                        // 2026-08-04 防御：INFINITY×0 = NaN 时按"无遮挡"处理（真空不挡光）
+                        if absorb.is_nan() {
+                            absorb = 0.0;
+                        }
                         if absorb >= 1.0 {
                             absorb = 1.0;
                         }
@@ -675,14 +687,15 @@ mod tests {
         assert!(!result.is_null(), "CreateElementsTable should succeed");
     }
 
-    /// 阳光衰减（原版可解码公式）：sun = sun - min(massScale[下方元素] × mass[下方格], 1.0) × factor[下方元素]。
-    /// 原版指针算术（05_liquid_flow.c L102/L133/L163/L176）读的是**下方格**（cell+width）的
+    /// 阳光衰减（原版可解码公式）：sun = sun - min(massScale[上方元素] × mass[上方格], 1.0) × factor[上方元素]。
+    /// 原版指针算术（05_liquid_flow.c L102/L133/L163/L176）读的是**上方格**（cell+width，
+    /// 阳光自上而下先经过）的
     /// 元素与质量，不是本格——第一次乘法用 +4 字段（massScale），第二次用 +0 字段（factor）。
     /// sim 6x5（game 4x3），world = {x:0,y:0,w:4,h:3}：
     /// - 天空行 r=3 → game 行 2（exposed[8..12]）清零为 0xff
-    /// - 光列 0：cell13（r=2,col0，真空）的**下方格** cell19（r=3,col0，固体 factor=0.5，mass=1.0）
+    /// - 光列 0：cell13（r=2,col0，真空）的**上方格** cell19（r=3,col0，固体 factor=0.5，mass=1.0）
     ///   → absorb = min(INF×1.0, 1.0) = 1.0 → f22 = 1 - 1.0×0.5 = 0.5 → exposed[4] = 127；
-    ///   r=1 col0（sim7 真空）下方格=13（真空 factor=0）→ 继承 sun=0.5 → exposed[0] = 127
+    ///   r=1 col0（sim7 真空）上方格=13（真空 factor=0）→ 继承 sun=0.5 → exposed[0] = 127
     /// - 光列 1：无遮挡 → exposed[5] == exposed[1] == 255
     #[test]
     fn update_exposed_to_sun_writes_attenuated_light_column() {
@@ -697,10 +710,10 @@ mod tests {
         });
         unsafe {
             let updated = &mut *sd.updated_cells.ptr;
-            // 吸光固体放在 cell13 的**下方格** cell19（原版读下方格的元素/质量）
+            // 吸光固体放在 cell13 的**上方格** cell19（原版读上方格的元素/质量）
             updated.element_idx.set(19, 1);
             updated.mass.set(19, 1.0);
-            // cell13（r=2,col0）为真空，仅作为其上方格 cell7 的下方格元素来源
+            // cell13（r=2,col0）为真空，仅作为其上方格 cell7 的吸光元素来源
             updated.element_idx.set(13, 0);
             updated.mass.set(13, 0.0);
         }
@@ -712,7 +725,7 @@ mod tests {
                 4 * 3,
             );
             // game(1,0) = sim(2,1) = 13：f22 = 1 - min(INF×1,1.0)×0.5 = 0.5 → 127
-            assert_eq!(exposed[4], 127, "吸光固体（下方格）所在列应衰减到 0.5 → 127");
+            assert_eq!(exposed[4], 127, "吸光固体（上方格）所在列应衰减到 0.5 → 127");
             // game(0,0) = sim(1,1) = 7：继承 0.5
             assert_eq!(exposed[0], 127, "下方真空格应继承衰减 0.5 → 127");
             // 光列 1：无遮挡，保持满曝 255
@@ -721,6 +734,91 @@ mod tests {
             // 天空行清零为 0xff
             for g in 8..12 {
                 assert_eq!(exposed[g], 255, "天空行 {} 应为满曝", g);
+            }
+        }
+        DestroyElementsTable();
+    }
+
+    /// 回归（2026-08-04 用户实测：太阳光只亮顶部行 / 真空阻隔光）：
+    /// 真实游戏真空 defaultMass=0 → 旧 massScale = 1/0 = INFINITY；
+    /// 曝光函数 `INFINITY × 上方格质量(0) = NaN` → NaN 毒化整列 → 空间生态区全 0。
+    /// 修复：零质量非固体 massScale 回退 1.0 + 曝光函数 NaN 防御。
+    /// 期望：全真空列（含空间区）曝光 = 255（真空不挡光）。
+    #[test]
+    fn exposed_sun_passes_through_vacuum_space_biome() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 元素表：0=真空(state0, factor0, **defaultMass=0**)；1=固体(state3, factor0.5)
+        {
+            let mut w = BinaryBufferWriter::new();
+            w.write_int(2);
+            let elems = [
+                {
+                    let mut e = Element::default();
+                    e.id = 0;
+                    e.state = 0;
+                    e.number_of_gradient_colors = 1;
+                    e.light_absorption_factor = 0.0;
+                    e.default_values.mass = 0.0; // 真实游戏真空值
+                    e
+                },
+                {
+                    let mut e = Element::default();
+                    e.id = 1;
+                    e.state = 3;
+                    e.number_of_gradient_colors = 1;
+                    e.light_absorption_factor = 0.5;
+                    e.default_values.mass = 1.0;
+                    e
+                },
+            ];
+            for elem in &elems {
+                let elem_bytes = unsafe {
+                    std::slice::from_raw_parts(elem as *const Element as *const u8, 164).to_vec()
+                };
+                w.write_bytes(&elem_bytes);
+            }
+            for _ in 0..2 {
+                w.write_int(0);
+            }
+            let data = w.into_bytes();
+            let mut reader = BinaryBufferReader::new(&data);
+            let result = CreateElementsTable(&mut reader);
+            assert!(!result.is_null(), "CreateElementsTable should succeed");
+        }
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.worlds.push(WorldOffsetData {
+            offset_x: 0,
+            offset_y: 0,
+            width: 4,
+            height: 3,
+        });
+        // 全真空：sim 内部行 1..3（game 行 0..2）全为真空、质量 0
+        unsafe {
+            for buf in [&mut *sd.updated_cells.ptr, &mut *sd.cells.ptr] {
+                for idx in 0..30usize {
+                    buf.element_idx.set(idx, 0);
+                    buf.mass.set(idx, 0.0);
+                    buf.temperature.set(idx, 300.0);
+                }
+            }
+        }
+        let mut gd = GameData::new(4, 3);
+        update_exposed_to_sun_property_texture(&sd, &mut gd);
+        unsafe {
+            let exposed = std::slice::from_raw_parts(
+                gd.property_texture_exposed_to_sunlight.ptr,
+                4 * 3,
+            );
+            // 修复前：上方格真空 massScale=INF × mass 0 = NaN → 除填充行外全 0
+            // 修复后：真空不挡光 → 所有 game 行（含空间区）255
+            for gr in 0..3 {
+                for gc in 0..4 {
+                    let v = exposed[gr * 4 + gc];
+                    assert_eq!(
+                        v, 255,
+                        "真空空间区 game({gr},{gc}) 应满曝光 255（NaN 防御），got {v}"
+                    );
+                }
             }
         }
         DestroyElementsTable();

@@ -384,10 +384,16 @@ fn create_elements_table(reader: &mut BinaryBufferReader) -> Result<usize, Buffe
 
         // — light_absorption_data（源码 L360-368）—
         // mass_scale: (state & 3 == 3) ? INFINITY : 1.0 / default_values.mass
+        // 2026-08-04 光照修复：defaultMass==0 的非固体（真空等）若取 1.0/0=INFINITY，
+        // 曝光函数 `massScale × 质量0 = NaN` 会毒化整列阳光（空间生态区全黑，
+        // 仅顶部填充行亮——用户实测症状）。old 稳定版对零质量元素用 multiplier=1.0，
+        // 与原版实际表现一致；此处同款回退（固体仍为 INFINITY 全遮光）。
         let mass_scale = if (elem.state & 3) == 3 {
             f32::INFINITY
-        } else {
+        } else if elem.default_values.mass > 0.0 {
             1.0 / elem.default_values.mass
+        } else {
+            1.0
         };
         table.light_absorption_data[i] = ElementLightAbsorptionData {
             factor: elem.light_absorption_factor,                       // @0
