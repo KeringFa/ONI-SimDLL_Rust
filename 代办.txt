@@ -519,3 +519,18 @@
 **修复**：handle_load disease 循环补读 disease_count（4B）并按原版语义写入（idx==0xff 时清零）。BeginSave 本就写 8B/格，无需改。
 **附带结论**：元素表无 id==0 元素、真空 DLC=211/单星=201；原版 simDLL 无 DLC 多星分支，判定全图统一。临时诊断代码（元素表/BeginSave/太空首帧）待实测确认后清理。
 
+## [已实现] DLC 专属 handler 补全（2026-08-04，太空删除定性后一并补）
+
+- DefineWorldOffsets（02_save_load.c L297-342）：读世界数量 + 每世界 4 int
+  （offset_x/offset_y/size_x/size_y）存入 SimData.worlds（16B/条），替换空桩。
+- ClearUnoccupiedCells（02_save_load.c L405-465）：全图 cells + updatedCells
+  重置为真空（element=vacuum、mass/temp/radiation=0、disease_idx=0xff、count=0），
+  不碰背墙与分区；DLC 加载世界前 C# 会调用。
+- ResizeAndInitializeVacuumCells（SimDLL_Source.c L123719-123950）：读 6 int
+  （grid_size 读取后忽略）+ width/height/x_offset/y_offset，在簇网格指定位置初始化
+  width×height 矩形：内部=真空、边界（上/下/左/右一圈）=中子(mass 9999)、背墙=真空；
+  对应 DLC 新增小行星/火箭舱时的 C# SimDataResizeGridAndInitializeVacuumCells。
+- 单测 3 条（worlds 解析替换 / 全图清空 / 矩形区域填充）；386 测试串行全过；release 构建成功。
+- 其余空桩记录：SetSavedOptions（L466-484）、CreateDiseaseTable（L494-518）仍在，
+  属病菌/选项模块，留待病菌表实现时一并补。
+

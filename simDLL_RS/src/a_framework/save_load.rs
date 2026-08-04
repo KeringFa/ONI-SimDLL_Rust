@@ -9,7 +9,7 @@
 use crate::a_framework::buffer::{BinaryBufferReader, BufferError};
 use crate::a_framework::game_data::GameData;
 use crate::a_framework::game_data_update::GameDataUpdate;
-use crate::a_framework::sim_data::{CellSOA, SimData};
+use crate::a_framework::sim_data::{CellSOA, SimData, WorldOffsetData};
 use crate::a_framework::stl_shim::UniquePtr;
 use crate::b_elements::elements_table;
 use crate::globals;
@@ -1000,11 +1000,66 @@ pub fn handle_start(_reader: &mut BinaryBufferReader) -> *mut c_void {
     result
 }
 
-/// DefineWorldOffsets handler 桩。
-/// 对照源码 02_save_load.c L297-342。
-/// 任务 4 实现真实逻辑。
-pub fn handle_define_world_offsets(_reader: &mut BinaryBufferReader) -> *mut c_void {
-    tracing::warn!("DefineWorldOffsets handler stub (task 4 will implement)");
+/// DefineWorldOffsets handler。
+/// 对照源码 02_save_load.c L297-342：读取世界数量 + 每世界 4 个 int
+/// （offset_x / offset_y / size_x / size_y），存入 SimData.worlds（16B/条）。
+/// DLC 多星图专用：游戏开始时 C# 通过本消息告知各世界在簇网格中的偏移与尺寸。
+pub fn handle_define_world_offsets(reader: &mut BinaryBufferReader) -> *mut c_void {
+    let sim_data_ptr = globals::G_SIM_DATA.lock().0;
+    if sim_data_ptr.is_null() {
+        tracing::warn!("DefineWorldOffsets: gSimData is null");
+        return std::ptr::null_mut();
+    }
+    let sim_data = unsafe { &mut *sim_data_ptr };
+    let count = match reader.read_int() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(?e, "DefineWorldOffsets: count read failed");
+            return std::ptr::null_mut();
+        }
+    };
+    if count < 0 {
+        tracing::warn!(count, "DefineWorldOffsets: negative count");
+        return std::ptr::null_mut();
+    }
+    sim_data.worlds.clear();
+    for _ in 0..count {
+        let offset_x = match reader.read_int() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, "DefineWorldOffsets: offset_x read failed");
+                return std::ptr::null_mut();
+            }
+        };
+        let offset_y = match reader.read_int() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, "DefineWorldOffsets: offset_y read failed");
+                return std::ptr::null_mut();
+            }
+        };
+        let size_x = match reader.read_int() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, "DefineWorldOffsets: size_x read failed");
+                return std::ptr::null_mut();
+            }
+        };
+        let size_y = match reader.read_int() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(?e, "DefineWorldOffsets: size_y read failed");
+                return std::ptr::null_mut();
+            }
+        };
+        sim_data.worlds.push(WorldOffsetData {
+            offset_x,
+            offset_y,
+            width: size_x,
+            height: size_y,
+        });
+    }
+    tracing::info!(count, "DefineWorldOffsets done");
     std::ptr::null_mut()
 }
 
@@ -1052,11 +1107,35 @@ pub fn handle_prepare_game_data(_reader: &mut BinaryBufferReader) -> *mut c_void
     result
 }
 
-/// ClearUnoccupiedCells handler 桩。
-/// 对照源码 02_save_load.c L405-465。
-/// 任务 4 实现真实逻辑。
+/// ClearUnoccupiedCells handler。
+/// 对照源码 02_save_load.c L405-465：全图 cells + updatedCells 重置为真空
+/// （element=vacuum、mass/temp/radiation=0、disease_idx=0xff、disease_count=0），
+/// 不触碰背墙与世界分区。DLC 多星图加载世界前 C# 会调用。
 pub fn handle_clear_unoccupied_cells(_reader: &mut BinaryBufferReader) -> *mut c_void {
-    tracing::warn!("ClearUnoccupiedCells handler stub (task 4 will implement)");
+    let sim_data_ptr = globals::G_SIM_DATA.lock().0;
+    if sim_data_ptr.is_null() {
+        tracing::warn!("ClearUnoccupiedCells: gSimData is null");
+        return std::ptr::null_mut();
+    }
+    let sim_data = unsafe { &mut *sim_data_ptr };
+    if sim_data.cells.ptr.is_null() || sim_data.updated_cells.ptr.is_null() {
+        tracing::warn!("ClearUnoccupiedCells: cells/updated_cells is null");
+        return std::ptr::null_mut();
+    }
+    let total = (sim_data.width as usize).saturating_mul(sim_data.height as usize);
+    let vacuum = sim_data.vacuum_element_idx;
+    for buf_ptr in [sim_data.cells.ptr, sim_data.updated_cells.ptr] {
+        let cells = unsafe { &mut *buf_ptr };
+        for i in 0..total {
+            cells.element_idx.set(i, vacuum);
+            cells.mass.set(i, 0.0);
+            cells.temperature.set(i, 0.0);
+            cells.disease_count.set(i, 0);
+            cells.disease_idx.set(i, 0xff);
+            cells.radiation.set(i, 0.0);
+        }
+    }
+    tracing::info!(total, "ClearUnoccupiedCells done");
     std::ptr::null_mut()
 }
 
@@ -1068,11 +1147,123 @@ pub fn handle_set_saved_options(_reader: &mut BinaryBufferReader) -> *mut c_void
     std::ptr::null_mut()
 }
 
-/// ResizeAndInitializeVacuumCells handler 桩。
-/// 对照源码 02_save_load.c L485-493。
-/// 任务 4 实现真实逻辑。
-pub fn handle_resize_and_initialize_vacuum_cells(_reader: &mut BinaryBufferReader) -> *mut c_void {
-    tracing::warn!("ResizeAndInitializeVacuumCells handler stub (task 4 will implement)");
+/// ResizeAndInitializeVacuumCells handler。
+/// 对照源码 SimDLL_Source.c L123719-123950（SimData::ResizeAndInitializeVacuumCells）。
+///
+/// 消息：grid_size.x(i32) + grid_size.y(i32) + width + height + x_offset + y_offset。
+/// （grid_size 原版读取后不使用；DLC 新增小行星/火箭舱时 C# 调用。）
+///
+/// 效果：在簇网格 (x_offset, y_offset) 处初始化一个 width×height 的矩形区域：
+/// - 内部（行 y_offset+1..y_offset+height、列 x_offset+1..x_offset+width）：
+///   cells/updatedCells = 真空、mass/temp/radiation=0、disease 清零；backwall = 真空。
+/// - 边界（上 y_offset / 下 y_offset+height+1 / 左 x_offset / 右 x_offset+width+1）：
+///   cells/updatedCells = 中子(unobtanium)、mass=9999、temp/radiation=0；backwall = 真空。
+pub fn handle_resize_and_initialize_vacuum_cells(reader: &mut BinaryBufferReader) -> *mut c_void {
+    let sim_data_ptr = globals::G_SIM_DATA.lock().0;
+    if sim_data_ptr.is_null() {
+        tracing::warn!("ResizeAndInitializeVacuumCells: gSimData is null");
+        return std::ptr::null_mut();
+    }
+    let mut read_int = || match reader.read_int() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(?e, "ResizeAndInitializeVacuumCells: read failed");
+            -1
+        }
+    };
+    let _grid_size_x = read_int();
+    let _grid_size_y = read_int();
+    let width = read_int();
+    let height = read_int();
+    let x_offset = read_int();
+    let y_offset = read_int();
+    if width < 0 || height < 0 {
+        tracing::warn!(width, height, "ResizeAndInitializeVacuumCells: invalid size");
+        return std::ptr::null_mut();
+    }
+    let sim_data = unsafe { &mut *sim_data_ptr };
+    if sim_data.cells.ptr.is_null()
+        || sim_data.updated_cells.ptr.is_null()
+        || sim_data.backwall.ptr.is_null()
+    {
+        tracing::warn!("ResizeAndInitializeVacuumCells: buffers null");
+        return std::ptr::null_mut();
+    }
+    let vacuum = sim_data.vacuum_element_idx;
+    let unobtanium = sim_data.unobtanium_element_idx;
+    let sim_w = sim_data.width as i64;
+
+    // 写一个格：双缓冲 + 背墙（元素/质量按参数，其余清零）。
+    // 对照原版各循环体：element/mass/temp/disease_count/disease_idx/radiation + backwall。
+    fn write_cell(
+        sim: &mut SimData,
+        cell: i64,
+        elem: u16,
+        mass: f32,
+        bw_elem: u16,
+    ) {
+        if cell < 0 {
+            return;
+        }
+        let cell = cell as usize;
+        for buf_ptr in [sim.cells.ptr, sim.updated_cells.ptr] {
+            if buf_ptr.is_null() {
+                continue;
+            }
+            let cells = unsafe { &mut *buf_ptr };
+            if cell >= cells.element_idx.len() {
+                continue;
+            }
+            cells.element_idx.set(cell, elem);
+            cells.mass.set(cell, mass);
+            cells.temperature.set(cell, 0.0);
+            cells.disease_count.set(cell, 0);
+            cells.disease_idx.set(cell, 0xff);
+            cells.radiation.set(cell, 0.0);
+        }
+        if !sim.backwall.ptr.is_null() {
+            let backwall = unsafe { &mut *sim.backwall.ptr };
+            if cell < backwall.element_idx.len() {
+                backwall.element_idx.set(cell, bw_elem);
+                backwall.mass.set(cell, 0.0);
+                backwall.temperature.set(cell, 0.0);
+            }
+        }
+    }
+
+    // 内部：行 y_offset+1..y_offset+height，列 x_offset+1..x_offset+width（原版 L123756）
+    for y in 0..height as i64 {
+        for x in 0..width as i64 {
+            let cell = (y_offset as i64 + 1 + y) * sim_w + (x_offset as i64 + x) + 1;
+            write_cell(sim_data, cell, vacuum, 0.0, vacuum);
+        }
+    }
+    // 边界行：上 y_offset、下 y_offset+height+1，列 x_offset..x_offset+width+1（原版 Loop A）
+    for i in 0..width as i64 + 2 {
+        let top = sim_w * y_offset as i64 + (x_offset as i64 + i);
+        write_cell(sim_data, top, unobtanium, 9999.0, vacuum);
+        let bottom = (y_offset as i64 + 1 + height as i64) * sim_w + (x_offset as i64 + i);
+        write_cell(sim_data, bottom, unobtanium, 9999.0, vacuum);
+    }
+    // 边界列：左 x_offset、右 x_offset+width+1，行 y_offset+1..y_offset+height（原版 Loop B）
+    for i in 1..height as i64 + 1 {
+        let row = (y_offset as i64 + i) * sim_w;
+        write_cell(sim_data, row + x_offset as i64, unobtanium, 9999.0, vacuum);
+        write_cell(
+            sim_data,
+            row + x_offset as i64 + width as i64 + 1,
+            unobtanium,
+            9999.0,
+            vacuum,
+        );
+    }
+    tracing::info!(
+        width,
+        height,
+        x_offset,
+        y_offset,
+        "ResizeAndInitializeVacuumCells done"
+    );
     std::ptr::null_mut()
 }
 
@@ -2172,6 +2363,171 @@ mod tests {
             }
             // 边界格保持 0（memset 清零）
             assert_eq!(std::ptr::read(sd.world_zones.ptr), 0, "边界格应为 0");
+        }
+        clean_up();
+    }
+
+    /// 最小元素表：真空 id=0x2d39bf75 → 211，中子 id=0x6d95058c → 0。
+    fn init_min_elements_for_dlc_handlers() {
+        let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.element_indices.clear();
+        table.elements.resize(212, Default::default());
+        table.elements[211].id = 0x2d39bf75i32;
+        table.elements[0].id = 0x6d95058cu32 as i32;
+        table.element_indices.insert(0x2d39bf75u32, 211u16);
+        table.element_indices.insert(0x6d95058cu32, 0u16);
+    }
+
+    #[test]
+    fn handle_define_world_offsets_populates_worlds() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+        init_min_elements_for_dlc_handlers();
+
+        let mut alloc_w = BinaryBufferWriter::new();
+        alloc_w.write_int(4);
+        alloc_w.write_int(4);
+        alloc_w.write_bool(false);
+        alloc_w.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&alloc_w.into_bytes());
+        let _ = handle_allocate_cells(&mut reader);
+
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(2);
+        w.write_int(10);
+        w.write_int(20);
+        w.write_int(100);
+        w.write_int(200);
+        w.write_int(30);
+        w.write_int(40);
+        w.write_int(300);
+        w.write_int(400);
+        let mut reader = BinaryBufferReader::new(&w.into_bytes());
+        handle_define_world_offsets(&mut reader);
+
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            assert_eq!(sd.worlds.len(), 2);
+            let a = sd.worlds.as_slice();
+            assert_eq!(a[0].offset_x, 10);
+            assert_eq!(a[0].offset_y, 20);
+            assert_eq!(a[0].width, 100);
+            assert_eq!(a[0].height, 200);
+            assert_eq!(a[1].offset_x, 30);
+            assert_eq!(a[1].offset_y, 40);
+            assert_eq!(a[1].width, 300);
+            assert_eq!(a[1].height, 400);
+        }
+        clean_up();
+    }
+
+    #[test]
+    fn handle_clear_unoccupied_cells_resets_all_cells_to_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+        init_min_elements_for_dlc_handlers();
+
+        let mut alloc_w = BinaryBufferWriter::new();
+        alloc_w.write_int(3);
+        alloc_w.write_int(2);
+        alloc_w.write_bool(false);
+        alloc_w.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&alloc_w.into_bytes());
+        let _ = handle_allocate_cells(&mut reader); // sim 5x4 = 20 cells
+
+        unsafe {
+            let sd = &mut *globals::G_SIM_DATA.lock().0;
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let cells = &mut *buf_ptr;
+                for i in 0..20usize {
+                    cells.element_idx.set(i, 7);
+                    cells.mass.set(i, 123.0);
+                    cells.temperature.set(i, 456.0);
+                    cells.disease_count.set(i, 99);
+                    cells.disease_idx.set(i, 3);
+                    cells.radiation.set(i, 5.0);
+                }
+            }
+        }
+
+        let mut reader = BinaryBufferReader::new(&[]);
+        handle_clear_unoccupied_cells(&mut reader);
+
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            assert_eq!(sd.vacuum_element_idx, 211);
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let cells = &*buf_ptr;
+                for i in 0..20usize {
+                    assert_eq!(cells.element_idx.get(i), 211, "elem[{}]", i);
+                    assert_eq!(cells.mass.get(i), 0.0);
+                    assert_eq!(cells.temperature.get(i), 0.0);
+                    assert_eq!(cells.disease_count.get(i), 0);
+                    assert_eq!(cells.disease_idx.get(i), 0xff);
+                    assert_eq!(cells.radiation.get(i), 0.0);
+                }
+            }
+        }
+        clean_up();
+    }
+
+    #[test]
+    fn handle_resize_and_initialize_vacuum_cells_fills_region() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+        init_min_elements_for_dlc_handlers();
+
+        let mut alloc_w = BinaryBufferWriter::new();
+        alloc_w.write_int(10);
+        alloc_w.write_int(10);
+        alloc_w.write_bool(false);
+        alloc_w.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&alloc_w.into_bytes());
+        let _ = handle_allocate_cells(&mut reader); // sim 12x12 = 144 cells
+
+        // grid_size(2 ints, 忽略) + width=4 + height=3 + x_offset=3 + y_offset=2
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(0);
+        w.write_int(0);
+        w.write_int(4);
+        w.write_int(3);
+        w.write_int(3);
+        w.write_int(2);
+        let mut reader = BinaryBufferReader::new(&w.into_bytes());
+        handle_resize_and_initialize_vacuum_cells(&mut reader);
+
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            assert_eq!(sd.vacuum_element_idx, 211);
+            assert_eq!(sd.unobtanium_element_idx, 0);
+            let w = sd.width as usize;
+            let cells = &*sd.cells.ptr;
+            let bw = &*sd.backwall.ptr;
+            // 内部：行 3..=5、列 4..=7 → 真空
+            for y in 3..=5usize {
+                for x in 4..=7usize {
+                    let cell = y * w + x;
+                    assert_eq!(cells.element_idx.get(cell), 211, "interior @{}", cell);
+                    assert_eq!(cells.mass.get(cell), 0.0);
+                    assert_eq!(bw.element_idx.get(cell), 211, "bw interior @{}", cell);
+                }
+            }
+            // 边界：上 2 / 下 6 / 左 3 / 右 8 → 中子 + mass 9999
+            for x in 3..=8usize {
+                for y in [2usize, 6] {
+                    let cell = y * w + x;
+                    assert_eq!(cells.element_idx.get(cell), 0, "border @{}", cell);
+                    assert_eq!(cells.mass.get(cell), 9999.0);
+                }
+            }
+            for y in 3..=5usize {
+                for x in [3usize, 8] {
+                    let cell = y * w + x;
+                    assert_eq!(cells.element_idx.get(cell), 0, "border col @{}", cell);
+                    assert_eq!(cells.mass.get(cell), 9999.0);
+                }
+            }
         }
         clean_up();
     }
