@@ -776,3 +776,37 @@ property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生�
 - **待实测**：部署 → 空间生态区应满曝光、阳光可穿透真空；光线传感器/
   毛刺花/光照叠层回归；流星雨期间与平静期对比。
 
+### 阶段 B 实测修复：Constant 发射节奏（2026-08-04，用户实测后内联修复）
+
+**用户实测反馈**：
+- 人力粒子发生器间歇性发射 ✓（其 SMI 门控本来就是间歇，正确）；
+- 发光虫/冰息萝卜等其余发射器**全部间歇性**（原版应为连续）✗；
+- **熔毁反应堆不发射辐射** ✗（原版运行态/熔毁态都持续发射，熔毁后
+  4800→0 约 3000s）。
+- 用户纠正原版行为：Reactor.cs **L110 on.Enter 显式 SetEmitting(true)**
+  （运行态发射，emitRads=2400）；熔毁态 L184 SetEmitting(true) +
+  L257 Lerp(4800,0,timeSinceMeltdown/3000)。此前"正常态不发射"结论有误。
+
+**根因（辐射时序两处偏离原版）**：
+1. 此前 Update 门控 `emitTimer >= emitRate` 才发 → rate=1 的 Constant
+   发射器**每秒才发一次**；而辐射衰减 `rad -= rad/linger`（linger=1.1，
+   每 tick 剩约 9%）→ 每秒一次的发射 2~3 tick 内衰减殆尽 → 叠层看起来
+   是"间歇性脉冲"；反应堆（rate=1）同理，闪烁几乎不可见 →"不发射"。
+2. 原版节奏是 **stepTimer 小数累加器驱动**：step_time=emitSpeed/max_r，
+   `n=(int)(dt/step_time)`，n<1 时不发、累加器攒够一个 step_time 补发 1 次
+   （帧末 emitStepTimer+=dt、每次发射 -=step_time）→ 半径 6 约 6 次/s、
+   半径 25（反应堆）约 20+ 次/s，叠层呈现连续。
+
+**修复（8e4157b，严格对照 11_msvcrt_ignored.c L39693-39881）**：
+- Update 重写：timer<=speed 恒可发（rate_ok 时重置 timer/step）；timer>speed
+  且 !rate_ok → skip；发射次数按 stepTimer 累加器补发，rate==0 恒 n=1；
+  emitStep=(emitStep+1)%max_r 环绕；帧末 emitStepTimer+=dt。
+- Modify：emitSpeed = min(emitSpeed, emitRate)（原版 L39168 钳制）；
+  **不再重置 emitTimer/emitStep/emitStepTimer**（原版 Modify 不重置，
+  灭活期计时冻结、重新激活后续走）。
+- 测试：9 条 emitter 测试全过（新增 stepTimer 补发、rate 边界重置 step、
+  多步发射+环绕、speed 钳制断言）；全量 466 测试串行全过；release 构建成功。
+- **待实测（部署新 DLL）**：发光虫/冰息萝卜应连续辐射；人力粒子发生器仍
+  间歇（正确）；蜂巢 Pulsing 节奏；运行态/熔毁态反应堆持续辐射且熔毁
+  5 周期（3000s）后归零；单星零辐射不回归。
+
