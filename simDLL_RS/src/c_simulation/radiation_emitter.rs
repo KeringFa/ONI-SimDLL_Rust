@@ -448,6 +448,9 @@ fn tick_pulsing(sim: &mut SimData, bounds: RegionBounds, rec: &mut RadiationEmit
             if x < bounds.min_x as i32 || x > bounds.max_x as i32 || x < 1 {
                 continue;
             }
+            if !in_radial_range(x, y, ex, ey, rec.emit_angle, rec.emit_direction) {
+                continue;
+            }
             let rx2 = (rx * rx) as f32;
             let ry2 = (ry * ry) as f32;
             if (dy * dy) as f32 / ry2 + (dx * dx) as f32 / rx2 > 1.0 {
@@ -635,6 +638,94 @@ mod tests {
             assert!(u.radiation.get(22) > 0.0, "椭圆内上方格应收到辐射");
             // cell 14+16=30（上方3格）超出 radiusY=2 → 不受影响
             assert_eq!(u.radiation.get(30), 0.0, "椭圆外不受影响");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 3：Pulsing——step 0 中心 +emitRads；step 1 环（radius×2/2=2）内每格
+    /// +emitRads/linger（线吸收 1.0）；emitStep 随 tick 递增。
+    #[test]
+    fn emitter_pulsing_expands_ring() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3); // → sim 12（行1 列4，居中）
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(0.0);
+        w.write_float(10.0); // speed=10 → 测试期间不重置 emitStep
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(1); // Pulsing
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        reg.register(&mut sd, &msg);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        // 更新 1：step 0 → 中心 +110
+        update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
+        unsafe {
+            assert!(
+                ((*sd.updated_cells.ptr).radiation.get(12) - 110.0).abs() < 1e-3,
+                "step0 中心 +110"
+            );
+        }
+        // 更新 2：step 1 → 环（rx=ry=2）内每格 +110/1.1=100
+        update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.radiation.get(12) - 210.0).abs() < 1e-3,
+                "中心 110+100=210，got {}",
+                u.radiation.get(12)
+            );
+            assert!((u.radiation.get(13) - 100.0).abs() < 1e-3, "环内右邻 +100");
+            assert!((u.radiation.get(20) - 100.0).abs() < 1e-3, "环内上方 +100");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 3b：PulsingAveraged——step 0 中心 = emitRads/面积（radius 2×2 → 面积1 → 110）。
+    #[test]
+    fn emitter_pulsing_averaged_center_step() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(0.0);
+        w.write_float(10.0);
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(2); // PulsingAveraged
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        reg.register(&mut sd, &msg);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
+        unsafe {
+            assert!(
+                ((*sd.updated_cells.ptr).radiation.get(12) - 110.0).abs() < 1e-3,
+                "Averaged step0 中心 = 110/面积1 = 110"
+            );
         }
         DestroyElementsTable();
     }
