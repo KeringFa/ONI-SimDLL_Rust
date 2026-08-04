@@ -135,6 +135,80 @@ pub(crate) fn run_space_vacuum_task(sim: &mut crate::a_framework::sim_data::SimD
     //   此前 element_idx[0]（=65535 加载值）判定把原版不删的格也删了（过度宽松；
     //   old 版因无 vacuumElementIdx 字段才用 element_idx[0]）。修正回 vacuumElementIdx。
     let vacuum = backwall.vacuum_element_idx;
+    // 2026-08-04 诊断（临时）：首次运行统计太空格背墙分布，确认判定条件与数据。
+    static SPACE_VACUUM_DIAG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !SPACE_VACUUM_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let (mut n_ff, mut n_bw_vac, mut n_bw_ffff, mut n_bw_void, mut n_liq, mut n_gas, mut n_deletable) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut samples: Vec<(usize, u16, i32, u16, i32, u8, f32)> = Vec::new();
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        let void_idx = sim.void_element_idx;
+        for row in 1..height - 1 {
+            for col in 1..width - 1 {
+                let cell = row * width + col;
+                if world_zones[cell] != 0xFF {
+                    continue;
+                }
+                n_ff += 1;
+                let bw = backwall.element_idx.get(cell);
+                if bw == vacuum {
+                    n_bw_vac += 1;
+                }
+                if bw == 0xFFFF {
+                    n_bw_ffff += 1;
+                }
+                if bw == void_idx {
+                    n_bw_void += 1;
+                }
+                let elem = updated.element_idx.get(cell);
+                let state = match elements_table::get_element_post_process_data(elem) {
+                    Some(ppd) => match ppd.state & 3 {
+                        s @ 1 => {
+                            n_gas += 1;
+                            s
+                        }
+                        s @ 2 => {
+                            n_liq += 1;
+                            s
+                        }
+                        _ => 0,
+                    },
+                    None => 0,
+                };
+                if bw == vacuum && (state == 1 || state == 2) {
+                    n_deletable += 1;
+                }
+                if samples.len() < 5 && (bw == vacuum || bw == 0xFFFF) {
+                    samples.push((
+                        cell,
+                        bw,
+                        elements_table::get_element_id_by_idx(bw).unwrap_or(-1),
+                        elem,
+                        elements_table::get_element_id_by_idx(elem).unwrap_or(-1),
+                        elements_table::get_element_post_process_data(elem)
+                            .map(|p| p.state & 3)
+                            .unwrap_or(0xFF),
+                        updated.mass.get(cell),
+                    ));
+                }
+            }
+        }
+        tracing::info!(
+            n_ff,
+            n_bw_vac,
+            n_bw_ffff,
+            n_bw_void,
+            n_liq,
+            n_gas,
+            n_deletable,
+            vacuum,
+            void = void_idx,
+            bw_vacuum_field = backwall.vacuum_element_idx,
+            ?samples,
+            "space_vacuum: first-run diag"
+        );
+    }
     unsafe {
         let updated = &mut *sim.updated_cells.ptr;
         let flow = std::slice::from_raw_parts_mut(sim.flow.ptr, total);

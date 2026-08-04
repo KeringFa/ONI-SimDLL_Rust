@@ -320,6 +320,19 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
                     }
                 };
 
+                // 2026-08-04 修复（太空删除根因）：原版 Load 的 disease 段为 8B/格
+                // （4B disease_hash + 4B disease_count，见 02_save_load.c L133-147）。
+                // 此前漏读 disease_count → reader 每格落后 4B → 背墙段整体偏移
+                // 4B/格 → 把 disease_count（无病菌时为 0）当成背墙元素 hash →
+                // 全图背墙读成 0xFFFF → 太空删除判定 backwall==真空 恒失败。
+                let disease_count = match reader.read_int() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(?e, "Load: disease count read failed");
+                        return std::ptr::null_mut();
+                    }
+                };
+
                 // L132-137: 获取 disease_idx
                 let disease_idx = if disease_hash == 0 {
                     0xffu8
@@ -331,6 +344,7 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
                 };
 
                 cells.disease_idx.set(cell_idx, disease_idx);
+                cells.disease_count.set(cell_idx, disease_count);
 
                 // L143-147: if disease_idx == 0xff → disease_count = 0
                 if disease_idx == 0xff {
@@ -345,6 +359,12 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         let backwall_ptr = sim_data.backwall.ptr;
         if !backwall_ptr.is_null() {
             let backwall = unsafe { &mut *backwall_ptr };
+            // 2026-08-04 诊断（临时）：存档背墙 hash 统计 + 顶部（太空）行样本，
+            // 用于确认原版存档太空背墙 = 真空 hash(0x2d39bf75) 时，加载后索引是否还原为真空。
+            let mut diag_top_vac = 0u64;
+            let mut diag_top_zero = 0u64;
+            let mut diag_top_void = 0u64;
+            let mut diag_samples: Vec<(i64, i64, u32, u16)> = Vec::new();
 
             for row in 0..save_height as i64 {
                 let row_start = offset as i64 + row * (stride as i64);
@@ -362,6 +382,17 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
 
                     // L166: GetElementIndex
                     let bw_elem = elements_table::get_element_index_pub(elem_hash);
+                    if row >= save_height as i64 - 25 {
+                        match elem_hash {
+                            0x2d39bf75 => diag_top_vac += 1,
+                            0xa9360b34 => diag_top_void += 1,
+                            0 => diag_top_zero += 1,
+                            _ => {}
+                        }
+                        if diag_samples.len() < 3 && row == save_height as i64 - 1 {
+                            diag_samples.push((row, col, elem_hash, bw_elem));
+                        }
+                    }
                     backwall.element_idx.set(cell_idx, bw_elem);
 
                     // L177-178: 读取 mass
@@ -384,6 +415,17 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
                     };
                     backwall.temperature.set(cell_idx, bw_temp);
                 }
+            }
+            if save_height > 0 {
+                tracing::info!(
+                    diag_top_vac,
+                    diag_top_zero,
+                    diag_top_void,
+                    vacuum_idx = sim_data.vacuum_element_idx,
+                    void_idx = sim_data.void_element_idx,
+                    ?diag_samples,
+                    "Load: backwall top-25 rows diag (space)"
+                );
             }
         }
     }
@@ -1393,6 +1435,42 @@ pub fn begin_save(
             let bw_mass_slice = backwall.mass.as_slice();
             let bw_temp_slice = backwall.temperature.as_slice();
 
+            // 2026-08-04 诊断（临时）：BeginSave 时背墙 element_idx 分布统计。
+            // 根因确认后：原版存档背墙实为真空 hash（0x2d39bf75）；
+            // 此前"全 0"是 handle_load 漏读 disease_count（4B/格 → 应为 8B/格）
+            // 导致背墙段偏移 4B/格、把 disease_count 当成背墙 hash 的假象。
+            {
+                let vacuum_idx = elements_table::get_element_index_pub(0x2d39bf75);
+                let mut n_ffff = 0u64;
+                let mut n_zero = 0u64;
+                let mut n_vac = 0u64;
+                let mut n_other = 0u64;
+                let mut other_samples: Vec<(usize, u16)> = Vec::new();
+                for i in 0..total_cells {
+                    let v = bw_elem_idx_slice.get(i).copied().unwrap_or(0xffff);
+                    match v {
+                        0xffff => n_ffff += 1,
+                        0 => n_zero += 1,
+                        x if x == vacuum_idx => n_vac += 1,
+                        x => {
+                            n_other += 1;
+                            if other_samples.len() < 8 {
+                                other_samples.push((i, x));
+                            }
+                        }
+                    }
+                }
+                tracing::info!(
+                    n_ffff,
+                    n_zero,
+                    n_vac,
+                    n_other,
+                    vacuum_idx,
+                    ?other_samples,
+                    "BeginSave: backwall element_idx distribution diag"
+                );
+            }
+
             for i in 0..total_cells {
                 // L124: backwall_element_idx[i] (u16)
                 let bw_elem_idx = bw_elem_idx_slice.get(i).copied().unwrap_or(0xffff);
@@ -1797,6 +1875,139 @@ mod tests {
 
         clean_up();
     }
+
+    #[test]
+    fn begin_save_converts_ffff_backwall_to_vacuum_hash() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        // 填最小元素表：真空 id=0x2d39bf75 在索引 211。
+        {
+            let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.element_indices.clear();
+            table.elements.resize(212, Default::default());
+            table.elements[211].id = 0x2d39bf75i32;
+            table.element_indices.insert(0x2d39bf75u32, 211u16);
+        }
+
+        // AllocateCells（2x2 → sim 4x4 = 16 cells）
+        let mut alloc_w = BinaryBufferWriter::new();
+        alloc_w.write_int(2);
+        alloc_w.write_int(2);
+        alloc_w.write_bool(false);
+        alloc_w.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&alloc_w.into_bytes());
+        let _ = handle_allocate_cells(&mut reader);
+
+        // 把 backwall 全部填 0xFFFF
+        unsafe {
+            let sd = &mut *globals::G_SIM_DATA.lock().0;
+            let bw = &mut *sd.backwall.ptr;
+            for i in 0..16usize {
+                bw.element_idx.set(i, 0xffff);
+            }
+        }
+
+        let mut size: std::os::raw::c_int = -1;
+        let result = begin_save(&mut size, 0, 0);
+        assert!(!result.is_null());
+        let vac_idx = crate::b_elements::elements_table::get_element_index_pub(0x2d39bf75);
+        let vac_hash = crate::b_elements::elements_table::get_element_id_by_idx(vac_idx);
+        tracing::info!(vac_idx, ?vac_hash, "test: vacuum lookup at begin_save time");
+        eprintln!("TEST vac_idx={} vac_hash={:?}", vac_idx, vac_hash);
+        let bytes = unsafe { std::slice::from_raw_parts(result as *const u8, size as usize) };
+        // 检查 cells 段第一个记录的 hash（cell element 默认 0 → 应写元素0的id）
+        let cell0_hsh = u32::from_le_bytes(bytes[29..33].try_into().unwrap());
+        eprintln!("TEST cell0 hash = {:#x}", cell0_hsh);
+
+        // 解析 backwall 段：header 29 + cells 16*16 + disease 16*8 + backwall 16*12
+        let bw_start = 29 + 16 * 16 + 16 * 8;
+        for i in 0..16usize {
+            let off = bw_start + i * 12;
+            let hsh = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            assert_eq!(
+                hsh, 0x2d39bf75,
+                "backwall[{}] should be vacuum hash after 0xffff conversion, got {:#x}",
+                i, hsh
+            );
+        }
+
+        end_save();
+        clean_up();
+    }
+
+    #[test]
+    fn load_disease_8b_per_cell_keeps_backwall_aligned() {
+        // 回归测试：太空删除根因——原版 Load 的 disease 段是 8B/格（hash+count）。
+        // 若只读 4B/格，背墙段会整体偏移 4B/格，全图背墙读成 0xFFFF。
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        // 最小元素表：真空 id=0x2d39bf75 → 索引 211。
+        {
+            let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.element_indices.clear();
+            table.elements.resize(212, Default::default());
+            table.elements[211].id = 0x2d39bf75i32;
+            table.element_indices.insert(0x2d39bf75u32, 211u16);
+        }
+
+        // AllocateCells（2x2 → sim 4x4 = 16 cells）
+        let mut alloc_w = BinaryBufferWriter::new();
+        alloc_w.write_int(2);
+        alloc_w.write_int(2);
+        alloc_w.write_bool(false);
+        alloc_w.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&alloc_w.into_bytes());
+        let _ = handle_allocate_cells(&mut reader);
+
+        // 构建 version 15 存档：header 29B + cells 16×16B + disease 16×8B + backwall 16×12B
+        let mut w = BinaryBufferWriter::new();
+        w.write_bytes(b"SIMSAVE\0");
+        w.write_int(15);
+        w.write_int(4);
+        w.write_int(4);
+        w.write_int(0);
+        w.write_int(0);
+        w.write_byte(0);
+        for _ in 0..16u32 {
+            w.write_uint(0x2d39bf75); // elem hash = vacuum
+            w.write_float(300.0);
+            w.write_float(1000.0);
+            w.write_float(0.0);
+        }
+        for i in 0..16u32 {
+            w.write_uint(if i % 2 == 0 { 0 } else { 0x1234abcd }); // disease hash
+            w.write_int((i * 7) as i32); // disease count（若漏读，会污染背墙段）
+        }
+        for _ in 0..16u32 {
+            w.write_uint(0x2d39bf75); // backwall hash = vacuum
+            w.write_float(0.0);
+            w.write_float(0.0);
+        }
+        let data = w.into_bytes();
+        let mut load_reader = BinaryBufferReader::new(&data);
+        let result = handle_load(&mut load_reader);
+        assert!(!result.is_null());
+
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            let bw = &*sd.backwall.ptr;
+            for i in 0..16usize {
+                assert_eq!(
+                    bw.element_idx.get(i),
+                    211,
+                    "backwall[{}] should be vacuum index after aligned load, got {}",
+                    i,
+                    bw.element_idx.get(i)
+                );
+            }
+        }
+        clean_up();
+    }
+
 
     #[test]
     fn end_save_releases_buffer() {

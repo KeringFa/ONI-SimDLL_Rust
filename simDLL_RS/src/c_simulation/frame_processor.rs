@@ -549,6 +549,28 @@ fn process_cell_world_zone_modifications(frame: &mut SimFrameInfo, sim_data: &mu
     let slice = frame.cell_world_zone_modifications.as_slice();
     let count = slice.len();
     let world_zones = sim_data.world_zones.ptr as *mut u8;
+    // 2026-08-04 诊断（临时）：DLC 太空删除排查——ModifyCellWorldZone 消息统计。
+    static ZONE_MSG_DIAG: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !ZONE_MSG_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let mut n_ff = 0u32;
+        let mut samples: Vec<(i32, u8)> = Vec::new();
+        for i in 0..count {
+            let e = slice[i];
+            if e.zone_id == 0xFF {
+                n_ff += 1;
+            }
+            if samples.len() < 10 {
+                samples.push((e.game_cell, e.zone_id));
+            }
+        }
+        tracing::info!(
+            count,
+            n_ff,
+            ?samples,
+            "ModifyCellWorldZone: first-batch diag"
+        );
+    }
     for i in 0..count {
         let entry = slice[i];
         let internal_cell = ((entry.game_cell % game_w + 1) as i32)
@@ -1490,6 +1512,52 @@ fn process_element_chunk_messages(frame: &mut SimFrameInfo, sim_data: &mut SimDa
             let width = sim_data.width as usize;
             let backwall = unsafe { &mut *sim_data.backwall.ptr };
             let events = unsafe { &mut *sim_data.sim_events.ptr };
+            // 2026-08-04 诊断（临时）：DLC 多星图太空删除排查——
+            // 统计 ModifyBackwallData 消息：总数 / 真空元素 / 目标在太空区(worldZones==0xFF)。
+            static BACKWALL_MSG_DIAG: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !BACKWALL_MSG_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let mut n_vac = 0u32;
+                let mut n_space_target = 0u32;
+                let mut samples: Vec<(i32, u16, f32, f32)> = Vec::new();
+                let zones = if sim_data.world_zones.ptr.is_null() {
+                    None
+                } else {
+                    Some(unsafe {
+                        std::slice::from_raw_parts(
+                            sim_data.world_zones.ptr,
+                            (width as usize) * (sim_data.height as usize),
+                        )
+                    })
+                };
+                for i in 0..n {
+                    let off = i * 16;
+                    let game_cell = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                    let elem_idx = u16::from_le_bytes(bytes[off + 4..off + 6].try_into().unwrap());
+                    let mass = f32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+                    let temp = f32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap());
+                    if elem_idx == sim_data.vacuum_element_idx {
+                        n_vac += 1;
+                    }
+                    let sim_cell = ((game_cell / game_w + 1) * (width as i32) + game_cell % game_w + 1)
+                        as usize;
+                    if let Some(z) = zones {
+                        if sim_cell < z.len() && z[sim_cell] == 0xFF {
+                            n_space_target += 1;
+                        }
+                    }
+                    if samples.len() < 20 {
+                        samples.push((game_cell, elem_idx, mass, temp));
+                    }
+                }
+                tracing::info!(
+                    n,
+                    n_vac,
+                    n_space_target,
+                    ?samples,
+                    "ModifyBackwallData: first-batch diag"
+                );
+            }
             for i in 0..n {
                 let off = i * 16;
                 let game_cell = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());

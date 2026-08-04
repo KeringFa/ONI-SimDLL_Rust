@@ -281,6 +281,46 @@ fn create_elements_table(reader: &mut BinaryBufferReader) -> Result<usize, Buffe
         table.element_indices.insert(elem_id, i as u16);
     }
 
+    // 2026-08-04 诊断（临时）：DLC 太空删除排查——完整元素表关键数据。
+    // 关注：是否存在 id==0 的元素（存档背墙 hash 0 → GetElementIndex(0) 的语义）；
+    // 以及真空/虚空元素的实际索引与 id。
+    {
+        let vac_hash = 0x2d39bf75u32;
+        let void_hash = 0xa9360b34u32;
+        let mut zero_idx: Vec<usize> = Vec::new();
+        let mut vac_idx: usize = 0xFFFF;
+        let mut void_idx: usize = 0xFFFF;
+        let first_ids: Vec<u32> = table.elements.iter().take(5).map(|e| e.id as u32).collect();
+        let last_ids: Vec<u32> = table
+            .elements
+            .iter()
+            .rev()
+            .take(5)
+            .map(|e| e.id as u32)
+            .collect();
+        for (i, e) in table.elements.iter().enumerate() {
+            let id = e.id as u32;
+            if id == 0 {
+                zero_idx.push(i);
+            }
+            if id == vac_hash {
+                vac_idx = i;
+            }
+            if id == void_hash {
+                void_idx = i;
+            }
+        }
+        tracing::info!(
+            count,
+            ?zero_idx,
+            vac_idx,
+            void_idx,
+            ?first_ids,
+            ?last_ids,
+            "ElementsTable diag (DLC space vacuum)"
+        );
+    }
+
     tracing::info!(
         count,
         mapped = table.element_indices.len(),
