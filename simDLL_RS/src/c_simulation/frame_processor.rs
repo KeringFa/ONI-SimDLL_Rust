@@ -1791,9 +1791,14 @@ pub fn process_cell_radiation_changes(sim: &mut SimData, entries: &[u8]) {
             off += 12;
             continue;
         }
-        let mut r = updated.radiation.get(sim_cell) + delta;
+        // 原版 06_process_messages.c L341-372：fVar1=原值 → +=delta →
+        // 结果 ≤0 时清零且回调 radiation 改记**原值 fVar1**（非 delta）。
+        let original = updated.radiation.get(sim_cell);
+        let mut r = original + delta;
+        let mut cb_rad = delta;
         if r <= 0.0 {
             r = 0.0;
+            cb_rad = original;
         }
         updated.radiation.set(sim_cell, r);
         if callback_idx != -1 {
@@ -1801,7 +1806,7 @@ pub fn process_cell_radiation_changes(sim: &mut SimData, entries: &[u8]) {
             events.radiation_consumed_callbacks.push(crate::a_framework::game_data::RadiationConsumedCallback {
                 game_cell,
                 callback_idx,
-                radiation: delta,
+                radiation: cb_rad,
             });
         }
         off += 12;
@@ -1938,6 +1943,41 @@ mod tests {
         assert_eq!(cb[0].game_cell, 4);
         assert_eq!(cb[0].callback_idx, 7);
         assert!((cb[0].radiation - 2.5).abs() < 1e-6, "回调记录应用前的 delta");
+    }
+
+    /// 任务 2b：CellRadiationModification 结果 ≤0 清零时，回调 radiation 记
+    /// **原值**（原版 06_process_messages.c：fVar11 = fVar1），而非 delta。
+    #[test]
+    fn cell_radiation_clamped_callback_reports_original_value() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            (*sd.updated_cells.ptr).radiation.set(13, 5.0);
+        }
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(4);      // gameCell → sim 13
+        w.write_float(-10.0); // delta 使结果 -5 ≤0 → 清零
+        w.write_int(7);      // callbackIdx
+        let data = w.into_bytes();
+
+        process_cell_radiation_changes(&mut sd, &data);
+        unsafe {
+            assert_eq!(
+                (*sd.updated_cells.ptr).radiation.get(13),
+                0.0,
+                "结果 ≤0 → 清零"
+            );
+        }
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.radiation_consumed_callbacks.len(), 1);
+        let cb = events.radiation_consumed_callbacks.as_slice();
+        assert_eq!(cb[0].game_cell, 4);
+        assert_eq!(cb[0].callback_idx, 7);
+        assert!(
+            (cb[0].radiation - 5.0).abs() < 1e-6,
+            "钳零时回调 radiation = 原值 5.0（非 delta -10），got {}",
+            cb[0].radiation
+        );
     }
 
     #[test]

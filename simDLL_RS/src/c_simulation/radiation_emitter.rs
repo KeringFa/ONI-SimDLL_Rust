@@ -355,7 +355,10 @@ fn push_state_changed(sim: &mut SimData, callback_idx: i32, sim_handle: i32) {
 /// 同元素表 LCG（与 liquid_flow::next_random 同款）。
 fn next_random(sim: &mut SimData) -> f32 {
     sim.random_seed = sim.random_seed.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
-    ((sim.random_seed >> 16) & 0x7fff) as f32 * 3.051851e-05
+    // 原版 L40280-40288：随机值 = (seed>>16 & 0x7fff)，tickConstant 抖动公式
+    // 再乘 7.629627e-06（=1/131072）与 amount。此前归一化到 [0,1] 导致随机项
+    // 再缩 1/32768 ≈ 0，抖动退化为恒定 −12.5%。
+    ((sim.random_seed >> 16) & 0x7fff) as f32
 }
 
 /// 扇形判定（原版 inRadialRange L40033）。
@@ -374,7 +377,8 @@ fn in_radial_range(tx: i32, ty: i32, ex: i32, ey: i32, angle: f32, direction: f3
 }
 
 /// 沿直线逐格辐射吸收（原版 RadiationAbsorptionAlongLine L39249）：
-/// Bresenham 走查发射器→目标，透射率 = Π(1 − block)，block 用宇宙遮挡公式
+/// **半步 DDA** 走查发射器→目标（非整数 Bresenham——|dy|>|dx| 斜率下两者
+/// 访问的格子集合不同），透射率 = Π(1 − block)，block 用宇宙遮挡公式
 /// （构造格 constructedFactor / 质量加权）。
 fn radiation_absorption_along_line(sim: &SimData, ex: i32, ey: i32, tx: i32, ty: i32) -> f32 {
     let w = sim.width as i32;
@@ -385,14 +389,37 @@ fn radiation_absorption_along_line(sim: &SimData, ex: i32, ey: i32, tx: i32, ty:
     let const_f = sim.radiation_constructed_factor;
     let cells = unsafe { &*sim.updated_cells.ptr };
     let mut transmission = 1.0f32;
-    let mut x = ex;
-    let mut y = ey;
-    let dx = (tx - ex).abs();
-    let dy = (ty - ey).abs();
-    let sx = if ex < tx { 1 } else { -1 };
-    let sy = if ey < ty { 1 } else { -1 };
-    let mut err = dx - dy;
+    let abs_dx = (tx - ex).abs();
+    let abs_dy = (ty - ey).abs();
+    // 主轴选择（原版 bVar1 = |dy| <= |dx|，主轴为 X；否则为 Y）。
+    let walk_x = abs_dy <= abs_dx;
+    // 原版排序后恒从**较小主轴坐标**走到较大者（主轴 +1 步进）；
+    // 透射率是乘积、与方向无关，故等价。主轴/副轴端点按同一端点配对。
+    let (dom0, minor0, dom1, minor1) = if walk_x {
+        if ex <= tx {
+            (ex, ey, tx, ty)
+        } else {
+            (tx, ty, ex, ey)
+        }
+    } else {
+        if ey <= ty {
+            (ey, ex, ty, tx)
+        } else {
+            (ty, tx, ey, ex)
+        }
+    };
+    let (mut dom, mut minor) = (dom0, minor0);
+    let dom_end = dom1;
+    let minor_step = if minor1 < minor0 { -1 } else { 1 };
+    let (dom_span, minor_span) = if walk_x {
+        (abs_dx, abs_dy)
+    } else {
+        (abs_dy, abs_dx)
+    };
+    // 半步误差（原版 L39280：fVar13 = (fVar10 - fVar11) * 0.5）
+    let mut error = 0.5 * dom_span as f32;
     loop {
+        let (x, y) = if walk_x { (dom, minor) } else { (minor, dom) };
         if x >= 1 && y >= 1 && x < w - 1 && y < h - 1 {
             let cell = (y * w + x) as usize;
             let elem = cells.element_idx.get(cell);
@@ -408,20 +435,18 @@ fn radiation_absorption_along_line(sim: &SimData, ex: i32, ey: i32, tx: i32, ty:
             };
             transmission *= 1.0 - block.clamp(0.0, 1.0);
         }
-        if x == tx && y == ty {
+        if dom == dom_end {
             break;
         }
-        let e2 = 2 * err;
-        if e2 > -dy {
-            err -= dy;
-            x += sx;
+        // 原版 L39820-39826：error -= 副轴跨度；<0 → error += 主轴跨度、副轴步进
+        error -= minor_span as f32;
+        if error < 0.0 {
+            error += dom_span as f32;
+            minor += minor_step;
         }
-        if e2 < dx {
-            err += dx;
-            y += sy;
-        }
+        dom += 1;
     }
-    transmission
+    transmission.clamp(0.0, 1.0)
 }
 
 /// tickConstant（原版 L40172）：椭圆区域逐格 falloff × emitRads / lingerRate，
@@ -783,6 +808,100 @@ mod tests {
             assert!(u.radiation.get(22) > 0.0, "椭圆内上方格应收到辐射");
             // cell 14+16=30（上方3格）超出 radiusY=2 → 不受影响
             assert_eq!(u.radiation.get(30), 0.0, "椭圆外不受影响");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 原版半步 DDA 线走查（L39249）：(2,2)→(3,5)（|dy|>|dx|）经过
+    /// (2,2),(2,3),(3,4),(3,5)；整数 Bresenham 会经过 (2,4)。把 (2,4)
+    /// 设为全遮挡 → DDA 透射率必须为 1.0。
+    #[test]
+    fn radiation_absorption_line_dda_visits_original_cells() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+            // cell 34 = (2,4)：仅整数 Bresenham 路径经过
+            b.element_idx.set(34, 1);
+            b.mass.set(34, 1e6);
+        });
+        let t = radiation_absorption_along_line(&sd, 2, 2, 3, 5);
+        assert!(
+            (t - 1.0).abs() < 1e-6,
+            "DDA 路径避开 (2,4) 全遮挡格，透射率应为 1.0，got {t}"
+        );
+        DestroyElementsTable();
+    }
+
+    /// next_random 返回原始 (seed>>16 & 0x7fff)（原版 L40280-40288），
+    /// 不做 [0,1] 归一化——归一化会让 tickConstant 抖动随机项趋零。
+    #[test]
+    fn next_random_returns_raw_rand_value() {
+        let mut sd = make_sim();
+        sd.random_seed = 12345;
+        let s1 = 12345u32.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+        let expected = ((s1 >> 16) & 0x7fff) as f32;
+        let got = next_random(&mut sd);
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "raw rand = {expected}，got {got}"
+        );
+        assert!(got >= 0.0 && got <= 32767.0, "rand ∈ [0, 32767]");
+    }
+
+    /// tickConstant 低 falloff 抖动（原版 L40280-40291）：amount +=
+    /// rand×amount×7.629627e-06 − amount×0.125（±12.5%）。
+    /// radius 3 发射器在 sim cell 12（cx=4, cy=1）：按 dy→dx 行主序，
+    /// 仅 (dy=0,dx=-3) 轴向格（falloff=0）先抽取 1 次（(dy=0,dx=3) 在 x=7
+    /// 边界被跳过），故 cell 18（dx=-2, dy=1，falloff=2/9、amount=22.222…）
+    /// 是**第 2 次**随机抽取，用 seed 确定性断言公式。
+    #[test]
+    fn tick_constant_low_falloff_jitter_matches_original() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        sd.random_seed = 12345;
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(3);
+        w.write_short(3);
+        w.write_float(110.0);
+        w.write_float(0.0); // rate=0
+        w.write_float(1.0);
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(0); // Constant
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        reg.register(&mut sd, &msg);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_radiation_emitters(&mut sd, &mut reg, 1.0, bounds);
+        // 复算前两次 LCG 抽取
+        let mut s = 12345u32;
+        s = s.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+        s = s.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+        let rand2 = ((s >> 16) & 0x7fff) as f32;
+        // cell 18 = (2,2)，相对发射器 dx=-2、dy=1
+        let falloff = (1.0 - 2.0 / 3.0) - (1.0 - (1.0 * 2.0) / 3.0) / 3.0;
+        let base = falloff * 110.0 / 1.1;
+        let expected = base + rand2 * base * 7.629627e-06 - base * 0.125;
+        unsafe {
+            let got = (*sd.updated_cells.ptr).radiation.get(18);
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "cell18 抖动 = {expected}，got {got}（base={base}, rand2={rand2}）"
+            );
         }
         DestroyElementsTable();
     }

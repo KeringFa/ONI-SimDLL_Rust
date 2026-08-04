@@ -103,7 +103,12 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
             } else {
                 1.0
             };
-            sim.cosmic_radiation_occlusion.set(cell, (1.0 - block) * above_occ);
+            // 原版 L42760-42775：occlusion = (1-block)×above，<0.01 → 0
+            let mut occ = (1.0 - block) * above_occ;
+            if occ < 0.01 {
+                occ = 0.0;
+            }
+            sim.cosmic_radiation_occlusion.set(cell, occ);
 
             // 衰减（原版 L42785-42810）
             let f = rad / linger;
@@ -186,6 +191,7 @@ mod tests {
             (0i32, 0u8, 0.0f32, 0.0f32),
             (1i32, 3u8, 0.5f32, 0.0f32),
             (2i32, 3u8, 0.2f32, 1000.0f32),
+            (3i32, 3u8, 1.0f32, 0.0f32),
         ] {
             let mut e = Element::default();
             e.id = id;
@@ -214,6 +220,7 @@ mod tests {
             .insert(0u32, 0u16);
         table.element_indices.insert(1u32, 1u16);
         table.element_indices.insert(2u32, 2u16);
+        table.element_indices.insert(3u32, 3u16);
     }
 
     fn make_sim() -> SimData {
@@ -302,6 +309,36 @@ mod tests {
             assert!((u.radiation.get(21) - 100.0).abs() < 1e-3, "真空行 cosmic 100");
             // 行1 固体：block=(2000/2000)×0.5×0.7 + 0.5×0.3 = 0.5；occlusion=0.5 → +50
             assert!((u.radiation.get(13) - 50.0).abs() < 1e-3, "固体遮挡后 cosmic 50");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 3e：occlusion < 0.01 → 0（原版 L42760-42775）——近全遮挡格
+    /// 的微小漏射被清零，不再累加 cosmic。
+    #[test]
+    fn radiation_task_occlusion_below_threshold_zeroed() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        let mut sd = make_sim();
+        // cell 13（行1 列5）= 元素3（factor 1.0）mass=1986 →
+        // block = (1986/2000)×1.0×0.7 + 1.0×0.3 = 0.9951 →
+        // occlusion = (1-0.9951)×1.0 = 0.0049 < 0.01 → 应清零。
+        // cell 21（行2 列5）= 真空，above occlusion = 1.0。
+        fill_both(&mut sd, |b| {
+            b.element_idx.set(13, 3);
+            b.mass.set(13, 1986.0);
+            b.element_idx.set(21, 0);
+        });
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, b, 110.0);
+        assert_eq!(
+            sd.cosmic_radiation_occlusion.get(13),
+            0.0,
+            "occlusion <0.01 应清零"
+        );
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.radiation.get(13), 0.0, "occlusion=0 → 不累加 cosmic");
         }
         DestroyElementsTable();
     }
