@@ -1905,6 +1905,40 @@ mod tests {
         assert!((sd.radiation_max_mass - 3000.0).abs() < 1e-6);
     }
 
+    /// 任务 2：CellRadiationModification（12B：gameCell + delta + callbackIdx）。
+    /// gameCell=4 → sim cell = (4/4+1)*6 + (4%4+1) = 2*6+1 = 13；
+    /// delta 累加、≤0 清零、callbackIdx≠-1 → 消费回调。
+    #[test]
+    fn cell_radiation_modification_applies_delta_and_callback() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            (*sd.updated_cells.ptr).radiation.set(13, 5.0);
+        }
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(4);   // gameCell
+        w.write_float(2.5); // delta
+        w.write_int(7);   // callbackIdx
+        w.write_int(8);   // 第二条：gameCell=8 → sim=(8/4+1)*6+(8%4+1)=3*6+1=19
+        w.write_float(-100.0); // delta 使结果 ≤0 → 清零
+        w.write_int(-1);  // 无回调
+        let data = w.into_bytes();
+
+        process_cell_radiation_changes(&mut sd, &data);
+        unsafe {
+            let r13 = (*sd.updated_cells.ptr).radiation.get(13);
+            assert!((r13 - 7.5).abs() < 1e-6, "delta 累加：5+2.5=7.5，got {r13}");
+            let r19 = (*sd.updated_cells.ptr).radiation.get(19);
+            assert_eq!(r19, 0.0, "delta 使辐射 ≤0 → 清零，got {r19}");
+        }
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.radiation_consumed_callbacks.len(), 1);
+        let cb = events.radiation_consumed_callbacks.as_slice();
+        assert_eq!(cb[0].game_cell, 4);
+        assert_eq!(cb[0].callback_idx, 7);
+        assert!((cb[0].radiation - 2.5).abs() < 1e-6, "回调记录应用前的 delta");
+    }
+
     #[test]
     fn cell_energy_modification_heats_cell_and_caps() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
