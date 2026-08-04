@@ -282,7 +282,10 @@ impl RadiationEmitterRegistry {
         let pending = std::mem::take(&mut self.pending_remove);
         for (handle, callback_idx) in pending {
             let index = (handle & 0xffffff) as usize;
-            if index < self.versions.len() {
+            let version = ((handle >> 24) & 0xff) as u8;
+            // 版本校验：旧存档的延迟 Remove 在新存档复用同 index 后到达时，
+            // 不能误杀新注册的发射器（新世界分配时注册表已整体清空）。
+            if index < self.versions.len() && self.versions[index] == version {
                 self.versions[index] = self.versions[index].wrapping_add(1);
                 self.items[index] = -1;
                 self.free_handles.push(index as i32);
@@ -466,51 +469,125 @@ fn tick_constant(sim: &mut SimData, bounds: RegionBounds, rec: &mut RadiationEmi
     }
 }
 
-/// tickPulsing（原版 L40263）：脉冲环扩散；PulsingAveraged 均摊 emitRads。
+/// tickPulsing（原版 L40255-40350）：脉冲环扩散。
+/// - step 0：中心格 += emitRads（PulsingAveraged 为 emitRads/面积）；
+/// - step 1+：SetCircleAA 抗锯齿椭圆轮廓（1~2px 环，非填充圆盘），
+///   每像素强度 = roundf(frac × emitRads)，**无 linger 除**（区别于 Constant）；
+/// - rx/ry = ceil(radius×step_f)（原版 movmskps 取整 hack：正值上取整），min 1。
 fn tick_pulsing(sim: &mut SimData, bounds: RegionBounds, rec: &mut RadiationEmitterData, _dt: f32) {
-    let w = sim.width as usize;
-    let ex = (rec.cell % w as i32) as i32;
-    let ey = (rec.cell / w as i32) as i32;
-    let max_r = rec.emit_radius_x.max(rec.emit_radius_y).max(1) as f32;
+    let w = sim.width as i32;
+    let ex = rec.cell % w;
+    let ey = rec.cell / w;
+    let max_r = rec.emit_radius_x.max(rec.emit_radius_y) as f32;
+    if max_r <= 0.0 {
+        return;
+    }
     let step_f = (rec.emit_step as f32 + 1.0) / max_r;
-    let rx = ((rec.emit_radius_x as f32) * step_f).round().max(1.0) as i32;
-    let ry = ((rec.emit_radius_y as f32) * step_f).round().max(1.0) as i32;
+    let rx = (rec.emit_radius_x as f32 * step_f).ceil().max(1.0) as i32;
+    let ry = (rec.emit_radius_y as f32 * step_f).ceil().max(1.0) as i32;
     let mut emit_rads = rec.emit_rads;
     if rec.emit_type == RadiationEmitterType::PulsingAveraged as i32 {
         let area = ((ry - 1) * (rx - 1)).max(1) as f32;
         emit_rads /= area;
     }
-    let linger = sim.radiation_linger_rate;
     if rec.emit_step == 0 {
         let cell = rec.cell as usize;
         let u = unsafe { &mut *sim.updated_cells.ptr };
         u.radiation.set(cell, u.radiation.get(cell) + emit_rads);
         return;
     }
-    for dy in -ry..=ry {
-        let y = ey + dy;
-        if y < bounds.min_y as i32 || y > bounds.max_y as i32 || y < 1 {
+    if rx <= 1 && ry <= 1 {
+        return;
+    }
+    set_circle_aa(sim, bounds, rec, ex, ey, rx, ry, emit_rads);
+}
+
+/// SetCircleAA（原版 L39482-39596）：抗锯齿椭圆轮廓。
+/// 两个循环（x 向扫描 + y 向扫描）各画边界像素 + 内侧补像素，
+/// 强度按边界亚像素位置插值：inten = roundf(frac × rads)，补像素 = rads − inten。
+fn set_circle_aa(
+    sim: &mut SimData,
+    bounds: RegionBounds,
+    rec: &RadiationEmitterData,
+    cx: i32,
+    cy: i32,
+    rx: i32,
+    ry: i32,
+    rads: f32,
+) {
+    if rx < 1 || ry < 1 {
+        return;
+    }
+    let rx2 = (rx * rx) as f32;
+    let ry2 = (ry * ry) as f32;
+    let inv_hyp = 1.0 / (rx2 + ry2).sqrt();
+    // 第一循环：dx 0..round(rx²/hypot)，dy = floor(ry×sqrt(1−(dx/rx)²))
+    let dx_max = (inv_hyp * rx2).round() as i32;
+    for dx in 0..=dx_max {
+        let y_exact = (1.0 - (dx * dx) as f32 / rx2).sqrt() * ry as f32;
+        let dy = y_exact.floor() as i32;
+        let inten = ((y_exact - dy as f32) * rads).round();
+        if inten > 0.0 {
+            set_pulsing_pixel(sim, bounds, rec, cx, cy, dx, dy, inten);
+        }
+        let comp = rads - inten;
+        if comp > 0.0 {
+            set_pulsing_pixel(sim, bounds, rec, cx, cy, dx, dy - 1, comp);
+        }
+    }
+    // 第二循环：dy 0..round(ry²/hypot)，dx = floor(rx×sqrt(1−(dy/ry)²))
+    let dy_max = (inv_hyp * ry2).round() as i32;
+    for dy in 0..=dy_max {
+        let x_exact = (1.0 - (dy * dy) as f32 / ry2).sqrt() * rx as f32;
+        let dx = x_exact.floor() as i32;
+        let inten = ((x_exact - dx as f32) * rads).round();
+        if inten > 0.0 {
+            set_pulsing_pixel(sim, bounds, rec, cx, cy, dx, dy, inten);
+        }
+        let comp = rads - inten;
+        if comp > 0.0 {
+            set_pulsing_pixel(sim, bounds, rec, cx, cy, dx - 1, dy, comp);
+        }
+    }
+}
+
+/// setPulsing（原版 L40110-40142）：四象限镜像写辐射 += absorption × intensity；
+/// 强度 ≤0 / 越界 / 扇形外 / 源格跳过。
+fn set_pulsing_pixel(
+    sim: &mut SimData,
+    bounds: RegionBounds,
+    rec: &RadiationEmitterData,
+    cx: i32,
+    cy: i32,
+    dx: i32,
+    dy: i32,
+    intensity: f32,
+) {
+    let w = sim.width as i32;
+    let h = sim.height as i32;
+    for (sx, sy) in [(1i32, 1i32), (-1, 1), (1, -1), (-1, -1)] {
+        let x = cx + sx * dx;
+        let y = cy + sy * dy;
+        if x < 1 || y < 1 || x >= w - 1 || y >= h - 1 {
             continue;
         }
-        for dx in -rx..=rx {
-            let x = ex + dx;
-            if x < bounds.min_x as i32 || x > bounds.max_x as i32 || x < 1 {
-                continue;
-            }
-            if !in_radial_range(x, y, ex, ey, rec.emit_angle, rec.emit_direction) {
-                continue;
-            }
-            let rx2 = (rx * rx) as f32;
-            let ry2 = (ry * ry) as f32;
-            if (dy * dy) as f32 / ry2 + (dx * dx) as f32 / rx2 > 1.0 {
-                continue;
-            }
-            let line_abs = radiation_absorption_along_line(sim, ex, ey, x, y);
-            let amount = line_abs * (emit_rads / linger);
-            let cell = (y as usize) * w + x as usize;
-            let u = unsafe { &mut *sim.updated_cells.ptr };
-            u.radiation.set(cell, u.radiation.get(cell) + amount);
+        if x < bounds.min_x as i32
+            || x > bounds.max_x as i32
+            || y < bounds.min_y as i32
+            || y > bounds.max_y as i32
+        {
+            continue;
         }
+        if x == cx && y == cy {
+            continue;
+        }
+        if !in_radial_range(x, y, cx, cy, rec.emit_angle, rec.emit_direction) {
+            continue;
+        }
+        let line_abs = radiation_absorption_along_line(sim, cx, cy, x, y);
+        let cell = (y as usize) * (w as usize) + x as usize;
+        let u = unsafe { &mut *sim.updated_cells.ptr };
+        u.radiation.set(cell, u.radiation.get(cell) + line_abs * intensity);
     }
 }
 
@@ -710,8 +787,9 @@ mod tests {
         DestroyElementsTable();
     }
 
-    /// 任务 3：Pulsing——step 0 中心 +emitRads；step 1 环（radius×2/2=2）内每格
-    /// +emitRads/linger（线吸收 1.0）；dt=0.5=step_time(1/2)，每次更新发射 1 次；
+    /// 任务 3：Pulsing——step 0 中心 +emitRads；step 1 环 = SetCircleAA 抗锯齿
+    /// 椭圆轮廓（rx=ry=2：轴向外侧像素强度 0 被跳过，环落在内侧一格），
+    /// 无 linger 除；dt=0.5=step_time(1/2)，每次更新发射 1 次；
     /// rate=1 边界（timer>=1s）重置 emitStep。
     #[test]
     fn emitter_pulsing_expands_ring() {
@@ -737,7 +815,7 @@ mod tests {
         w.write_float(360.0);
         w.write_int(1); // Pulsing
         let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
-        reg.register(&mut sd, &msg);
+        let h = reg.register(&mut sd, &msg);
         let bounds = crate::d1_activity::full_grid_bounds(&sd);
         // 更新 1（dt=0.5=step_time）：step 0 → 中心 +110
         update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
@@ -757,17 +835,35 @@ mod tests {
                 u.radiation.get(12)
             );
         }
-        // 更新 3（dt=0.5）：step 1 → 环（rx=ry=2）内每格 +110/1.1=100
+        // 更新 3（dt=0.5）：step 1 → 环（rx=ry=2）轮廓
         update_radiation_emitters(&mut sd, &mut reg, 0.5, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
             assert!(
-                (u.radiation.get(12) - 320.0).abs() < 1e-3,
-                "中心 220+100=320，got {}",
+                (u.radiation.get(12) - 220.0).abs() < 1e-3,
+                "环步不写中心，220，got {}",
                 u.radiation.get(12)
             );
-            assert!((u.radiation.get(13) - 100.0).abs() < 1e-3, "环内右邻 +100");
-            assert!((u.radiation.get(20) - 100.0).abs() < 1e-3, "环内上方 +100");
+            // 半径 2 圆环（rx=ry=2）：边界恰落整格 → 外部像素强度 0 被跳过，
+            // 环像素落在内侧：轴向 (1,0)=278（原版 SetPixel4 四象限在 dy=0 时
+            // 两次写同一格：(29+110)×2）、(0,1)=278 同理、对角 (1,1)=162（81+81）。
+            assert!(
+                (u.radiation.get(13) - 278.0).abs() < 1e-3,
+                "环内右邻 (29+110)×2=278，got {}",
+                u.radiation.get(13)
+            );
+            assert!(
+                (u.radiation.get(20) - 278.0).abs() < 1e-3,
+                "环内上方 (110+29)×2=278，got {}",
+                u.radiation.get(20)
+            );
+            assert!(
+                (u.radiation.get(21) - 162.0).abs() < 1e-3,
+                "环内对角 81+81=162，got {}",
+                u.radiation.get(21)
+            );
+            assert_eq!(u.radiation.get(14), 0.0, "半径 2 环外侧轴向 (2,0) 强度 0");
+            assert_eq!(u.radiation.get(28), 0.0, "半径 2 环外侧轴向 (0,2) 强度 0");
         }
         DestroyElementsTable();
     }
@@ -799,20 +895,82 @@ mod tests {
         let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
         let h = reg.register(&mut sd, &msg);
         let bounds = crate::d1_activity::full_grid_bounds(&sd);
-        // dt=1.0 → n=(int)(1.0/0.5)=2：step 0 → 中心 +110，step 1 → 环 +100，
+        // dt=1.0 → n=(int)(1.0/0.5)=2：step 0 → 中心 +110，step 1 → 环轮廓，
         // emitStep 2 → max_r=2 → 环绕 0。
         update_radiation_emitters(&mut sd, &mut reg, 1.0, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
             assert!(
-                (u.radiation.get(12) - 210.0).abs() < 1e-3,
-                "中心 110+100=210，got {}",
+                (u.radiation.get(12) - 110.0).abs() < 1e-3,
+                "step0 中心 110，got {}",
                 u.radiation.get(12)
             );
-            assert!((u.radiation.get(13) - 100.0).abs() < 1e-3, "环内右邻 +100");
+            assert!((u.radiation.get(13) - 278.0).abs() < 1e-3, "环右邻 278");
+            assert!((u.radiation.get(20) - 278.0).abs() < 1e-3, "环上方 278");
+            assert!((u.radiation.get(21) - 162.0).abs() < 1e-3, "环对角 162");
         }
         let rec = reg.record(h).unwrap();
         assert_eq!(rec.emit_step, 0, "emitStep 在 max_r=2 后回环");
+        DestroyElementsTable();
+    }
+
+    /// 任务 3e：Pulsing 环是**轮廓**而非填充圆盘——radius 3×3 的 step 2 环
+    /// （rx=ry=3）：内部 (1,0) 不受辐射、环上 (2,0)=110、外侧 (3,0)=0。
+    #[test]
+    fn emitter_pulsing_ring_outline_not_filled() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(3);
+        w.write_short(3);
+        w.write_float(110.0);
+        w.write_float(10.0); // rate=10：测试期间不重置
+        w.write_float(1.0);  // speed=1 → step_time = 1/3
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(1); // Pulsing
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        let h = reg.register(&mut sd, &msg);
+        // 直接置 step=2（step 0/1 已发射过），只测 step 2 环（rx=ry=3）。
+        reg.record_mut(h).unwrap().emit_step = 2;
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_radiation_emitters(&mut sd, &mut reg, 1.0 / 3.0, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.radiation.get(12), 0.0, "中心未被环步写入");
+            assert_eq!(u.radiation.get(13), 0.0, "内部 (1,0) 不受辐射（环非填充）");
+            assert!(
+                (u.radiation.get(14) - 220.0).abs() < 1e-3,
+                "环上轴向 (2,0) = Loop B comp 110×2（SetPixel4 轴向重复写），got {}",
+                u.radiation.get(14)
+            );
+            assert_eq!(u.radiation.get(15), 0.0, "外侧轴向 (3,0) 强度 0（整格边界）");
+            assert!(
+                (u.radiation.get(21) - 38.0).abs() < 1e-3,
+                "对角内侧 (1,1) = 19+19 = 38，got {}",
+                u.radiation.get(21)
+            );
+            assert!(
+                (u.radiation.get(22) - 175.0).abs() < 1e-3,
+                "对角 (2,1) = 84+91 = 175，got {}",
+                u.radiation.get(22)
+            );
+            assert!(
+                (u.radiation.get(30) - 52.0).abs() < 1e-3,
+                "对角 (2,2) = 26+26 = 52，got {}",
+                u.radiation.get(30)
+            );
+        }
         DestroyElementsTable();
     }
 

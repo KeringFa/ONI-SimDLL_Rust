@@ -114,6 +114,11 @@ pub fn handle_allocate_cells(reader: &mut BinaryBufferReader) -> *mut c_void {
     }
     global_sim_data.0 = sim_data_ptr;
 
+    // 新世界分配 = 存档切换：上一存档的 RadiationEmitter 记录全部作废。
+    // 原版注册表在 Sim 内、跨存档靠 Remove 消息清理；本项目为全局静态，
+    // 显式清空避免"上个存档辐射残留"（旧发射器继续向新世界发射）。
+    crate::c_simulation::radiation_emitter::clear_radiation_emitters();
+
     tracing::info!(width, height, flag1, flag2, "AllocateCells done");
     sim_data_ptr as *mut c_void
 }
@@ -1348,6 +1353,7 @@ pub fn handle_initialize_from_cells(reader: &mut BinaryBufferReader) -> *mut c_v
         }
     }
     global_sim_data.0 = new_ptr;
+    crate::c_simulation::radiation_emitter::clear_radiation_emitters();
 
     unsafe {
         let sim_data = &mut *new_ptr;
@@ -1836,6 +1842,57 @@ mod tests {
         let sim_data_ptr = globals::G_SIM_DATA.lock().0;
         assert_eq!(sim_data_ptr as *mut c_void, second);
 
+        clean_up();
+    }
+
+    #[test]
+    fn allocate_cells_clears_radiation_emitter_registry() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+        crate::c_simulation::radiation_emitter::clear_radiation_emitters();
+
+        // 模拟上个存档注册了一个辐射发射器（全局注册表残留）
+        let mut sd = crate::a_framework::sim_data::SimData::new_for_allocate(8, 8, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1);
+        w.write_int(3);
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(0.0);
+        w.write_float(1.0);
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(0);
+        let bytes = w.into_bytes();
+        let mut frame = crate::a_framework::sim_frame_manager::SimFrameInfo::default();
+        for &b in &bytes {
+            frame.radiation_emitter_messages.adds.push_unchecked(b);
+        }
+        crate::c_simulation::radiation_emitter::process_radiation_emitter_messages(&frame, &mut sd);
+        assert_eq!(
+            crate::c_simulation::radiation_emitter::radiation_emitter_count(),
+            1,
+            "前置：旧存档发射器已注册"
+        );
+
+        // 新世界分配（存档切换）→ 注册表必须清空，否则旧发射器继续向新世界发射
+        let mut w2 = BinaryBufferWriter::new();
+        w2.write_int(4);
+        w2.write_int(4);
+        w2.write_bool(true);
+        w2.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&w2.into_bytes());
+        let result = handle_allocate_cells(&mut reader);
+        assert!(!result.is_null());
+        assert_eq!(
+            crate::c_simulation::radiation_emitter::radiation_emitter_count(),
+            0,
+            "新世界分配必须清空旧存档发射器（防辐射残留）"
+        );
+
+        crate::c_simulation::radiation_emitter::clear_radiation_emitters();
         clean_up();
     }
 
