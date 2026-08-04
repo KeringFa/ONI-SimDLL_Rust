@@ -300,15 +300,343 @@ fn push_state_changed(sim: &mut SimData, callback_idx: i32, sim_handle: i32) {
     });
 }
 
+/// 同元素表 LCG（与 liquid_flow::next_random 同款）。
+fn next_random(sim: &mut SimData) -> f32 {
+    sim.random_seed = sim.random_seed.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+    ((sim.random_seed >> 16) & 0x7fff) as f32 * 3.051851e-05
+}
+
+/// 扇形判定（原版 inRadialRange L40033）。
+fn in_radial_range(tx: i32, ty: i32, ex: i32, ey: i32, angle: f32, direction: f32) -> bool {
+    if angle == 360.0 || (tx == ex && ty == ey) {
+        return true;
+    }
+    let min_a = (direction - angle * 0.5).rem_euclid(360.0);
+    let max_a = (angle * 0.5 + direction).rem_euclid(360.0);
+    let target = ((ty - ey) as f32).atan2((tx - ex) as f32).to_degrees().rem_euclid(360.0);
+    if max_a <= min_a {
+        target >= min_a || target <= max_a
+    } else {
+        target >= min_a && target <= max_a
+    }
+}
+
+/// 沿直线逐格辐射吸收（原版 RadiationAbsorptionAlongLine L39249）：
+/// Bresenham 走查发射器→目标，透射率 = Π(1 − block)，block 用宇宙遮挡公式
+/// （构造格 constructedFactor / 质量加权）。
+fn radiation_absorption_along_line(sim: &SimData, ex: i32, ey: i32, tx: i32, ty: i32) -> f32 {
+    let w = sim.width as i32;
+    let h = sim.height as i32;
+    let max_mass = sim.radiation_max_mass;
+    let base_w = sim.radiation_base_weight;
+    let dens_w = sim.radiation_density_weight;
+    let const_f = sim.radiation_constructed_factor;
+    let cells = unsafe { &*sim.updated_cells.ptr };
+    let mut transmission = 1.0f32;
+    let mut x = ex;
+    let mut y = ey;
+    let dx = (tx - ex).abs();
+    let dy = (ty - ey).abs();
+    let sx = if ex < tx { 1 } else { -1 };
+    let sy = if ey < ty { 1 } else { -1 };
+    let mut err = dx - dy;
+    loop {
+        if x >= 1 && y >= 1 && x < w - 1 && y < h - 1 {
+            let cell = (y * w + x) as usize;
+            let elem = cells.element_idx.get(cell);
+            let factor = match crate::b_elements::elements_table::get_element_radiation_data(elem) {
+                Some(d) => d.factor,
+                None => 0.0,
+            };
+            let props = cells.properties.get(cell);
+            let block = if props & 0x80 != 0 {
+                factor * const_f
+            } else {
+                (cells.mass.get(cell) / max_mass) * factor * dens_w + factor * base_w
+            };
+            transmission *= 1.0 - block.clamp(0.0, 1.0);
+        }
+        if x == tx && y == ty {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
+    }
+    transmission
+}
+
+/// tickConstant（原版 L40172）：椭圆区域逐格 falloff × emitRads / lingerRate，
+/// 低 falloff（<0.25）加 ±12.5% 随机抖动。
+fn tick_constant(sim: &mut SimData, bounds: RegionBounds, rec: &mut RadiationEmitterData, _dt: f32) {
+    let w = sim.width as usize;
+    let h = sim.height as usize;
+    let ex = (rec.cell % w as i32) as i32;
+    let ey = (rec.cell / w as i32) as i32;
+    let rx = rec.emit_radius_x.max(1) as i32;
+    let ry = rec.emit_radius_y.max(1) as i32;
+    let linger = sim.radiation_linger_rate;
+    for dy in -ry..=ry {
+        let y = ey + dy;
+        if y < bounds.min_y as i32 || y > bounds.max_y as i32 || y < 1 || y >= h as i32 - 1 {
+            continue;
+        }
+        for dx in -rx..=rx {
+            let x = ex + dx;
+            if x < bounds.min_x as i32 || x > bounds.max_x as i32 || x < 1 || x >= w as i32 - 1 {
+                continue;
+            }
+            if !in_radial_range(x, y, ex, ey, rec.emit_angle, rec.emit_direction) {
+                continue;
+            }
+            let rx2 = (rx * rx) as f32;
+            let ry2 = (ry * ry) as f32;
+            if (dy * dy) as f32 / ry2 + (dx * dx) as f32 / rx2 > 1.0 {
+                continue;
+            }
+            let ax = dx.abs() as f32;
+            let ay = dy.abs() as f32;
+            let falloff =
+                (1.0 - ax / rx as f32) - (ay - (ay * ax) / rx as f32) / ry as f32;
+            let line_abs = radiation_absorption_along_line(sim, ex, ey, x, y);
+            let mut amount = line_abs * (falloff * rec.emit_rads / linger);
+            if falloff < 0.25 {
+                let r = next_random(sim);
+                amount += r * amount * 7.629627e-06 - amount * 0.125;
+            }
+            let cell = (y as usize) * w + x as usize;
+            let u = unsafe { &mut *sim.updated_cells.ptr };
+            u.radiation.set(cell, u.radiation.get(cell) + amount);
+        }
+    }
+}
+
+/// tickPulsing（原版 L40263）：脉冲环扩散；PulsingAveraged 均摊 emitRads。
+fn tick_pulsing(sim: &mut SimData, bounds: RegionBounds, rec: &mut RadiationEmitterData, _dt: f32) {
+    let w = sim.width as usize;
+    let ex = (rec.cell % w as i32) as i32;
+    let ey = (rec.cell / w as i32) as i32;
+    let max_r = rec.emit_radius_x.max(rec.emit_radius_y).max(1) as f32;
+    let step_f = (rec.emit_step as f32 + 1.0) / max_r;
+    let rx = ((rec.emit_radius_x as f32) * step_f).round().max(1.0) as i32;
+    let ry = ((rec.emit_radius_y as f32) * step_f).round().max(1.0) as i32;
+    let mut emit_rads = rec.emit_rads;
+    if rec.emit_type == RadiationEmitterType::PulsingAveraged as i32 {
+        let area = ((ry - 1) * (rx - 1)).max(1) as f32;
+        emit_rads /= area;
+    }
+    let linger = sim.radiation_linger_rate;
+    if rec.emit_step == 0 {
+        let cell = rec.cell as usize;
+        let u = unsafe { &mut *sim.updated_cells.ptr };
+        u.radiation.set(cell, u.radiation.get(cell) + emit_rads);
+        return;
+    }
+    for dy in -ry..=ry {
+        let y = ey + dy;
+        if y < bounds.min_y as i32 || y > bounds.max_y as i32 || y < 1 {
+            continue;
+        }
+        for dx in -rx..=rx {
+            let x = ex + dx;
+            if x < bounds.min_x as i32 || x > bounds.max_x as i32 || x < 1 {
+                continue;
+            }
+            let rx2 = (rx * rx) as f32;
+            let ry2 = (ry * ry) as f32;
+            if (dy * dy) as f32 / ry2 + (dx * dx) as f32 / rx2 > 1.0 {
+                continue;
+            }
+            let line_abs = radiation_absorption_along_line(sim, ex, ey, x, y);
+            let amount = line_abs * (emit_rads / linger);
+            let cell = (y as usize) * w + x as usize;
+            let u = unsafe { &mut *sim.updated_cells.ptr };
+            u.radiation.set(cell, u.radiation.get(cell) + amount);
+        }
+    }
+}
+
+/// 组件 Update（原版 RadiationEmitter::Update L39693）：门控 + 时序 + 类型分发。
+pub fn update_radiation_emitters(
+    sim: &mut SimData,
+    reg: &mut RadiationEmitterRegistry,
+    dt: f32,
+    bounds: RegionBounds,
+) {
+    if !sim.radiation_enabled {
+        return;
+    }
+    let w = sim.width as i32;
+    let handles: Vec<i32> = (0..reg.items.len() as i32)
+        .filter(|&i| reg.items[i as usize] >= 0)
+        .map(|i| ((reg.versions[i as usize] as i32) << 24) | i)
+        .collect();
+    for handle in handles {
+        let (in_bounds, active) = {
+            let Some(rec) = reg.record(handle) else { continue };
+            let cy = rec.cell / w;
+            let cx = rec.cell % w;
+            (
+                cx >= bounds.min_x as i32
+                    && cx <= bounds.max_x as i32
+                    && cy >= bounds.min_y as i32
+                    && cy <= bounds.max_y as i32,
+                rec.emit_rads > 0.0 && (rec.emit_radius_x != 0 || rec.emit_radius_y != 0),
+            )
+        };
+        if !in_bounds || !active {
+            continue;
+        }
+        let emit = {
+            let rec = reg.record_mut(handle).unwrap();
+            rec.emit_timer += dt;
+            if rec.emit_rate == 0.0 {
+                true
+            } else {
+                rec.emit_timer >= rec.emit_rate
+            }
+        };
+        if !emit {
+            continue;
+        }
+        let rec = reg.record_mut(handle).unwrap();
+        let max_r = rec.emit_radius_x.max(rec.emit_radius_y).max(1) as f32;
+        let step_time = rec.emit_speed / max_r;
+        let n = if rec.emit_rate == 0.0 || step_time <= 0.0 {
+            1
+        } else {
+            ((dt / step_time).ceil() as i32).max(1)
+        };
+        for _ in 0..n {
+            let rec = reg.record_mut(handle).unwrap();
+            match rec.emit_type {
+                0 => tick_constant(sim, bounds, rec, dt),
+                1 | 2 => tick_pulsing(sim, bounds, rec, dt),
+                _ => {} // SimplePulse/RadialBeams/Attractor：阶段 B 范围外，跳过
+            }
+            let rec = reg.record_mut(handle).unwrap();
+            rec.emit_step += 1;
+        }
+        let rec = reg.record_mut(handle).unwrap();
+        if rec.emit_timer > rec.emit_speed {
+            rec.emit_timer = 0.0;
+            rec.emit_step = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::a_framework::buffer::BinaryBufferWriter;
-    use crate::a_framework::sim_data::SimData;
+    use crate::a_framework::sim_data::{CellSOA, SimData};
+    use crate::b_elements::element::Element;
+    use crate::b_elements::elements_table::{DestroyElementsTable, G_ELEMENTS_TABLE};
     use crate::LIB_TESTS_LOCK;
 
     fn make_sim() -> SimData {
-        SimData::new_for_allocate(8, 8, 1, true, false)
+        let mut sd = SimData::new_for_allocate(8, 8, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        sd
+    }
+
+    /// 元素表：0=真空(factor0)、1=固体(factor0.5)。
+    fn init_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        table.elements.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        table.radiation_data.clear();
+        for (id, state, factor) in [(0i32, 0u8, 0.0f32), (1i32, 3u8, 0.5f32)] {
+            let mut e = Element::default();
+            e.id = id;
+            e.state = state;
+            table.elements.push(e);
+            table.state_data.push(crate::b_elements::element::ElementStateData { state });
+            table.liquid_data.push(crate::b_elements::element::ElementLiquidData {
+                state,
+                ..Default::default()
+            });
+            table.pressure_data.push(crate::b_elements::element::ElementPressureData {
+                state,
+                ..Default::default()
+            });
+            table.post_process_data.push(crate::b_elements::element::ElementPostProcessData {
+                state,
+                ..Default::default()
+            });
+            table.radiation_data.push(crate::b_elements::element::ElementRadiationData {
+                factor,
+                rads_per_1000: 0.0,
+            });
+        }
+        table
+            .element_indices
+            .insert(0u32, 0u16);
+        table.element_indices.insert(1u32, 1u16);
+    }
+
+    fn fill_both(sd: &mut SimData, f: impl Fn(&mut CellSOA)) {
+        unsafe {
+            f(&mut *sd.cells.ptr);
+            f(&mut *sd.updated_cells.ptr);
+        }
+    }
+
+    /// 任务 2：Constant 发射器——椭圆中心 falloff=1.0、线吸收=1.0（真空）→
+    /// emitRads/linger = 110/1.1 = 100；radius 2×2 边界外不受影响。
+    #[test]
+    fn emitter_constant_ticks_ellipse() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = make_sim();
+        fill_both(&mut sd, |b| {
+            for i in 0..64 {
+                b.element_idx.set(i, 0);
+                b.mass.set(i, 0.0);
+            }
+        });
+        let mut reg = RadiationEmitterRegistry::new();
+        // 发射器在 sim cell 14（行1 列6，gameCell=5 换算）：radius 2×2、emitRads=110、rate=0（恒发）、
+        // speed=1、dir=0、angle=360（全向）、type=Constant
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(-1); // callback
+        w.write_int(5);  // gameCell → sim 14
+        w.write_short(2);
+        w.write_short(2);
+        w.write_float(110.0);
+        w.write_float(0.0);
+        w.write_float(1.0);
+        w.write_float(0.0);
+        w.write_float(360.0);
+        w.write_int(0);
+        let msg = AddRadiationEmitterMsg::from_bytes(&w.into_bytes()).unwrap();
+        reg.register(&mut sd, &msg);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_radiation_emitters(&mut sd, &mut reg, 1.0, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(
+                (u.radiation.get(14) - 100.0).abs() < 1e-3,
+                "中心格 falloff1×110/1.1=100，got {}",
+                u.radiation.get(14)
+            );
+            // radius 2 → 椭圆内最远 2 格；cell 13+8=21（上方2格）在椭圆内 → falloff>0
+            assert!(u.radiation.get(22) > 0.0, "椭圆内上方格应收到辐射");
+            // cell 14+16=30（上方3格）超出 radiusY=2 → 不受影响
+            assert_eq!(u.radiation.get(30), 0.0, "椭圆外不受影响");
+        }
+        DestroyElementsTable();
     }
 
     #[test]
