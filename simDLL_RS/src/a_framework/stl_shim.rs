@@ -241,18 +241,28 @@ pub struct UniquePtr<T> {
     pub ptr: *mut T,
 }
 
-/// MSVC std::string 等价物（32 字节）。SSO 布局：16B buffer + 8B size + 8B capacity。
+/// MSVC std::string 等价物（40 字节，_ITERATOR_DEBUG_LEVEL>=1）。
+/// 布局：_Container_proxy*（8B）+ 16B SSO buffer + 8B size + 8B capacity。
+/// 2026-08-04 审查修正：原实现 32B 缺 _Container_proxy（原版 00_types_reference.c
+/// L941-980 反编译 field0_0x0..field39_0x27 = 40B）。目前仅 Disease::disease_names
+/// 使用（C# 不读），但病菌表实现前必须对齐 40B。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MsvcString {
-    pub buffer: [u8; 16],
+    pub container_proxy: *mut c_void, // _Container_proxy*（IDL 头部）
+    pub buffer: [u8; 16],            // SSO buffer
     pub size: u64,
     pub capacity: u64,
 }
 
 impl Default for MsvcString {
     fn default() -> Self {
-        Self { buffer: [0; 16], size: 0, capacity: 0 }
+        Self {
+            container_proxy: std::ptr::null_mut(),
+            buffer: [0; 16],
+            size: 0,
+            capacity: 0,
+        }
     }
 }
 
@@ -388,8 +398,9 @@ mod tests {
     }
 
     #[test]
-    fn msvc_string_size_is_32() {
-        assert_eq!(std::mem::size_of::<MsvcString>(), 32);
+    fn msvc_string_size_is_40() {
+        // 原版 basic_string 40B（_Container_proxy + SSO 16 + size 8 + cap 8）
+        assert_eq!(std::mem::size_of::<MsvcString>(), 40);
     }
 
     #[test]

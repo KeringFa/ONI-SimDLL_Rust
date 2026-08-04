@@ -619,6 +619,15 @@ impl SimData {
         let visible = vec![0xFFu8; sd.num_game_cells as usize];
         sd.visible_grid = UniquePtr { ptr: visible.leak().as_mut_ptr() };
 
+        // 分配 timers（原版 11_msvcrt_ignored.c L22456-22484）：每格 1B，初始全部 |= 0x1F。
+        // 2026-08-04 审查修正：此前 null（liquid_flow/temperature/element_emitter 均 null 守卫
+        // 跳过 timers 写入）。原版初始全 0x1F（"格子内容刚变化"标记位域）。
+        let timers = vec![Timers { stable_cell_ticks: 0x1F }; total_cells];
+        sd.timers = UniquePtr { ptr: timers.leak().as_mut_ptr() };
+
+        // world_zones：原版 SimData::SimData 初始 null（11_msvcrt L22138），
+        // 由 SetWorldZones 消息分配（L24760）；此处保持 null，消息到达时分配。
+
         sd
     }
 
@@ -754,7 +763,24 @@ impl Drop for SimData {
             unsafe { let _ = Vec::from_raw_parts(self.accumulated_flow.ptr, total, total); }
             self.accumulated_flow.ptr = std::ptr::null_mut();
         }
-        // 注意：world_zones/timers/visible_grid 在 A3 阶段保持 null。
+        // 释放 timers（2026-08-04 起分配）
+        if !self.timers.ptr.is_null() {
+            let total = (self.width as usize) * (self.height as usize);
+            unsafe { let _ = Vec::from_raw_parts(self.timers.ptr, total, total); }
+            self.timers.ptr = std::ptr::null_mut();
+        }
+        // 释放 visible_grid（2026-08-02 起分配）
+        if !self.visible_grid.ptr.is_null() {
+            let total = (self.num_game_cells as usize).max(0);
+            unsafe { let _ = Vec::from_raw_parts(self.visible_grid.ptr, total, total); }
+            self.visible_grid.ptr = std::ptr::null_mut();
+        }
+        // 释放 world_zones（SetWorldZones 消息分配后；null 时跳过）
+        if !self.world_zones.ptr.is_null() {
+            let total = (self.width as usize) * (self.height as usize);
+            unsafe { let _ = Vec::from_raw_parts(self.world_zones.ptr, total, total); }
+            self.world_zones.ptr = std::ptr::null_mut();
+        }
         // MsvcVector 字段（cosmic_radiation_occlusion/active_regions/components/worlds）
         // 的释放在后续阶段实现。
     }
@@ -864,6 +890,33 @@ mod tests {
         assert_eq!(sd.radiation_density_weight, 0.7);
         assert_eq!(sd.radiation_constructed_factor, 0.8);
         assert!(!sd.init_settle_thermal_boundaries);
+    }
+
+    /// 2026-08-04 审查修正：timers 分配（初始全 0x1F，原版 L22456-22484）、
+    /// visible_grid 分配（全 0xFF 可见兜底）、world_zones 初始 null（原版 L22138，
+    /// 由 SetWorldZones 消息分配）。
+    #[test]
+    fn new_for_allocate_allocates_timers_visible_grid_keeps_world_zones_null() {
+        let sd = SimData::new_for_allocate(6, 5, 0, false, false);
+        assert!(!sd.timers.ptr.is_null(), "timers 应分配");
+        assert!(!sd.visible_grid.ptr.is_null(), "visible_grid 应分配");
+        assert!(sd.world_zones.ptr.is_null(), "world_zones 初始应 null（原版 L22138）");
+        unsafe {
+            // timers 初始全部 |= 0x1F（原版 L22475-22484 循环）
+            let timers = std::slice::from_raw_parts(sd.timers.ptr, 30);
+            for t in timers {
+                assert_eq!(
+                    t.stable_cell_ticks & 0x1F,
+                    0x1F,
+                    "timers 初始应 0x1F"
+                );
+            }
+            // visible_grid 初始全 0xFF（可见兜底，已知偏差记录）
+            let vg = std::slice::from_raw_parts(sd.visible_grid.ptr, sd.num_game_cells as usize);
+            for v in vg {
+                assert_eq!(*v, 0xFF);
+            }
+        }
     }
 
     #[test]

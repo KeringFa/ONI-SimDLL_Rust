@@ -306,6 +306,11 @@ impl GameData {
         //   ExposedToSunlight: 1 * W * H 字节
         //   AccumulatedFlowValues: 4 * W * H 字节
         // 零初始化，C# 端 LoadRawTextureData 读取后 Apply 到纹理。
+        // 2026-08-04 审查修正：分配 flow（Vector4f，16B/格）——原版 GameData::GameData
+        // 11_msvcrt_ignored.c L27433-27458 分配 0x10×count 并零初始化。C# 不消费该字段
+        // （死字段），但按原版构造补齐。
+        let flow_vec = vec![crate::a_framework::vector_math::Vector4f::default(); total_cells];
+        gd.flow = UniquePtr { ptr: flow_vec.leak().as_mut_ptr() };
         let flow_vec = vec![crate::a_framework::vector_math::Vector2f::default(); total_cells];
         gd.property_texture_flow = UniquePtr {
             ptr: flow_vec.leak().as_mut_ptr()
@@ -377,9 +382,9 @@ impl Drop for GameData {
         free_leaked_vec!(property_texture_liquid_data);
         free_leaked_vec!(property_texture_material_data);
         free_leaked_vec!(property_texture_exposed_to_sunlight);
+        free_leaked_vec!(flow);
         free_leaked_vec!(accumulated_flow);
         free_leaked_vec!(visible_grid);
-        // flow（Vector4f）在 new() 中保持 null（分配于 copy 路径/后续阶段），此处无需处理。
         // 29 个事件 MsvcVector 的内存在 resize 时分配，Drop 时需要 clear
         // 但 GameData 通常通过 Box::from_raw 释放，CellSOA/BackwallSOA 的 Drop 会清理 MsvcVector
     }
@@ -441,5 +446,24 @@ mod tests {
         // 4×i32 (16) + 29×MsvcVector (928) + 10×UniquePtr (80) = 1024B
         let actual = size_of::<GameData>();
         assert_eq!(actual, 1024, "GameData size = {} (0x{:x}), 期望 1024 (0x400)", actual, actual);
+    }
+
+    /// 2026-08-04 审查修正：GameData::GameData 分配 flow（Vector4f，16B/格，
+    /// 原版 11_msvcrt_ignored.c L27433-27458）。此前 new() 未分配 → flow 恒 null。
+    #[test]
+    fn new_allocates_flow_buffer() {
+        let gd = GameData::new(4, 3);
+        assert!(!gd.flow.ptr.is_null(), "flow 应分配（Vector4f × 12）");
+        unsafe {
+            let flow = std::slice::from_raw_parts(gd.flow.ptr, 12);
+            for f in flow {
+                assert_eq!(f.x, 0.0);
+                assert_eq!(f.y, 0.0);
+                assert_eq!(f.z, 0.0);
+                assert_eq!(f.w, 0.0);
+            }
+        }
+        // Drop 释放所有缓冲区（含 flow）——此处仅验证指针已分配
+        drop(gd);
     }
 }

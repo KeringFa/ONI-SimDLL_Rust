@@ -10,6 +10,7 @@ use crate::a_framework::buffer::{BinaryBufferReader, BufferError};
 use crate::a_framework::game_data::GameData;
 use crate::a_framework::game_data_update::GameDataUpdate;
 use crate::a_framework::sim_data::{CellSOA, SimData};
+use crate::a_framework::stl_shim::UniquePtr;
 use crate::b_elements::elements_table;
 use crate::globals;
 use std::ffi::c_void;
@@ -1202,11 +1203,49 @@ pub fn handle_free_grid_cells(_reader: &mut BinaryBufferReader) -> *mut c_void {
     std::ptr::null_mut()
 }
 
-/// SetWorldZones handler 桩。
-/// 对照源码 11_msvcrt_ignored.c L24760。
-/// A3 阶段返回 null（不处理），C 类阶段实现真实逻辑。
-pub fn handle_set_world_zones(_reader: &mut BinaryBufferReader) -> *mut c_void {
-    tracing::debug!("SetWorldZones handler stub (A3)");
+/// SetWorldZones handler。
+/// 对照源码 11_msvcrt_ignored.c L24760-24805（SimData::SetWorldZones）：
+/// 1. 分配 width×height 字节（含边界 total_cells），释放旧的；
+/// 2. memset 清零；
+/// 3. 逐行读取 (width−2) 字节，写入 row×width+1（去边界，sim 坐标内部）。
+/// 2026-08-04 审查修正：A3 桩不处理 → world_zones 恒 null → 世界区域数据缺失。
+/// 消费端：PostProcessCell 世界区域分支（L42954）按 worldZones[cell]==-1 特判。
+pub fn handle_set_world_zones(reader: &mut BinaryBufferReader) -> *mut c_void {
+    let sim_data_ptr = globals::G_SIM_DATA.lock().0;
+    if sim_data_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let sim_data = unsafe { &mut *sim_data_ptr };
+    let width = sim_data.width as usize;
+    let height = sim_data.height as usize;
+    if width == 0 || height == 0 {
+        return std::ptr::null_mut();
+    }
+    let total = width * height;
+    // 释放旧的 world_zones（vec![...].leak() 分配；初始 null）
+    if !sim_data.world_zones.ptr.is_null() {
+        unsafe {
+            let _ = Vec::from_raw_parts(sim_data.world_zones.ptr, total, total);
+        }
+    }
+    // 原版 L24784-24790：memset 清零后逐行读
+    let mut zones = vec![0u8; total];
+    let row_len = width.saturating_sub(2);
+    let rows = height.saturating_sub(2);
+    for row in 0..rows {
+        let dst = (row + 1) * width + 1;
+        for col in 0..row_len {
+            match reader.read_byte() {
+                Ok(b) => zones[dst + col] = b,
+                Err(_) => {
+                    tracing::warn!(row, col, "SetWorldZones: buffer exhausted");
+                    sim_data.world_zones = UniquePtr { ptr: zones.leak().as_mut_ptr() };
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+    }
+    sim_data.world_zones = UniquePtr { ptr: zones.leak().as_mut_ptr() };
     std::ptr::null_mut()
 }
 
@@ -1953,6 +1992,46 @@ mod tests {
             assert!(!new_ptr.is_null());
             assert!(new_ptr != old_ptr, "应替换为新 SimData");
             assert_eq!((*new_ptr).width, 6);
+        }
+        clean_up();
+    }
+
+    /// 2026-08-04 审查修正：SetWorldZones 从 A3 桩改为真实实现
+    /// （原版 11_msvcrt_ignored.c L24760-24805：分配 width×height + memset 清零 +
+    /// 逐行读 (width−2) 字节写入 row×width+1）。
+    #[test]
+    fn handle_set_world_zones_allocates_and_writes_rows() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        let data = build_initialize_from_cells_message();
+        let mut reader = BinaryBufferReader::new(&data);
+        handle_initialize_from_cells(&mut reader);
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            assert_eq!(sd.width, 6); // 4+2
+            assert_eq!(sd.height, 5); // 3+2
+            assert!(sd.world_zones.ptr.is_null(), "初始 world_zones 应为 null");
+        }
+
+        // SetWorldZones 消息体：3 行 × 4 列 = 12 字节（width-2=4, height-2=3）
+        let wz_data: Vec<u8> = (1..=12).collect();
+        let mut wz_reader = BinaryBufferReader::new(&wz_data);
+        handle_set_world_zones(&mut wz_reader);
+
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            assert!(!sd.world_zones.ptr.is_null(), "world_zones 应已分配");
+            for row in 0..3usize {
+                for col in 0..4usize {
+                    let sim_idx = (row + 1) * 6 + (col + 1);
+                    let expected = (row * 4 + col + 1) as u8;
+                    let got = std::ptr::read(sd.world_zones.ptr.offset(sim_idx as isize));
+                    assert_eq!(got, expected, "wz @row={} col={}", row, col);
+                }
+            }
+            // 边界格保持 0（memset 清零）
+            assert_eq!(std::ptr::read(sd.world_zones.ptr), 0, "边界格应为 0");
         }
         clean_up();
     }

@@ -425,3 +425,27 @@
 6. powf 衰减参数 1.0 占位（原版 05_liquid_flow.c L397 反编译丢失，不可恢复）。
 
 **验证**：审查基于既有 426 测试（本轮无代码改动）；Release 构建不受影响。
+
+### Minor 修复（2026-08-04 同日，严格对照原版）
+
+审查后按"严格对照原版"完成 5 项忠实化（行为不变，430 测试全过 + Release 构建成功）：
+
+1. **GameData.flow 分配**（game_data.rs）：Vector4f 16B/格 + Drop 释放；
+   原版 GameData::GameData L27433-27458。+测试 new_allocates_flow_buffer。
+2. **copy_sim_data_to_game flow 逐行拷贝**（sim_data_ops.rs 5a 段）：
+   原版 copyFlowTasks L31263-31350（去边界，Vector4f）。+测试
+   copy_sim_data_to_game_copies_flow_stripped。
+3. **SetWorldZones 真实实现**（save_load.rs）：原版 L24760-24805（分配 width×height
+   + memset + 逐行读 (width−2)）；world_zones 初始仍 null（原版 L22138 同）。
+   +测试 handle_set_world_zones_allocates_and_writes_rows。
+4. **timers 分配**（sim_data.rs）：每格 1B 初始全 0x1F（原版 L22456-22484）；
+   visible_grid/timers/world_zones Drop 释放补齐。+测试
+   new_for_allocate_allocates_timers_visible_grid_keeps_world_zones_null。
+5. **MsvcString 40B**（stl_shim.rs）：补 _Container_proxy 8B（原版 basic_string
+   field0_0x0..field39_0x27）；断言改名 msvc_string_size_is_40。
+   **病菌表 CreateDiseaseTable 实现前置已闭合**。
+
+保留项：powf 衰减参数 1.0 占位（原版 05_liquid_flow.c L397 反编译丢失参数，不可恢复）。
+
+**待实测**：部署 DLL → ① 加载/保存存档不回归；② 世界区域（SetWorldZones）若 C# 发送
+消息则 world_zones 开始填充；③ 液体/温度/液滴行为不回归（timers 初始 0x1F 激活写入路径）。

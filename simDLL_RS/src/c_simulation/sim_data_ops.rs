@@ -264,6 +264,29 @@ pub fn copy_sim_data_to_game(
     // 5. 更新 num_frames_processed
     game_data.num_frames_processed = frame_count;
 
+    // 5a. flow 逐行拷贝（原版 copyFlowTasks，11_msvcrt_ignored.c L31263-31350）：
+    //     按行（去掉边界）SimData.flow → GameData.flow（Vector4f，16B/格）。
+    //     2026-08-04 审查修正：此前缺失 → game.flow 恒 null（C# 不消费该字段，
+    //     行为等价，但按原版补全构造/拷贝链）。
+    if !sim_data.flow.ptr.is_null() && !game_data.flow.ptr.is_null() {
+        let sim_total = sim_w * sim_data.height as usize;
+        let game_total = game_w * game_h;
+        if game_total > 0 {
+            unsafe {
+                let src = std::slice::from_raw_parts(
+                    sim_data.flow.ptr,
+                    sim_total,
+                );
+                let dst = std::slice::from_raw_parts_mut(game_data.flow.ptr, game_total);
+                for row in 0..game_h {
+                    let sim_row_start = (row + 1) * sim_w + 1;
+                    dst[row * game_w..(row + 1) * game_w]
+                        .copy_from_slice(&src[sim_row_start..sim_row_start + game_w]);
+                }
+            }
+        }
+    }
+
     // 5b. accumulated_flow 同步（原版 11_msvcrt_ignored.c L32491-32498）：
     //     按行 memcpy（去掉边界）SimData.accumulatedFlow → GameData.accumulatedFlow，
     //     随后局部静态 tick_count 超过 14 时 memset 清零 SimData 源缓冲。
@@ -619,6 +642,40 @@ mod tests {
         assert!((dst[0] - 0.5).abs() < 1e-6, "game[0,0] 应为 sim 内部格累积量 0.5");
         assert!((dst[6] - 0.25).abs() < 1e-6, "game[1,2] 应为 0.25");
         assert_eq!(dst[3], 0.0, "game 边界行（sim 边界格 9.0）不应被拷贝");
+    }
+
+    /// 2026-08-04 审查修正：copy_sim_data_to_game 逐行拷贝 sim.flow → game.flow
+    /// （原版 copyFlowTasks，11_msvcrt_ignored.c L31263-31350，Vector4f 16B/格）。
+    /// 此前 game.flow 恒 null；此测试验证去边界拷贝。
+    #[test]
+    fn copy_sim_data_to_game_copies_flow_stripped() {
+        let mut sd = make_test_sim_data();
+        let mut gd = make_test_game_data();
+
+        // 分配 SimData.flow（36 格 Vector4f）
+        let flow_vec: Vec<crate::a_framework::vector_math::Vector4f> =
+            vec![crate::a_framework::vector_math::Vector4f::default(); 36];
+        sd.flow = UniquePtr { ptr: flow_vec.leak().as_mut_ptr() };
+        unsafe {
+            let src = std::slice::from_raw_parts_mut(sd.flow.ptr, 36);
+            src[7] = crate::a_framework::vector_math::Vector4f {
+                x: 1.0, y: 2.0, z: 3.0, w: 4.0,
+            }; // sim (row=1,col=1) → game (0,0)
+            src[15] = crate::a_framework::vector_math::Vector4f {
+                x: 5.0, y: 6.0, z: 7.0, w: 8.0,
+            }; // sim (row=2,col=3) → game (1,2)
+            src[0] = crate::a_framework::vector_math::Vector4f {
+                x: 9.0, y: 9.0, z: 9.0, w: 9.0,
+            }; // 边界格不应被拷贝
+        }
+
+        copy_sim_data_to_game(&mut sd, &mut gd, std::ptr::null(), 1);
+
+        let dst = unsafe { std::slice::from_raw_parts(gd.flow.ptr, 16) };
+        assert!((dst[0].x - 1.0).abs() < 1e-6, "game[0,0].x 应为 1.0");
+        assert!((dst[0].w - 4.0).abs() < 1e-6, "game[0,0].w 应为 4.0");
+        assert!((dst[6].y - 6.0).abs() < 1e-6, "game[1,2].y 应为 6.0");
+        assert_eq!(dst[3].x, 0.0, "game 边界行（sim 边界格 9.0）不应被拷贝");
     }
 
     /// 验证 accumulated_flow 的 15 帧清零窗口（原版 CopySimDataToGame 局部静态
