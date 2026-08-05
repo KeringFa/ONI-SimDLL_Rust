@@ -8,7 +8,8 @@
 //! 公式对照 C# Klei.AI.Disease（HalfLifeToGrowthRate / CalculateRangeHalfLife）与
 //! Klei.AI.DiseaseGrowthRules.ElemGrowthInfo.CalculateDiseaseCountDelta；dt 固定 0.2。
 use crate::a_framework::sim_data::SimData;
-use crate::b_elements::disease::RangeInfo;
+use crate::b_elements::disease::{Disease, RangeInfo};
+use crate::d1_activity::RegionBounds;
 
 /// HalfLifeToGrowthRate — 半活期转生长率（C# Klei.AI.Disease L314-322）。
 ///
@@ -71,10 +72,426 @@ pub(crate) fn calculate_range_half_life(
     (1.0 - t) * hls[lower] + t * hls[upper]
 }
 
+/// GetDiffusionScale — 病菌扩散比例（原版 L26329）。
+///
+/// 门控：disease_idx/elem 越界 → 0.0（原版断言，防御语义）；
+/// count < minDiffusionCount[elem] → 0.0；
+/// tick < minDiffusionInfestationTickCount[elem] → 0.0；
+/// 否则返回 diffusionScale[elem]。
+pub(crate) fn get_diffusion_scale(disease: &Disease, sim: &SimData, cell: usize) -> f32 {
+    let cells = unsafe { &*sim.cells.ptr };
+    if cell >= cells.disease_idx.len()
+        || cell >= cells.element_idx.len()
+        || cell >= cells.disease_count.len()
+        || cell >= cells.disease_infestation_tick_count.len()
+    {
+        return 0.0;
+    }
+    let d_idx = cells.disease_idx.get(cell);
+    let diseases = disease.diseases.as_slice();
+    if (d_idx as usize) >= diseases.len() {
+        return 0.0;
+    }
+    let eg = &diseases[d_idx as usize].elem_growth_info;
+    let elem = cells.element_idx.get(cell) as usize;
+    if elem >= eg.min_diffusion_count.len()
+        || elem >= eg.min_diffusion_infestation_tick_count.len()
+        || elem >= eg.diffusion_scale.len()
+    {
+        return 0.0;
+    }
+    if cells.disease_count.get(cell) < eg.min_diffusion_count.get(elem) {
+        return 0.0;
+    }
+    if cells.disease_infestation_tick_count.get(cell) < eg.min_diffusion_infestation_tick_count.get(elem) {
+        return 0.0;
+    }
+    eg.diffusion_scale.get(elem)
+}
+
+/// UpdateCells — 相邻两格病菌扩散（原版 L26646-26812）。
+///
+/// 读 `cells` 稳定缓冲，写 `updatedCells`（经 AddDiseaseToCell 强度混合）。
+/// - 元素相态门控：postProcessData[elem].state&3 必须相同（液/气/固/真空各自同类）；
+/// - 同病菌：按 count 差 ×0.125×scale 从高向低流；
+/// - 一方无病菌：单向流入（×0.125×scale）；
+/// - 异真实病菌：强方（count×strength 大）流向弱方（相等 → b 为源）。
+pub(crate) fn update_cells(disease: &Disease, sim: &mut SimData, cell_a: usize, cell_b: usize) {
+    let cells = unsafe { &*sim.cells.ptr };
+    let len = cells.element_idx.len();
+    if cell_a >= len || cell_b >= len {
+        return;
+    }
+    // 元素相态门控（原版 L26679-26681：(state_b ^ state_a) & 3 != 0 → return）
+    let ea = cells.element_idx.get(cell_a);
+    let eb = cells.element_idx.get(cell_b);
+    let sa = crate::b_elements::elements_table::get_element_post_process_data(ea)
+        .map(|p| p.state & 3);
+    let sb = crate::b_elements::elements_table::get_element_post_process_data(eb)
+        .map(|p| p.state & 3);
+    if sa.is_none() || sb.is_none() || sa != sb {
+        return;
+    }
+    let da = cells.disease_idx.get(cell_a);
+    let db = cells.disease_idx.get(cell_b);
+    let ca = cells.disease_count.get(cell_a);
+    let cb = cells.disease_count.get(cell_b);
+    let diseases = disease.diseases.as_slice();
+
+    // transfer：正 = a 得 b 失；src_disease = 流入病菌
+    let mut transfer = 0i32;
+    let mut src_disease = da;
+    if da == db {
+        if da == 0xff {
+            return;
+        }
+        // 同病菌：count 差 ×0.125×scale，高→低（原版 L26692-26703）
+        let diff = cb - ca;
+        let source = if diff > 0 { cell_b } else { cell_a };
+        let f = get_diffusion_scale(disease, sim, source) * diff as f32 * 0.125;
+        transfer = f as i32;
+        src_disease = da;
+    } else if da == 0xff {
+        // a 无病菌：b → a 单向（原版 L26705-26712）
+        let f = get_diffusion_scale(disease, sim, cell_b) * cb as f32 * 0.125;
+        transfer = f as i32;
+        src_disease = db;
+    } else if db == 0xff {
+        // b 无病菌：a → b 单向（原版 L26714-26724）
+        let f = get_diffusion_scale(disease, sim, cell_a) * ca as f32 * 0.125;
+        transfer = -(f as i32);
+        src_disease = da;
+    } else {
+        // 异真实病菌：强方流向弱方（原版 L26726-26766）
+        if (da as usize) >= diseases.len() || (db as usize) >= diseases.len() {
+            return;
+        }
+        let sa_s = diseases[da as usize].strength;
+        let sb_s = diseases[db as usize].strength;
+        if cb as f32 * sb_s < ca as f32 * sa_s {
+            // a 更强 → a 失 b 得
+            let f = get_diffusion_scale(disease, sim, cell_a) * ca as f32 * 0.125;
+            transfer = -(f as i32);
+            src_disease = da;
+        } else {
+            // b 更强（或相等）→ b 失 a 得
+            let f = get_diffusion_scale(disease, sim, cell_b) * cb as f32 * 0.125;
+            transfer = f as i32;
+            src_disease = db;
+        }
+    }
+    if transfer == 0 {
+        return;
+    }
+    let updated = unsafe { &mut *sim.updated_cells.ptr };
+    crate::c2_physics::liquid_flow::add_disease_to_cell(updated, cell_a, src_disease, transfer);
+    crate::c2_physics::liquid_flow::add_disease_to_cell(updated, cell_b, src_disease, -transfer);
+}
+
+/// 病菌扩散区域循环（原版 UpdateData L145087-145100）。
+///
+/// 区域每格：若本格或右邻有病菌 → update_cells(cell, cell+1)；
+/// 若本格或下邻有病菌 → update_cells(cell, cell+width)。
+/// gDisease 缺失（单星/未建表）→ 跳过。
+pub(crate) fn run_disease_diffusion_task(sim: &mut SimData, bounds: RegionBounds) {
+    let disease_ptr = crate::globals::G_DISEASE.lock().0;
+    if disease_ptr.is_null() {
+        return;
+    }
+    let disease = unsafe { &*disease_ptr };
+    let width = sim.width as usize;
+    let height = sim.height as usize;
+    if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    for row in bounds.min_y..=bounds.max_y {
+        for col in bounds.min_x..=bounds.max_x {
+            let cell = row * width + col;
+            let (right_ok, down_ok) = {
+                let cells = unsafe { &*sim.cells.ptr };
+                let d = cells.disease_idx.get(cell);
+                let right = cell + 1 < cells.disease_idx.len()
+                    && (d != 0xff || cells.disease_idx.get(cell + 1) != 0xff);
+                let down = cell + width < cells.disease_idx.len()
+                    && (d != 0xff || cells.disease_idx.get(cell + width) != 0xff);
+                (right, down)
+            };
+            if right_ok {
+                update_cells(disease, sim, cell, cell + 1);
+            }
+            if down_ok {
+                update_cells(disease, sim, cell, cell + width);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::a_framework::buffer::{BinaryBufferReader, BinaryBufferWriter};
+    use crate::a_framework::sim_data::SimData;
+    use crate::b_elements::disease::{Disease, DiseaseInfo, ElemGrowthInfo};
+    use crate::b_elements::element::Element;
+    use crate::b_elements::elements_table::{CreateElementsTable, DestroyElementsTable};
     use crate::LIB_TESTS_LOCK;
+
+    /// 建 3 元素最小表：0=气体(state=1)、1=液体(state=2)、2=固体(state=3)。
+    /// 调用方需持 LIB_TESTS_LOCK，并在测试末尾 DestroyElementsTable() 清理。
+    fn create_state_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(3);
+        for (id, state) in [(0i32, 1u8), (1i32, 2u8), (2i32, 3u8)] {
+            let mut elem = Element::default();
+            elem.id = id;
+            elem.state = state;
+            elem.number_of_gradient_colors = 1;
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..3 {
+            w.write_int(0); // 空名称
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// 2 病菌表挂 G_DISEASE：
+    /// - idx0: strength=2.0；idx1: strength=1.0
+    /// ElemGrowthInfo（3 元素）：
+    ///   diffusionScale=[1.0,0.5,0.0]
+    ///   minDiffusionCount=[10,5,100]
+    ///   minDiffusionInfestationTickCount=[2,1,3]
+    fn install_disease_table() {
+        let mut t = Disease::new();
+        for (hash, strength) in [(0xAAAAu32, 2.0f32), (0xBBBB, 1.0)] {
+            let mut eg = ElemGrowthInfo::default();
+            eg.diffusion_scale.resize(3, 0.0);
+            eg.diffusion_scale.set(0, 1.0);
+            eg.diffusion_scale.set(1, 0.5);
+            eg.diffusion_scale.set(2, 0.0);
+            eg.min_diffusion_count.resize(3, 0);
+            eg.min_diffusion_count.set(0, 10);
+            eg.min_diffusion_count.set(1, 5);
+            eg.min_diffusion_count.set(2, 100);
+            eg.min_diffusion_infestation_tick_count.resize(3, 0);
+            eg.min_diffusion_infestation_tick_count.set(0, 2);
+            eg.min_diffusion_infestation_tick_count.set(1, 1);
+            eg.min_diffusion_infestation_tick_count.set(2, 3);
+            t.diseases.push_unchecked(DiseaseInfo {
+                hash_id: hash,
+                strength,
+                elem_growth_info: eg,
+                ..Default::default()
+            });
+        }
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    fn uninstall_disease_table() {
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+            g.0 = std::ptr::null_mut();
+        }
+    }
+
+    fn disease_table_ref() -> &'static Disease {
+        unsafe { &*crate::globals::G_DISEASE.lock().0 }
+    }
+
+    #[test]
+    fn get_diffusion_scale_gates() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let d = disease_table_ref();
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            // elem0（气体）：count=9 < minDiffusionCount=10 → 0.0
+            cells.element_idx.set(7, 0);
+            cells.disease_idx.set(7, 0);
+            cells.disease_count.set(7, 9);
+            cells.disease_infestation_tick_count.set(7, 5);
+            assert_eq!(get_diffusion_scale(d, &sd, 7), 0.0, "count < minDiffusionCount");
+            // elem0：count=100、tick=1 < minInfestationTick=2 → 0.0
+            cells.disease_count.set(7, 100);
+            cells.disease_infestation_tick_count.set(7, 1);
+            assert_eq!(get_diffusion_scale(d, &sd, 7), 0.0, "tick < minInfestationTick");
+            // elem0：count=100、tick=5 → diffusionScale[0]=1.0
+            cells.disease_infestation_tick_count.set(7, 5);
+            assert_eq!(get_diffusion_scale(d, &sd, 7), 1.0);
+            // elem1（液体）：scale=0.5
+            cells.element_idx.set(8, 1);
+            cells.disease_idx.set(8, 0);
+            cells.disease_count.set(8, 100);
+            cells.disease_infestation_tick_count.set(8, 5);
+            assert_eq!(get_diffusion_scale(d, &sd, 8), 0.5);
+            // elem2（固体）：scale=0.0
+            cells.element_idx.set(9, 2);
+            cells.disease_idx.set(9, 0);
+            cells.disease_count.set(9, 100);
+            cells.disease_infestation_tick_count.set(9, 5);
+            assert_eq!(get_diffusion_scale(d, &sd, 9), 0.0);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    /// 设置 cells 与 updatedCells 中指定格：元素/病菌 idx/count/tick。
+    fn set_both(sd: &mut SimData, cell: usize, elem: u16, d_idx: u8, d_count: i32, tick: u8) {
+        unsafe {
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let cells = &mut *buf_ptr;
+                cells.element_idx.set(cell, elem);
+                cells.disease_idx.set(cell, d_idx);
+                cells.disease_count.set(cell, d_count);
+                cells.disease_infestation_tick_count.set(cell, tick);
+            }
+        }
+    }
+
+    #[test]
+    fn update_cells_same_disease_equilibrates() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        install_disease_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let d = disease_table_ref();
+        // a=7（elem0 气体）disease0 count100；b=8（elem0）disease0 count50
+        set_both(&mut sd, 7, 0, 0, 100, 5);
+        set_both(&mut sd, 8, 0, 0, 50, 5);
+        update_cells(d, &mut sd, 7, 8);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 94, "a 高→低 流失 6");
+            assert_eq!(u.disease_count.get(8), 56, "b 低→高 获得 6");
+            assert_eq!(u.disease_idx.get(7), 0);
+            assert_eq!(u.disease_idx.get(8), 0);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn update_cells_empty_a_absorbs_from_b() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        install_disease_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let d = disease_table_ref();
+        set_both(&mut sd, 7, 0, 0xff, 0, 0);
+        set_both(&mut sd, 8, 0, 0, 100, 5);
+        update_cells(d, &mut sd, 7, 8);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 12, "a 空 → 单向流入 12");
+            assert_eq!(u.disease_idx.get(7), 0);
+            assert_eq!(u.disease_count.get(8), 88);
+            assert_eq!(u.disease_idx.get(8), 0);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn update_cells_empty_b_receives_from_a() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        install_disease_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let d = disease_table_ref();
+        set_both(&mut sd, 7, 0, 0, 100, 5);
+        set_both(&mut sd, 8, 0, 0xff, 0, 0);
+        update_cells(d, &mut sd, 7, 8);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 88);
+            assert_eq!(u.disease_count.get(8), 12, "b 空 → 单向流入 12");
+            assert_eq!(u.disease_idx.get(8), 0);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn update_cells_different_disease_stronger_flows() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        install_disease_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let d = disease_table_ref();
+        // a=disease0(s2) count100；b=disease1(s1) count100 → a 更强，transfer=12
+        set_both(&mut sd, 7, 0, 0, 100, 5);
+        set_both(&mut sd, 8, 0, 1, 100, 5);
+        update_cells(d, &mut sd, 7, 8);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 88, "a 强方流失 12");
+            assert_eq!(u.disease_idx.get(7), 0);
+            // b 收 +12(disease0)：混合 f10=100×1=100、f11=12×2=24、d=-404 → b=404 保持 disease1
+            assert_eq!(u.disease_count.get(8), 404, "AddDiseaseToCell 混合结果");
+            assert_eq!(u.disease_idx.get(8), 1);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn update_cells_element_state_gate_blocks() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        install_disease_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let d = disease_table_ref();
+        // a=气体(elem0) b=液体(elem1) → state&3 不同 → 不扩散
+        set_both(&mut sd, 7, 0, 0, 100, 5);
+        set_both(&mut sd, 8, 1, 0, 50, 5);
+        update_cells(d, &mut sd, 7, 8);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 100, "异相态不扩散");
+            assert_eq!(u.disease_count.get(8), 50);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn run_disease_diffusion_task_loops_right_and_down() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_state_table();
+        install_disease_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        // 区域仅 cell=14（row2 col2）；右邻 15、下邻 20（均在 bounds 外，只作邻居）
+        set_both(&mut sd, 14, 0, 0, 100, 5);
+        set_both(&mut sd, 15, 0, 0, 50, 5);
+        set_both(&mut sd, 20, 0, 0, 50, 5);
+        let bounds = crate::d1_activity::RegionBounds {
+            min_x: 2,
+            min_y: 2,
+            max_x: 2,
+            max_y: 2,
+        };
+        run_disease_diffusion_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(14), 88, "右+下各流出 6 → 88");
+            assert_eq!(u.disease_count.get(15), 56);
+            assert_eq!(u.disease_count.get(20), 56);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
 
     #[test]
     fn half_life_to_growth_rate_zero_is_zero() {
