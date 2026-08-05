@@ -422,9 +422,11 @@ impl SimFrameManager {
                 emplace_bytes(&mut frame.cell_energy_modifications, reader, 16)
             }
 
-            // ConsumeDisease (0xC3217E40) → consume_disease（C2 桩，12B）
+            // ConsumeDisease (0xC3217E40) → consume_disease（16B：gameCell + callbackIdx +
+            // percentToConsume(f32) + maxToConsume；C# SimMessages.ConsumeDiseaseMessage；
+            // 原版 ProcessConsumeDisease stride +4。2026-08-05 修正 12B→16B）
             MSG_CONSUME_DISEASE => {
-                emplace_bytes(&mut frame.consume_disease, reader, 12)
+                emplace_bytes(&mut frame.consume_disease, reader, 16)
             }
 
             // CellDiseaseModification (0x9174F696) → cell_disease_modifications（C2 桩，12B）
@@ -543,21 +545,29 @@ impl SimFrameManager {
                 emplace_bytes(&mut frame.element_emitter_messages.removes, reader, 8)
             }
 
-            // ===== ComponentMessages 类（C2 桩：返回 true，不 emplace）=====
-            // 这些消息在 C1 阶段不处理，但返回 true 表示已识别，避免污染 handler 表查找。
-            // C2 阶段会实现真实 emplace 到 adds/modifies/removes vector。
-            MSG_ADD_DISEASE_EMITTER
-            | MSG_MODIFY_DISEASE_EMITTER
-            | MSG_REMOVE_DISEASE_EMITTER
-              | MSG_ADD_DISEASE_CONSUMER
-              | MSG_MODIFY_DISEASE_CONSUMER
-              | MSG_REMOVE_DISEASE_CONSUMER => {
-                  tracing::trace!(
-                      "handle_message: ComponentMessages id={:x} accepted (C2 stub, no emplace)",
-                      id
-                  );
-                  true
-              }
+            // ===== DiseaseEmitter 消息（阶段 3：adds 4B / modifies 20B / removes 8B）=====
+            MSG_ADD_DISEASE_EMITTER => {
+                emplace_bytes(&mut frame.disease_emitter_messages.adds, reader, 4)
+            }
+            MSG_MODIFY_DISEASE_EMITTER => {
+                emplace_bytes(&mut frame.disease_emitter_messages.modifies, reader, 20)
+            }
+            MSG_REMOVE_DISEASE_EMITTER => {
+                emplace_bytes(&mut frame.disease_emitter_messages.removes, reader, 8)
+            }
+
+            // ===== DiseaseConsumer 消息（阶段 3：adds 12B / modifies 20B / removes 8B）=====
+            // C# 无发送方（仅 SimMessageHashes 枚举），尺寸按原版 frame manager
+            // stride 确定（adds +3 int、modifies +0x14、removes +2 int）。
+            MSG_ADD_DISEASE_CONSUMER => {
+                emplace_bytes(&mut frame.disease_consumer_messages.adds, reader, 12)
+            }
+            MSG_MODIFY_DISEASE_CONSUMER => {
+                emplace_bytes(&mut frame.disease_consumer_messages.modifies, reader, 20)
+            }
+            MSG_REMOVE_DISEASE_CONSUMER => {
+                emplace_bytes(&mut frame.disease_consumer_messages.removes, reader, 8)
+            }
 
               // ===== RadiationEmitter 消息（2026-08-04 阶段 B：adds 36B / modifies 40B / removes 8B）=====
               // AddRadiationEmitter (0xA649D34E?) → adds 36B {callbackIdx, cell, radiusX(s16),
@@ -981,6 +991,72 @@ mod tests {
         assert!(mgr.handle_message(MessageType::AddDiseaseEmitter as u32, &mut reader, &mut result));
 
         unsafe { let _ = Box::from_raw(mgr.current_frame); }
+    }
+
+    #[test]
+    fn handle_message_consume_disease_emplaces_16b() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut result: *mut c_void = std::ptr::null_mut();
+        // 16B：gameCell=5, callbackIdx=7, percent=0.5, maxToConsume=100
+        let mut data = vec![0u8; 16];
+        data[0..4].copy_from_slice(&5i32.to_le_bytes());
+        data[4..8].copy_from_slice(&7i32.to_le_bytes());
+        data[8..12].copy_from_slice(&0.5f32.to_le_bytes());
+        data[12..16].copy_from_slice(&100i32.to_le_bytes());
+        let mut reader = BinaryBufferReader::new(&data);
+        assert!(mgr.handle_message(MessageType::ConsumeDisease as u32, &mut reader, &mut result));
+        unsafe {
+            assert_eq!(
+                (*mgr.current_frame).consume_disease.len(),
+                16,
+                "ConsumeDisease 消息 16B（gameCell+callbackIdx+percent+max）"
+            );
+            let _ = Box::from_raw(mgr.current_frame);
+        }
+    }
+
+    #[test]
+    fn handle_message_disease_emitter_messages_emplace_sizes() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut result: *mut c_void = std::ptr::null_mut();
+        for (id, n) in [
+            (MessageType::AddDiseaseEmitter as u32, 4usize),
+            (MessageType::ModifyDiseaseEmitter as u32, 20usize),
+            (MessageType::RemoveDiseaseEmitter as u32, 8usize),
+        ] {
+            let data = vec![0u8; n];
+            let mut r = BinaryBufferReader::new(&data);
+            assert!(mgr.handle_message(id, &mut r, &mut result));
+        }
+        unsafe {
+            let f = &*mgr.current_frame;
+            assert_eq!(f.disease_emitter_messages.adds.len(), 4, "AddDiseaseEmitter 4B");
+            assert_eq!(f.disease_emitter_messages.modifies.len(), 20, "ModifyDiseaseEmitter 20B");
+            assert_eq!(f.disease_emitter_messages.removes.len(), 8, "RemoveDiseaseEmitter 8B");
+            let _ = Box::from_raw(mgr.current_frame);
+        }
+    }
+
+    #[test]
+    fn handle_message_disease_consumer_messages_emplace_sizes() {
+        let mut mgr = SimFrameManager::new_zeroed();
+        let mut result: *mut c_void = std::ptr::null_mut();
+        for (id, n) in [
+            (MessageType::AddDiseaseConsumer as u32, 12usize),
+            (MessageType::ModifyDiseaseConsumer as u32, 20usize),
+            (MessageType::RemoveDiseaseConsumer as u32, 8usize),
+        ] {
+            let data = vec![0u8; n];
+            let mut r = BinaryBufferReader::new(&data);
+            assert!(mgr.handle_message(id, &mut r, &mut result));
+        }
+        unsafe {
+            let f = &*mgr.current_frame;
+            assert_eq!(f.disease_consumer_messages.adds.len(), 12, "AddDiseaseConsumer 12B");
+            assert_eq!(f.disease_consumer_messages.modifies.len(), 20, "ModifyDiseaseConsumer 20B");
+            assert_eq!(f.disease_consumer_messages.removes.len(), 8, "RemoveDiseaseConsumer 8B");
+            let _ = Box::from_raw(mgr.current_frame);
+        }
     }
 
     #[test]
