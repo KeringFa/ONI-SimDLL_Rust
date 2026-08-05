@@ -250,6 +250,12 @@ pub fn update_data(sim_data: &mut SimData) {
 
         // C2 阶段实现：液体流动（原版 L42408+）
         crate::c2_physics::liquid_flow::update_liquid_loop(sim_data, bounds);
+        // 病菌阶段 2（2026-08-05）：原版 L145069 液体阶段后 CopyFrom
+        // （病菌扩散读 cells 稳定缓冲）→ L145088 病菌扩散（右/下邻）。
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+        crate::c2_physics::disease::run_disease_diffusion_task(sim_data, bounds);
+        // 原版 L145106-145464：辐射病菌贡献（RadiationSickness，hash 0xd49f77d6，
+        // +count×0.001）→ 病菌阶段 4 预留位（当前未实现，位置保留）。
         // 太空真空特判（原版 L145466-145520：worldZones==-1 且背墙真空 → 液体/气体
         // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
         // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
@@ -265,6 +271,9 @@ pub fn update_data(sim_data: &mut SimData) {
         );
         // PostProcessCell（原版 L43023：挤压/密度分层/升华）
         crate::c2_physics::liquid_flow::post_process_loop(sim_data, bounds);
+        // 病菌阶段 2（2026-08-05）：原版 L145539 病菌生长（PostProcess，
+        // 置于 PostProcessCell 之后：温度因子 + 种群因子 + 辐射杀伤 + tick 递增）。
+        crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);
     }
     // ElementConsumer 逐帧消费（2026-08-02：水泵/涡轮取水；原版 UpdateData 调组件 Update）
     crate::c_simulation::frame_processor::process_element_consumers(sim_data);

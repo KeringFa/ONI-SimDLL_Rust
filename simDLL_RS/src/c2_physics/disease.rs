@@ -823,6 +823,121 @@ mod tests {
         uninstall_disease_table();
     }
 
+    // ===== 任务 4：update_data 挂接集成 =====
+
+    /// 集成用病菌表：固体(elem2) 扩散 scale=1.0；生长恒 0（popHL/overPopHL=INF、
+    /// underPopDeath=0、min=0、max=INF、tempHL 全 INF → 温度因子 1.0）。
+    fn install_integration_table() {
+        let mut t = Disease::new();
+        let mut eg = ElemGrowthInfo::default();
+        eg.diffusion_scale.resize(1, 0.0);
+        eg.diffusion_scale.set(0, 1.0);
+        eg.min_diffusion_count.resize(1, 0);
+        eg.min_diffusion_infestation_tick_count.resize(1, 0);
+        eg.min_count_per_kg.resize(1, 0.0);
+        eg.max_count_per_kg.resize(1, f32::INFINITY);
+        eg.population_half_life.resize(1, f32::INFINITY);
+        eg.over_population_half_life.resize(1, f32::INFINITY);
+        eg.under_population_death_rate.resize(1, 0.0);
+        t.diseases.push_unchecked(DiseaseInfo {
+            hash_id: 0xE1,
+            strength: 1.0,
+            temperature_range: RangeInfo {
+                min_viable: -f32::INFINITY,
+                min_growth: -f32::INFINITY,
+                max_growth: f32::INFINITY,
+                max_viable: f32::INFINITY,
+            },
+            temperature_half_lives: RangeInfo {
+                min_viable: f32::INFINITY,
+                min_growth: f32::INFINITY,
+                max_growth: f32::INFINITY,
+                max_viable: f32::INFINITY,
+            },
+            elem_growth_info: eg,
+            radiation_kill_rate: 0.0,
+            ..Default::default()
+        });
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    /// 集成测试元素表：1 个固体元素（state=3），温度范围覆盖 300K
+    /// （low=-273/high=1000 → 温度任务 DoStateTransition 不触发；
+    /// 避免测试元素表默认 low/high=0 把固体相变成元素 0）。
+    fn create_solid_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(1);
+        let mut elem = Element::default();
+        elem.id = 0;
+        elem.state = 3;
+        elem.low_temp = -273.0;
+        elem.high_temp = 1000.0;
+        elem.number_of_gradient_colors = 1;
+        let elem_bytes = unsafe {
+            std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+        };
+        w.write_bytes(&elem_bytes);
+        w.write_int(0); // 空名称
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    #[test]
+    fn update_data_hooks_disease_diffusion_after_liquid() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_solid_table();
+        install_integration_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        // 既有 update_data 测试约定：真空=元素0、void=0xFFFF（测试元素表无真实真空 hash）
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        // 全固体世界（elem0 state3，不流动）；两相邻固体格 disease0 count100/50
+        unsafe {
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let c = &mut *buf_ptr;
+                for i in 0..30usize {
+                    c.element_idx.set(i, 0);
+                    c.temperature.set(i, 300.0);
+                    c.mass.set(i, 1000.0);
+                    c.disease_idx.set(i, 0xff);
+                    c.disease_count.set(i, 0);
+                    c.disease_infestation_tick_count.set(i, 0);
+                }
+            }
+        }
+        set_both(&mut sd, 14, 0, 0, 100, 0);
+        set_both(&mut sd, 15, 0, 0, 50, 0);
+        // 下邻 20 同病菌等量（100）→ 14↔20 净转移 0；区域仅 cell14
+        // （原版扩散按区域每格对右/下邻调用，区域外格只作邻居，不被迭代）。
+        set_both(&mut sd, 20, 0, 0, 100, 0);
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 2,
+            min_y: 2,
+            max_x: 2,
+            max_y: 2,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        });
+        crate::c2_physics::update_data(&mut sd);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(14), 94, "扩散 6 → 94");
+            assert_eq!(u.disease_count.get(15), 56);
+            assert_eq!(u.disease_count.get(20), 100, "下邻等量 → 无净转移");
+            assert_eq!(u.disease_idx.get(14), 0);
+            assert_eq!(u.disease_idx.get(15), 0);
+            assert_eq!(u.disease_infestation_tick_count.get(14), 1, "生长第二遍 tick+1");
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
     #[test]
     fn half_life_to_growth_rate_zero_is_zero() {
         assert_eq!(half_life_to_growth_rate(0.0, 0.2), 0.0);
