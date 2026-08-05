@@ -6,6 +6,7 @@
 pub mod building_temperature;
 pub mod building_to_building;
 pub mod conduit_temperature;
+pub mod disease_component;
 pub mod element_emitter;
 pub mod element_chunk;
 pub mod frame_processor;

@@ -1735,11 +1735,13 @@ fn process_mass_emission(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
 }
 
 fn process_consume_disease(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
-    frame.consume_disease.clear_keep_capacity();
+    // 阶段 3（2026-08-05）：ConsumeDisease 16B/条 → 百分比消费 + DiseaseConsumedCallback
+    crate::c_simulation::disease_component::process_consume_disease(frame, _sim_data);
 }
 
 fn process_cell_disease_modifications(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
-    frame.cell_disease_modifications.clear_keep_capacity();
+    // 阶段 3（2026-08-05）：CellDiseaseModification 12B/条 → 直加/AddDiseaseToCell
+    crate::c_simulation::disease_component::process_cell_disease_modifications(frame, _sim_data);
 }
 
 /// 步骤 9：ProcessRadiationChanges（原版 06_process_messages.c L370-414）。
