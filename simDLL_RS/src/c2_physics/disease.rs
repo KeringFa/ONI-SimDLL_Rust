@@ -138,9 +138,9 @@ pub(crate) fn update_cells(disease: &Disease, sim: &mut SimData, cell_a: usize, 
     let cb = cells.disease_count.get(cell_b);
     let diseases = disease.diseases.as_slice();
 
-    // transfer：正 = a 得 b 失；src_disease = 流入病菌
-    let mut transfer = 0i32;
-    let mut src_disease = da;
+    // transfer：正 = a 得 b 失；src_disease = 流入病菌（所有分支均赋值或 return）
+    let transfer: i32;
+    let src_disease: u8;
     if da == db {
         if da == 0xff {
             return;

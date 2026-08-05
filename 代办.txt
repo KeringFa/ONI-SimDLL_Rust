@@ -1034,3 +1034,42 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
   12B、CellDiseaseModification 12B、ModifyDiseaseCount）；阶段 4 辐射病菌贡献
   （radiation.rs 预留段，RadiationSickness hash 0xd49f77d6 → +count×0.001）。
 
+## [已完成] 病菌模块·阶段 2：格子病菌模拟（2026-08-05 内联 TDD）
+
+- 规格：docs/superpowers/specs/2026-08-05-disease-cell-simulation-design.md（d6fa6fd）
+- 计划：docs/superpowers/plans/2026-08-05-disease-cell-simulation.md（e8692d9）
+- **已实现（严格对照原版 11_msvcrt_ignored.c L26329-26640 + SimDLL_Source.c）**：
+  1. 辅助公式（27d5338）——`half_life_to_growth_rate`（0→0、INF→1、2^(−dt/hl)）
+     + `calculate_range_half_life`（带间插值、最优带 [minGrowth,maxGrowth]→INF，
+     与 C# Disease.cs 完全一致）；
+  2. 扩散（346f0ba）——`GetDiffusionScale`（minDiffusionCount /
+     minDiffusionInfestationTickCount 门控）+ `UpdateCells`（元素相态门控
+     state&3 相同；同病菌 count 差×0.125×scale 高→低；单边空病菌单向流入；
+     异真实病菌强方（count×strength）流向弱方；写 updatedCells 走强度混合）+
+     `run_disease_diffusion_task`（区域每格对右/下邻）；
+  3. 生长（3acded6）——`PostProcess` 两遍：第一遍温度因子（带间半活期→powf）
+     + 种群因子三分支（min/max count per kg / under-pop 常数死亡 / 半活期）
+     + radiationEnabled 时 −radiation×killRate + acc_err 小数结转 + count 取整；
+     第二遍 count<1 清四字段 + tick=min(tick+1,0xfe)（含"清除后 tick=1"原版怪癖）；
+  4. 挂接（1275ac8）——update_data 区域循环按原版顺序：液体后 CopyFrom
+     （L145069，病菌扩散读 cells 稳定缓冲）→ 扩散（L145088）→ [辐射病菌
+     阶段 4 预留位 L145106] → 太空真空 → 辐射 → PostProcessCell →
+     生长（L145539）。
+- **实测踩坑（已修复并留注释）**：集成测试元素表用 `Element::default()`
+  （low/high temp=0）→ 温度任务 DoStateTransition 把固体格相变成元素 0 →
+  扩散按错误元素查表 scale=0。修复：集成表用真实温度范围
+  （low=−273/high=1000）的固体元素，避免相变；并用自定义 ActiveRegion
+  单格区域 + 下邻等量病菌消除扩散级联，得到确定性断言。
+- **测试**：+22 条（half-life 公式 7、GetDiffusionScale 门控、UpdateCells
+  五分支 + 相态门控 + 区域循环、PostProcess 七场景含 acc_err/辐射/tick 怪癖、
+  update_data 集成）；全量 522 测试串行全过（470 lib + 52 集成）；
+  release 构建成功（警告回到基线 7 条）。
+- **下一步（阶段 3）**：病菌消息/组件——DiseaseEmitter/Consumer 消息
+  （AddDiseaseEmitter 1486783027 / ModifyDiseaseEmitter 2395843372 /
+  RemoveDiseaseEmitter 468135926 / AddDiseaseConsumer 348345681 /
+  ModifyDiseaseConsumer 2471979672 / RemoveDiseaseConsumer 3513325646）、
+  ConsumeDisease 12B（3275125760）、CellDiseaseModification 12B（2441296022）、
+  ModifyDiseaseCount（L43462）。
+- **阶段 4（辐射病菌贡献）**：radiation.rs 预留段，RadiationSickness hash
+  0xd49f77d6 → +count×0.001，挂接点已在 update_data 留注释占位（L145106）。
+
