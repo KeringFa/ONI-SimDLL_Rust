@@ -893,3 +893,32 @@ L42860-42870）依赖病菌表，留待病菌模块实现时补。
 **下一步**：阶段 C（辐射消费/生物辐射）待用户决策；或按计划推进
 （气体模拟之后的模块）。
 
+## [已完成] 辐射消费/植物变异验证 + 小人误报炎热修复（2026-08-05）
+
+**辐射消费/植物变异（用户实测全部正常，无 simDLL 缺口）**：
+- 范围结论：几乎全在 C# 侧——复制人累计/病状/死亡（RadiationMonitor 每 1000ms
+  读 Grid.Radiation×（1−抗性）/600）、厕所/嘘嘘/呕吐/粘渣排放（RadiationBalance
+  ApplyDelta）、药丸（Medicine）、荧光棒特质（RadiationEmitter→simDLL 阶段 B）、
+  辐射吸收者（事件转卡路里）、植物枯萎/变异种子（RadiationVulnerable +
+  SeedProducer.RollForMutation：min(辐射,最大耐受)/最大耐受×0.8）；
+  simDLL 侧唯一缺口 = 病菌 RadiationSickness 发射辐射（依赖病菌表，已预留）。
+
+**C# 生物换热原理（三问结论，simDLL 侧已实现无缺口）**：
+- 复制人/动物/植物共用 sim 组件 **ElementChunk**（AddElementChunk 消息）；
+  差异在 C# 子类与 groundTransferScale：复制人/温血动物
+  CreatureSimTemperatureTransfer=0（不换热地面）；冷血动物（Drecko 等）/植物
+  基础 SimTemperatureTransfer=0.0625 默认 → 与下方固体格换热；
+  下方格（cell−width）仅当 state&3==3（固体）才换热——爬墙动物地面换热、
+  墙壁/天花板不换热与用户观察一致。element_chunk.rs 已实现并实测。
+
+**Bug：小人在 20°C 空气误报炎热（06dd1ae）**：
+- 根因：`exchange_heat_energy_with_world` 返回**碎片失热**，原版返回 **cell 失热**
+  （CalculateTemperatureExchange 冷侧在前 energy=(T1−new_T1)×HC1，T1=cell，
+  L37923-37990 直接返回）——符号相反。
+- C# `CreatureSimTemperatureTransfer` 采样 deltaKJ：正=环境比小人热（炎热）、
+  负=小人比环境热（寒冷）。符号反 → 20°C 空气（低于体温）delta 为正 → 误报炎热。
+- 修复：返回 −heat（cell 热量变化）；回归测试：
+  `duplicant_in_cool_air_produces_negative_delta`（310K 复制人在 20°C 氧气
+  delta<0、量级≈0.04 kJ/tick）、正反向符号测试。
+- 全量 475 测试串行全过；release 构建成功。
+
