@@ -18,13 +18,14 @@ use crate::b_elements::element::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use once_cell::sync::Lazy;
 
 // ===== ElementsTable struct =====
 
 /// ElementsTable — 元素表（15 字段）。
 /// 封装原版 03_elements.c 的 15 个全局变量。
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ElementsTable {
     pub elements: Vec<Element>,                                // gElements
     pub element_names: Vec<String>,                            // gElementNames
@@ -50,6 +51,51 @@ pub struct ElementsTable {
 pub static G_ELEMENTS_TABLE: Lazy<Mutex<ElementsTable>> =
     Lazy::new(|| Mutex::new(ElementsTable::default()));
 
+/// 只读快照指针（性能专项，2026-08-05）。
+///
+/// 原版元素表是 11 个全局 std::vector（gElements 等），创建后**直接下标访问、无锁**
+/// （03_elements.c 唯一的 Mutex 是帧同步握手）。此前每个 get_* 都 lock std Mutex，
+/// 每格每子步约 150 万次加锁 → FPS 略低于原版（155-159 vs 160）。
+///
+/// 修复：CreateElementsTable 完成后把元素表发布为只读快照（AtomicPtr，store Release），
+/// get_* 读快照（load Acquire + 裸指针解引用，**无锁**）；快照未发布时（测试/早期）
+/// 回退 Mutex。**旧快照 leak 不释放**——CreateElementsTable 每次加载重建，sim 线程
+/// 可能仍在读旧快照；旧表约 100KB/次，多次加载泄漏可忽略。
+static ELEMENTS_SNAPSHOT: AtomicPtr<ElementsTable> = AtomicPtr::new(std::ptr::null_mut());
+
+/// 把当前 Mutex 表内容发布为只读快照（生产 CreateElementsTable 完成后 +
+/// 测试初始化元素表后调用）。克隆 ~200 条元素数据（~100KB），仅创建时一次。
+pub fn refresh_elements_snapshot() {
+    let table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let snapshot = Box::new(table.clone());
+    ELEMENTS_SNAPSHOT.store(Box::into_raw(snapshot), Ordering::Release);
+}
+
+/// get_* 统一入口：生产 = 无锁读只读快照（快照未发布时回退 Mutex）；
+/// 测试 = 直接 Mutex（与旧行为一致，避免逐个测试刷新快照的隔离负担）。
+/// 安全性：快照 Box leak 永不释放 → 指针始终有效；Acquire/Release 保证发布可见；
+/// 物理代码仅 sim 线程单线程执行，子步内同一快照稳定。
+#[cfg(not(test))]
+fn with_table<T>(f: impl FnOnce(&ElementsTable) -> T) -> T {
+    let ptr = ELEMENTS_SNAPSHOT.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        f(unsafe { &*ptr })
+    } else {
+        match G_ELEMENTS_TABLE.lock() {
+            Ok(t) => f(&t),
+            Err(e) => f(&e.into_inner()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn with_table<T>(f: impl FnOnce(&ElementsTable) -> T) -> T {
+    match G_ELEMENTS_TABLE.lock() {
+        Ok(t) => f(&t),
+        Err(e) => f(&e.into_inner()),
+    }
+}
+
 /// CreateElementInteractionsLocked 用的独立锁。
 /// 对应原版 gFrameSync.mSimMutex。
 /// 用 parking_lot::Mutex（非 poisoning，避免析构时 panic 影响后续 DLL 调用）。
@@ -68,18 +114,12 @@ fn get_element_index_inner(table: &ElementsTable, hash: u32) -> u16 {
 
 /// 查找元素索引（pub 版本，自行加锁）。
 pub fn get_element_index_pub(hash: u32) -> u16 {
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => get_element_index_inner(&table, hash),
-        Err(e) => get_element_index_inner(&e.into_inner(), hash),
-    }
+    with_table(|table| get_element_index_inner(table, hash))
 }
 
 /// 返回元素数量。
 pub fn get_element_count_pub() -> usize {
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.elements.len(),
-        Err(e) => e.into_inner().elements.len(),
-    }
+    with_table(|table| table.elements.len())
 }
 
 /// 销毁元素表（pub 版本，供 save_load CleanUp 调用）。
@@ -90,28 +130,19 @@ pub fn destroy_elements_table_pub() {
 /// 查询元素状态（低 2 bits：0=Vacuum, 1=Gas, 2=Liquid, 3=Solid）。
 pub fn get_element_state_by_idx(elem_idx: u16) -> Option<u8> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.state_data.get(idx).map(|s| s.state & 3),
-        Err(e) => e.into_inner().state_data.get(idx).map(|s| s.state & 3),
-    }
+    with_table(|table| table.state_data.get(idx).map(|s| s.state & 3))
 }
 
 /// 查询元素热导率（temperature.rs 用）。
 pub fn get_element_conductivity(elem_idx: u16) -> Option<f32> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.temperature_data.get(idx).map(|d| d.thermal_conductivity),
-        Err(e) => e.into_inner().temperature_data.get(idx).map(|d| d.thermal_conductivity),
-    }
+    with_table(|table| table.temperature_data.get(idx).map(|d| d.thermal_conductivity))
 }
 
 /// 查询元素比热容（temperature.rs 用）。
 pub fn get_element_specific_heat_capacity(elem_idx: u16) -> Option<f32> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.temperature_data.get(idx).map(|d| d.specific_heat_capacity),
-        Err(e) => e.into_inner().temperature_data.get(idx).map(|d| d.specific_heat_capacity),
-    }
+    with_table(|table| table.temperature_data.get(idx).map(|d| d.specific_heat_capacity))
 }
 
 /// 查询元素默认温度（对应 Element.defaultValues.temperature @0x98）。
@@ -121,19 +152,13 @@ pub fn get_element_specific_heat_capacity(elem_idx: u16) -> Option<f32> {
 /// `ElementTemperatureData` 不含该字段，故直接读 `Element.default_values.temperature`。
 pub fn get_element_default_temperature(elem_idx: u16) -> Option<f32> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.elements.get(idx).map(|e| e.default_values.temperature),
-        Err(e) => e.into_inner().elements.get(idx).map(|e| e.default_values.temperature),
-    }
+    with_table(|table| table.elements.get(idx).map(|e| e.default_values.temperature))
 }
 
 /// 一次性读取 ElementTemperatureData（避免多次加锁）。
 pub fn get_element_temperature_data(elem_idx: u16) -> Option<ElementTemperatureData> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.temperature_data.get(idx).copied(),
-        Err(e) => e.into_inner().temperature_data.get(idx).copied(),
-    }
+    with_table(|table| table.temperature_data.get(idx).copied())
 }
 
 /// 按索引读取元素 id（hash），用于 BeginSave 写存档。
@@ -141,40 +166,28 @@ pub fn get_element_temperature_data(elem_idx: u16) -> Option<ElementTemperatureD
 /// 即 gElements[idx].id。
 pub fn get_element_id_by_idx(elem_idx: u16) -> Option<i32> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.elements.get(idx).map(|e| e.id),
-        Err(e) => e.into_inner().elements.get(idx).map(|e| e.id),
-    }
+    with_table(|table| table.elements.get(idx).map(|e| e.id))
 }
 
 /// 查询元素液体数据（gElementLiquidData，24B）。
 /// 对照源码 00_types_reference.c L8802-8809。
 pub fn get_element_liquid_data(elem_idx: u16) -> Option<ElementLiquidData> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.liquid_data.get(idx).copied(),
-        Err(e) => e.into_inner().liquid_data.get(idx).copied(),
-    }
+    with_table(|table| table.liquid_data.get(idx).copied())
 }
 
 /// 查询元素压力数据（gElementPressureData，8B）。
 /// 对照源码 00_types_reference.c L5474-5477。
 pub fn get_element_pressure_data(elem_idx: u16) -> Option<ElementPressureData> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.pressure_data.get(idx).copied(),
-        Err(e) => e.into_inner().pressure_data.get(idx).copied(),
-    }
+    with_table(|table| table.pressure_data.get(idx).copied())
 }
 
 /// 查询元素属性纹理数据（gElementPropertyTextureData，36B）。
 /// 对照源码 00_types_reference.c L9598-9604。
 pub fn get_element_property_texture_data(elem_idx: u16) -> Option<ElementPropertyTextureData> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.property_texture_data.get(idx).copied(),
-        Err(e) => e.into_inner().property_texture_data.get(idx).copied(),
-    }
+    with_table(|table| table.property_texture_data.get(idx).copied())
 }
 
 /// 查询元素后处理数据（gElementPostProcessData，44B）。
@@ -185,10 +198,7 @@ pub fn get_element_property_texture_data(elem_idx: u16) -> Option<ElementPropert
 /// - max_mass / off_gas_percentage / sublimate_*：液体过压与升华路径
 pub fn get_element_post_process_data(elem_idx: u16) -> Option<ElementPostProcessData> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.post_process_data.get(idx).copied(),
-        Err(e) => e.into_inner().post_process_data.get(idx).copied(),
-    }
+    with_table(|table| table.post_process_data.get(idx).copied())
 }
 
 /// 查询元素吸光数据（gElementLightAbsorptionData，8B）。
@@ -196,20 +206,14 @@ pub fn get_element_post_process_data(elem_idx: u16) -> Option<ElementPostProcess
 /// 任务 8（update_exposed_to_sun_property_texture）用：factor 参与阳光衰减计算。
 pub fn get_element_light_absorption_data(elem_idx: u16) -> Option<ElementLightAbsorptionData> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.light_absorption_data.get(idx).copied(),
-        Err(e) => e.into_inner().light_absorption_data.get(idx).copied(),
-    }
+    with_table(|table| table.light_absorption_data.get(idx).copied())
 }
 
 /// 查询元素辐射数据（gElementRadiationData，8B）。
 /// 辐射模块（阶段 A）：factor 参与宇宙辐射遮挡，rads_per_1000 参与元素辐射扩散。
 pub fn get_element_radiation_data(elem_idx: u16) -> Option<ElementRadiationData> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.radiation_data.get(idx).copied(),
-        Err(e) => e.into_inner().radiation_data.get(idx).copied(),
-    }
+    with_table(|table| table.radiation_data.get(idx).copied())
 }
 
 // ===== 内部实现函数 =====
@@ -218,6 +222,9 @@ pub fn get_element_radiation_data(elem_idx: u16) -> Option<ElementRadiationData>
 /// **严格按源码不清空 3 个交互 vector**（03_elements.c L430-453）。
 fn destroy_elements_table() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 清空只读快照：后续 get_* 回退 Mutex（空表），避免读到旧数据。
+        // 旧快照 Box leak（不释放）——destroy 多在进程/测试边界调用，泄漏可忽略。
+        ELEMENTS_SNAPSHOT.store(std::ptr::null_mut(), Ordering::Release);
         let mut table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         table.elements.clear();
         table.element_names.clear();
@@ -565,6 +572,7 @@ pub extern "C" fn CreateElementsTable(reader: *mut BinaryBufferReader) -> *mut c
         let reader = unsafe { &mut *reader };
         match create_elements_table(reader) {
             Ok(count) => {
+                refresh_elements_snapshot();
                 tracing::info!(count, "CreateElementsTable success");
                 count as usize as *mut c_void
             }
@@ -652,10 +660,7 @@ pub extern "C" fn CreateElementInteractionsLocked(reader: *mut BinaryBufferReade
 /// 查询完整元素记录（gElements，0xa4B）。DoStateTransition 低温非固态分支读 low_temp/high_temp。
 pub fn get_element_by_idx(elem_idx: u16) -> Option<Element> {
     let idx = elem_idx as usize;
-    match G_ELEMENTS_TABLE.lock() {
-        Ok(table) => table.elements.get(idx).copied(),
-        Err(e) => e.into_inner().elements.get(idx).copied(),
-    }
+    with_table(|table| table.elements.get(idx).copied())
 }
 
 #[cfg(test)]
@@ -853,5 +858,38 @@ mod tests {
         assert!(ptd.is_some());
         assert!(ptd.unwrap().number_of_gradient_colors > 0);
         DestroyElementsTable();
+    }
+
+    /// 快照发布/销毁指针语义（生产无锁读路径的基础）：
+    /// refresh 后指针非空且指向克隆数据；destroy 后置 null（回退 Mutex）。
+    #[test]
+    fn elements_snapshot_publish_and_destroy() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        destroy_elements_table();
+        assert!(ELEMENTS_SNAPSHOT.load(Ordering::Acquire).is_null(), "初始无快照");
+
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.elements.push(Element::default());
+            table.elements[0].id = 0x1234;
+        }
+        refresh_elements_snapshot();
+        let ptr = ELEMENTS_SNAPSHOT.load(Ordering::Acquire);
+        assert!(!ptr.is_null(), "refresh 后快照非空");
+        let snap = unsafe { &*ptr };
+        assert_eq!(snap.elements.len(), 1);
+        assert_eq!(snap.elements[0].id, 0x1234, "快照内容 = Mutex 表克隆");
+
+        // 修改 Mutex 表不影响已发布快照（旧表 leak 语义：读取者持旧数据）
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements[0].id = 0x9999;
+        }
+        let snap2 = unsafe { &*ptr };
+        assert_eq!(snap2.elements[0].id, 0x1234, "快照不可变（克隆）");
+
+        destroy_elements_table();
+        assert!(ELEMENTS_SNAPSHOT.load(Ordering::Acquire).is_null(), "destroy 清空快照");
     }
 }
