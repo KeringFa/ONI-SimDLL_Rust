@@ -1073,3 +1073,30 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
 - **阶段 4（辐射病菌贡献）**：radiation.rs 预留段，RadiationSickness hash
   0xd49f77d6 → +count×0.001，挂接点已在 update_data 留注释占位（L145106）。
 
+## [已完成] 病菌模块·阶段 3：病菌消息/组件（2026-08-05 内联 TDD）
+
+- 规格：docs/superpowers/specs/2026-08-05-disease-messages-components-design.md（808bb8e）
+- 计划：docs/superpowers/plans/2026-08-05-disease-messages-components.md（a42554a）
+- **已实现（严格对照原版 06_process_messages.c / SimDLL_Source.c / 11_msvcrt_ignored.c / C# SimMessages）**：
+  1. 消息路由（3264d39）——ConsumeDisease 修正 **12B→16B**（C# struct
+     gameCell+callbackIdx+percent+max；原版 stride +4，代办原记 12B 有误）；
+     DiseaseEmitter 4/20/8B、DiseaseConsumer 12/20/8B 真实 emplace；
+  2. 处理函数（8b30551）——`GetReachableCells`（4 向 BFS、depth<range、不过滤元素内容）、
+     `ProcessConsumeDisease`（四舍五入 + maxToConsume 钳制 + count<1 清四字段 +
+     DiseaseConsumedCallback 12B）、`CellDiseaseModification`（idx==0xff 直加 count
+     [不改 idx，原版语义] / 否则 AddDiseaseToCell 强度混合）；
+  3. DiseaseEmitter 组件（9987f88）——版本句柄注册表（Register 默认
+     cell=-1/diseaseIdx=0xff；Modify game→sim 坐标换算 + 不重置 elapsedTime；
+     Remove 立即释放 + 版本+1）+ Update（区域门控 + interval 累加触发 +
+     BFS 发射：emitCount 正→全部可达格 / 负→仅同病菌格 + emittedInfo 8B 输出）+
+     挂接 update_data（原版 L145434 UpdateComponents 位置）；AllocateCells/
+     InitializeFromCells 清空注册表（与 radiation emitter 同约定）；
+  4. DiseaseConsumer 防御（928aef5）——消息解析 + 注册表（原版 Register 不读字段，
+     注册零值记录）；C# 无发送方 → Update 预留（vtable 未解析，已注释）；
+     update_data 集成测试（发射器经全管线向邻格发射）。
+- **测试**：+13 条（消息路由尺寸 3、BFS 深度/边界、Consume 四舍五入/钳制/清除回调、
+  CellMod 直加/混合、Emitter 注册/修改/移除/更新/负 count/区域门控、Consumer 注册/移除、
+  update_data 集成）；全量 535 测试串行全过（483 lib + 52 集成）；release 构建成功。
+- **下一步（阶段 4）**：辐射病菌贡献——RadiationSickness（hash 0xd49f77d6）→
+  `+count×0.001`（radiation.rs 预留段；挂接位已在 update_data 留注释占位 L145106）。
+
