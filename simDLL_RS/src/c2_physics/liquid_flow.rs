@@ -790,9 +790,21 @@ pub(crate) fn add_mass_and_update_temperature(
     add_disease_to_cell(cells, cell, disease_idx, disease_count);
 }
 
-/// Disease::AddDiseaseToCell（原版 11_msvcrt_ignored.c L26163-26263）简化版。
-/// 病菌转移：同病菌累加 count；不同病菌替换（原版还有基于疾病强度的混合，
-/// 依赖 gDisease 全局疾病表，Rust 侧暂无此表，此处简化为直接替换）。
+/// Disease::AddDiseaseToCell（原版 11_msvcrt_ignored.c L26163-26263）。
+///
+/// 病菌强度混合，逐分支对照原版：
+/// - 同病菌：count 累加（L26173-26174）；
+/// - 异病菌：默认替换为新病菌（L26175-26177）；
+/// - 双方真实病菌（cur!=0xff 且 new!=0xff）→ 默认保留当前（L26178-26179）+
+///   强度混合（L26180-26219）：
+///     f10 = cur_count × strength[cur]，f11 = new_count × strength[new]
+///     f10<=f11：cur<0 → result=-cur, idx=new；否则保留当前
+///     f10>f11：d=(int)(new - (f10/f11)×cur)；d<0 → idx=cur；
+///              result=-d（wrapping，对应 MSVC 无符号回绕），-1<d → result=d
+/// - result>0：idx 变化 → infestation_tick_count 清零（L26225-26231）；
+/// - result<=0：清除病菌四字段（L26234-26251）。
+///
+/// 防御：gDisease 表缺失或索引越界（原版越界断言/UB）→ 保留当前。
 pub(crate) fn add_disease_to_cell(
     cells: &mut CellSOA,
     cell: usize,
@@ -804,7 +816,50 @@ pub(crate) fn add_disease_to_cell(
     let (new_idx, new_count) = if cur_idx == disease_idx {
         (disease_idx, cur_count + disease_count)
     } else {
-        (disease_idx, disease_count)
+        // 默认：替换为新病菌（原版 L26175-26177）
+        let mut result_idx = disease_idx;
+        let mut result_count = disease_count;
+        // 双方真实病菌 → 默认保留当前 + 强度混合（L26178-26219）
+        if cur_idx != 0xFF && disease_idx != 0xFF {
+            let table_ptr = crate::globals::G_DISEASE.lock().0;
+            let strengths = if table_ptr.is_null() {
+                None
+            } else {
+                let t = unsafe { &*table_ptr };
+                Some(t.diseases.as_slice())
+            };
+            match strengths {
+                Some(s) if (cur_idx as usize) < s.len() && (disease_idx as usize) < s.len() => {
+                    result_count = cur_count;
+                    result_idx = cur_idx;
+                    let f10 = cur_count as f32 * s[cur_idx as usize].strength;
+                    let f11 = disease_count as f32 * s[disease_idx as usize].strength;
+                    if f10 <= f11 {
+                        if cur_count < 0 {
+                            result_count = cur_count.wrapping_neg();
+                            result_idx = disease_idx;
+                        }
+                    } else {
+                        let d = (disease_count as f32 - (f10 / f11) * cur_count as f32) as i32;
+                        if d < 0 {
+                            // 混合差值为负 → 当前病菌胜出（原版 param_3 = bVar1）
+                            result_idx = cur_idx;
+                            result_count = d.wrapping_neg();
+                        } else {
+                            // d>=0 → 新病菌（原版 bVar7 = param_3 未被改写）
+                            result_idx = disease_idx;
+                            result_count = d;
+                        }
+                    }
+                }
+                _ => {
+                    // 表缺失 / 索引越界（理论不发生的脏数据）→ 保留当前
+                    result_count = cur_count;
+                    result_idx = cur_idx;
+                }
+            }
+        }
+        (result_idx, result_count)
     };
     cells.disease_idx.set(cell, new_idx);
     cells.disease_count.set(cell, new_count);
@@ -5818,5 +5873,187 @@ mod tests {
             assert_eq!(events.spawn_fx_info.len(), 1);
         }
         DestroyElementsTable();
+    }
+
+    // ===== 任务 3：AddDiseaseToCell 病菌强度混合 =====
+
+    /// 安装病菌表到 G_DISEASE：
+    /// - idx0: strength = 2.0（当前病菌 A）
+    /// - idx1: strength = 4.0（强病菌 B，用于 f10<=f11 分支）
+    /// - idx2: strength = 1.0（弱病菌 C，用于 f10>f11 分支）
+    fn install_disease_table() {
+        use crate::b_elements::disease::{Disease, DiseaseInfo};
+        let mut t = Disease::new();
+        t.diseases.push_unchecked(DiseaseInfo { hash_id: 0xAAAA, strength: 2.0, ..Default::default() });
+        t.diseases.push_unchecked(DiseaseInfo { hash_id: 0xBBBB, strength: 4.0, ..Default::default() });
+        t.diseases.push_unchecked(DiseaseInfo { hash_id: 0xCCCC, strength: 1.0, ..Default::default() });
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    fn uninstall_disease_table() {
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+            g.0 = std::ptr::null_mut();
+        }
+    }
+
+    #[test]
+    fn add_disease_to_cell_same_disease_accumulates() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 100);
+            cells.disease_infestation_tick_count.set(0, 7);
+            add_disease_to_cell(cells, 0, 0, 50);
+            assert_eq!(cells.disease_idx.get(0), 0);
+            assert_eq!(cells.disease_count.get(0), 150);
+            assert_eq!(cells.disease_infestation_tick_count.get(0), 7, "同病菌不清 infestation");
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_one_side_invalid_replaces() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        uninstall_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0xff);
+            add_disease_to_cell(cells, 0, 1, 42);
+            assert_eq!(cells.disease_idx.get(0), 1);
+            assert_eq!(cells.disease_count.get(0), 42);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_mixing_keep_current_when_weaker_new() {
+        // cur(0,100,s2) + new(1,50,s4): f10=200<=f11=200, cur>=0 → 保留当前 (0,100)
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 100);
+            add_disease_to_cell(cells, 0, 1, 50);
+            assert_eq!(cells.disease_idx.get(0), 0, "f10<=f11 且 cur>=0 → 保留当前");
+            assert_eq!(cells.disease_count.get(0), 100);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_mixing_negative_cur_count_switches() {
+        // cur(0,-100,s2) + new(1,50,s4): f10=-200<=200, cur<0 → (-cur=100, idx=1)
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, -100);
+            add_disease_to_cell(cells, 0, 1, 50);
+            assert_eq!(cells.disease_idx.get(0), 1, "f10<=f11 且 cur<0 → 切换为新病菌");
+            assert_eq!(cells.disease_count.get(0), 100);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_mixing_negative_d_keeps_current() {
+        // cur(0,100,s2) + new(2,100,s1): f10=200>100, d=100-(200/100)*100=-100 → (100, idx=0)
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 100);
+            add_disease_to_cell(cells, 0, 2, 100);
+            assert_eq!(cells.disease_idx.get(0), 0, "f10>f11 且 d<0 → 当前病菌胜出");
+            assert_eq!(cells.disease_count.get(0), 100, "result = -d = 100");
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_mixing_positive_d_replaces() {
+        // cur(0,100,s2) + new(2,150,s1): f10=200>150, d=150-(200/150)*100=16 → (16, idx=2)
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 100);
+            add_disease_to_cell(cells, 0, 2, 150);
+            assert_eq!(cells.disease_idx.get(0), 2, "f10>f11 且 d>=0 → 新病菌");
+            assert_eq!(cells.disease_count.get(0), 16, "result = d = 16");
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_mixing_changes_idx_resets_infestation() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 100);
+            cells.disease_infestation_tick_count.set(0, 9);
+            add_disease_to_cell(cells, 0, 2, 150); // idx 0 → 2
+            assert_eq!(cells.disease_idx.get(0), 2);
+            assert_eq!(cells.disease_infestation_tick_count.get(0), 0, "idx 变化 → infestation 清零");
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_result_nonpositive_clears() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 5);
+            cells.disease_infestation_tick_count.set(0, 3);
+            cells.disease_growth_accumulated_error.set(0, 1.5);
+            add_disease_to_cell(cells, 0, 0, -5); // 5 + (-5) = 0
+            assert_eq!(cells.disease_idx.get(0), 0xff, "count<=0 → 清 idx");
+            assert_eq!(cells.disease_count.get(0), 0);
+            assert_eq!(cells.disease_infestation_tick_count.get(0), 0);
+            assert_eq!(cells.disease_growth_accumulated_error.get(0), 0.0);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_without_table_keeps_current() {
+        // G_DISEASE 为 null（无病菌表）时双真实病菌 → 防御保留当前（原版越界断言语义）
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        uninstall_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 100);
+            add_disease_to_cell(cells, 0, 1, 50);
+            assert_eq!(cells.disease_idx.get(0), 0, "无表时保留当前病菌");
+            assert_eq!(cells.disease_count.get(0), 100);
+        }
+        uninstall_disease_table();
     }
 }
