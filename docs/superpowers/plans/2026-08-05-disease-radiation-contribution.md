@@ -1,7 +1,7 @@
-# 病菌模块・阶段 4 实现计划（辐射病菌贡献）
+﻿# 病菌模块・阶段 4 实现计划（辐射病菌贡献）
 
 > **面向 AI 代理的工作者：** 本计划由主代理内联执行（用户已明确"终止，切回内联执行"）。
-> 每步使用复选（`- [ ]`）语法跟踪进度。
+> 每步使用复选（`- [x]`）语法跟踪进度。
 
 **目标：** 在 radiation.rs 的 `run_radiation_task` 逐格循环中实现 RadiationSickness 病菌辐射贡献（原版 L42860-42870）：`radiation[cell] += disease_count[cell] × 0.001`（disease_idx == RS 索引时）。
 
@@ -14,7 +14,7 @@
 **文件：**
 - 修改：`simDLL_RS/src/c2_physics/radiation.rs`
 
-- [ ] **步骤 1：编写失败测试**（沿用 init_radiation_table / make_sim / fill_both）
+- [x] **步骤 1：编写失败测试**（沿用 init_radiation_table / make_sim / fill_both）
 
 ```rust
 /// 病菌表挂 G_DISEASE：idx0 = RadiationSickness（hash 0xd49f77d6）、idx1 = 其他病菌。
@@ -56,8 +56,8 @@ fn table_without_radiation_sickness_is_noop() {
 }
 ```
 
-- [ ] **步骤 2：运行确认失败**（未实现 → RS 格 radiation=0）
-- [ ] **步骤 3：最小实现**（run_radiation_task 逐格循环，元素辐射扩散之后、宇宙辐射应用之前）
+- [x] **步骤 2：运行确认失败**（未实现 → RS 格 radiation=0）
+- [x] **步骤 3：最小实现**（run_radiation_task 逐格循环，元素辐射扩散之后、宇宙辐射应用之前）
 
 ```rust
 // 任务开头（循环外）：
@@ -74,8 +74,8 @@ if let Some(rs) = rs_idx {
 }
 ```
 
-- [ ] **步骤 4：运行确认通过**
-- [ ] **步骤 5：Commit**（`feat(c2): radiation sickness disease contributes radiation (task 1/2)`）
+- [x] **步骤 4：运行确认通过**
+- [x] **步骤 5：Commit**（`feat(c2): radiation sickness disease contributes radiation (task 1/2)`）
 
 ---
 
@@ -84,7 +84,7 @@ if let Some(rs) = rs_idx {
 **文件：**
 - 修改：`simDLL_RS/src/c2_physics/radiation.rs`（集成测试）
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```rust
 #[test]
@@ -95,10 +95,10 @@ fn update_data_applies_radiation_sickness_contribution() {
 }
 ```
 
-- [ ] **步骤 2：运行确认失败**（未挂接 → radiation=0）
-- [ ] **步骤 3：最小实现**：无（任务 1 已实现；测试验证全管线挂接）。
-- [ ] **步骤 4：运行确认通过** + 全量回归
-- [ ] **步骤 5：Commit**（`feat(c2): disease radiation contribution done - regression green + release`）
+- [x] **步骤 2：运行确认失败**（未挂接 → radiation=0）
+- [x] **步骤 3：最小实现**：无（任务 1 已实现；测试验证全管线挂接）。
+- [x] **步骤 4：运行确认通过** + 全量回归
+- [x] **步骤 5：Commit**（`feat(c2): disease radiation contribution done - regression green + release`）
 
 ---
 
