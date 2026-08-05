@@ -2449,6 +2449,11 @@ mod tests {
         let mut frame = SimFrameInfo::default();
 
         // gameCell=0 → simCell=7（默认真空）；添加液体元素 1
+        // 真空格无病菌：disease_idx=0xFF（真实游戏经 Load/ClearCell 初始化；
+        // CellSOA::with_size 零初始化是原版构造器语义，此处需显式模拟真空态）。
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.disease_idx.set(7, 0xFF);
+        updated_cells.disease_count.set(7, 0);
         frame.cell_modifications.push(crate::a_framework::sim_events::CellModification {
             game_cell: 0,
             callback_idx: -1,

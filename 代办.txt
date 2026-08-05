@@ -39,7 +39,7 @@
 ## [备忘] 遗留技术隐患与已知偏差（含审查待分诊）
 
 - **测试套件并行 flaky（不做处理，仅知悉）**：全量 `cargo test` 偶发 lib 失败（frame_processor/sim_data_ops 等不持 LIB_TESTS_LOCK 的既有竞态，多次确认与新增代码无关），串行 `--test-threads=1` 稳定全过。对策：遇 flaky 用 `cargo test -- --test-threads=1`。
-- **液体已知偏差**：① 病菌混合简化（无 gDisease 表）；② 相变留桩（升华/熔融发射未实现，仅累积纹理值）；③ powf 参数反编译丢失取 1.0（仅影响 alpha）；④ 压力循环门控只跳固体（原版更严 state&3<2）；⑤ post_process 过压分支潜在 0/0 NaN（观察未修，ppd.max_mass 修复后风险降低）。
+- **液体已知偏差**：① ~~病菌混合简化（无 gDisease 表）~~ **已解决（2026-08-05 病菌表阶段 1）**；② 相变留桩（升华/熔融发射未实现，仅累积纹理值）；③ powf 参数反编译丢失取 1.0（仅影响 alpha）；④ 压力循环门控只跳固体（原版更严 state&3<2）；⑤ post_process 过压分支潜在 0/0 NaN（观察未修，ppd.max_mass 修复后风险降低）。
 - **气体分层 bug**：DoDensityDisplacement 对气体也生效（原版 L1810 同款），用户判定为行为 bug，暂不修（保留决策）。
 - **visible_grid 全可见兜底**：屏幕外也会发液滴事件（开销问题，不影响行为）；SetVisibleCells 消息的 C# 发送方未定位，找到后可做屏幕级门控。
 - **液体性能（已知优化项）**：元素表每格加锁查询（G_ELEMENTS_TABLE Mutex），液体密集区帧率可能受影响；优化方向：update_data 一次性读出元素数据快照或改 RwLock。
@@ -374,7 +374,9 @@
 
 ### 需用户决策/大项（本次未动，列入待办）
 
-- **病菌混合简化（gDisease 表）**：疾病模拟全量（剩余清单 #4），大工程，另行立项。
+- **病菌混合简化（gDisease 表）**：~~混合已实现~~（2026-08-05 病菌表阶段 1）；
+  格子病菌模拟全量（UpdateCells/PostProcess/CalculateFinalDiseaseCount）仍待
+  实现，另立项（病菌阶段 2）。
 - **visible_grid 全可见兜底**：SetVisibleCells 消息的 C# 发送方未定位，找到后可做
   屏幕级门控（性能项）。
 - **元素表每格加锁性能**：G_ELEMENTS_TABLE Mutex → RwLock/快照（性能项）。
@@ -997,4 +999,38 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
   `duplicant_in_cool_air_produces_negative_delta`（310K 复制人在 20°C 氧气
   delta<0、量级≈0.04 kJ/tick）、正反向符号测试。
 - 全量 475 测试串行全过；release 构建成功。
+
+## [已完成] 病菌模块·阶段 1：病菌表解析 + 转移强度混合（2026-08-05 内联 TDD）
+
+- 规格：docs/superpowers/specs/2026-08-05-disease-table-design.md（72e14de）
+- 计划：docs/superpowers/plans/2026-08-05-disease-table-phase1.md（8a97619）
+- **已实现（严格对照原版 11_msvcrt_ignored.c，未抄任何项目版本）**：
+  1. `Disease::from_stream`（4f0dbee）——CreateDiseaseTable 消息解析：
+     count/elements_count + 每病菌 KleiString 名 + hash + strength + 4×RangeInfo +
+     radiationKillRate + elements_count×ElemGrowthInfo（6×f32+i32+u8）；
+     elements_count 与元素表数量不匹配 → warn 不中断（原版 DebugBreak+
+     KCrashReporterReportMessage，与 CreateElementsTable 同款）；
+     `MsvcString::set_bytes/as_bytes`（SSO ≤15B / 堆 >15B，堆内存随项目
+     快照泄漏约定不自动释放）；
+  2. `handle_create_disease_table` 挂接 gDisease（7230275）——解析成功后
+     释放旧 Box → Box::into_raw 替换（原版 unique_ptr 替换 + 析构 L507-516），
+     返回 null（L517）；失败保留旧表；
+  3. `AddDiseaseToCell` 病菌强度混合（9b2e38c）——同累加 / 异替换 /
+     双真实默认保留当前 + f10/f11 四分支（f10<=f11 且 cur>=0 保留当前、
+     cur<0 切新病菌；f10>f11 且 d<0 当前胜出、d>=0 新病菌）、result<=0
+     清四字段；gDisease 表缺失/索引越界 → 防御保留当前（原版越界断言）。
+- **实测踩坑（已修复并留注释）**：① `let d = unsafe { &*MUTEX.lock().0 }`
+  let 绑定引用会延长临时 MutexGuard 生命周期到函数结束 → 末尾 clean_up
+  同线程重锁死锁；必须显式作用域持锁。② `BinaryBufferReader::new(&w.into_bytes())`
+  悬垂指针（临时 Vec 语句结束即释放）——单测侥幸通过、全量堆复用后读到
+  脏数据；必须先把字节绑定到变量。
+- **测试**：+20 条（解析全字段/多病菌/空表/截断/长名/校验 warn、handler
+  挂接/替换/失败保留/CleanUp、混合四分支/infestation 清零/清四字段/无表
+  回退）；全量 500 测试串行全过（448 lib + 52 集成）；release 构建成功。
+- **下一步（阶段 2）**：格子病菌模拟——UpdateCells（11_msvcrt_ignored.c
+  L26646）/ PostProcess（L26424）/ CalculateFinalDiseaseCount（L26268）/
+  GetDiffusionScale（L26329），挂接温度任务循环（最大工作量，约 555 行）。
+- **后续阶段**：阶段 3 病菌消息/组件（DiseaseEmitter/Consumer、ConsumeDisease
+  12B、CellDiseaseModification 12B、ModifyDiseaseCount）；阶段 4 辐射病菌贡献
+  （radiation.rs 预留段，RadiationSickness hash 0xd49f77d6 → +count×0.001）。
 

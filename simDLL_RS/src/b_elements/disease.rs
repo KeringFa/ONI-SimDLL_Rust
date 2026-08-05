@@ -358,7 +358,11 @@ mod tests {
             w.write_float(0.0);
         }
         w.write_float(0.5);
-        let mut reader = BinaryBufferReader::new(&w.into_bytes());
+        // 注意：必须先把字节绑定到变量，reader 持有裸指针；若写成
+        // `new(&w.into_bytes())`，临时 Vec 在语句结束即释放 → 悬垂指针
+        // （单测侥幸通过、全量下堆复用后读到脏数据，已实测踩坑）。
+        let bytes = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&bytes);
         let d = Disease::from_stream(&mut reader).expect("parse ok");
         assert_eq!(d.disease_names.as_slice()[0].as_bytes(), long_name);
     }
