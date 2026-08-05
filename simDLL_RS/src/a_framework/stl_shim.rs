@@ -292,6 +292,57 @@ impl Default for MsvcString {
     }
 }
 
+impl MsvcString {
+    /// 写入字符串字节（MSVC std::string 布局：SSO ≤15B / 堆 >15B）。
+    ///
+    /// 仅 `Disease::disease_names` 使用（C# 不读、Rust 侧也不依赖内容），
+    /// 因此内部存储自洽即可。长度 ≤15 走 SSO（buffer[15] 存 capacity=15）；
+    /// 更长走堆分配（buffer[0..8] 存指针，size=len, capacity=len）。
+    /// 注意：本结构 derive Copy 且无 Drop，堆内存不自动释放——与项目 MsvcVector
+    /// 快照泄漏约定一致（CreateDiseaseTable 每次加载重建，泄漏量极小，已知可接受）。
+    pub fn set_bytes(&mut self, bytes: &[u8]) {
+        let len = bytes.len();
+        self.size = len as u64;
+        if len <= 15 {
+            self.buffer[..len].copy_from_slice(bytes);
+            self.buffer[15] = 15; // MSVC SSO 末字节存 capacity
+            self.capacity = 15;
+            return;
+        }
+        let layout = std::alloc::Layout::from_size_align(len + 1, 1).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut u8;
+        if ptr.is_null() {
+            // 分配失败：降级为 SSO 截断（仅诊断用途，名字不被任何代码读取）
+            let n = len.min(15);
+            self.buffer[..n].copy_from_slice(&bytes[..n]);
+            self.buffer[15] = 15;
+            self.size = n as u64;
+            self.capacity = 15;
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
+            std::ptr::write(ptr.add(len), 0);
+        }
+        self.buffer[0..8].copy_from_slice(&(ptr as usize).to_ne_bytes());
+        self.capacity = len as u64;
+    }
+
+    /// 读回字符串字节（测试/诊断用）。
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let len = self.size as usize;
+        if len == 0 {
+            return Vec::new();
+        }
+        if len <= 15 {
+            self.buffer[..len].to_vec()
+        } else {
+            let ptr = usize::from_ne_bytes(self.buffer[0..8].try_into().unwrap()) as *const u8;
+            unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
+        }
+    }
+}
+
 /// MSVC std::function 等价物（64 字节）。
 #[repr(C)]
 #[derive(Clone, Copy)]

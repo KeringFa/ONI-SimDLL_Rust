@@ -14,7 +14,9 @@
 //!
 //! **注意**：DiseaseInfo/Disease 含 MsvcVector（裸指针），不能 derive Copy/Clone。
 
+use crate::a_framework::buffer::{BinaryBufferReader, BufferError};
 use crate::a_framework::stl_shim::{MsvcString, MsvcVector};
+use crate::b_elements::elements_table;
 
 /// RangeInfo — 范围信息（16B = 4×f32）。
 /// 源码 00_types_reference.c L12644-12646（struct RangeInfo { union RangeInfo_u_0 }）。
@@ -76,6 +78,89 @@ impl Disease {
         Self::default()
     }
 
+    /// Disease::Disease 构造 — 从 CreateDiseaseTable 消息流解析病菌表。
+    ///
+    /// 对照原版 11_msvcrt_ignored.c L25718-26091 + C# SimMessages.CreateDiseaseTable：
+    /// ```text
+    /// count(i32) + elements_count(i32)
+    /// repeat count:
+    ///   name KleiString(u32 len + UTF-8) + hash_id(u32) + strength(f32)
+    ///   + 4×RangeInfo(4×f32: minViable/minGrowth/maxGrowth/maxViable)
+    ///   + radiation_kill_rate(f32)
+    ///   + elements_count × ElemGrowthInfo(6×f32 + min_diffusion_count i32
+    ///     + min_diffusion_infestation_tick_count u8)
+    /// ```
+    /// elements_count 与元素表数量不匹配时：原版 DebugBreak（仅调试器）+ 
+    /// KCrashReporterReportMessage，本项目 warn 不中断（与 CreateElementsTable 同款）。
+    pub fn from_stream(reader: &mut BinaryBufferReader) -> Result<Disease, BufferError> {
+        let count = reader.read_int()?;
+        let elements_count = reader.read_int()?;
+        let table_count = elements_table::get_element_count_pub() as i64;
+        if elements_count as i64 != table_count {
+            tracing::warn!(
+                elements_count,
+                table_count,
+                "CreateDiseaseTable: elements_count != element table count (original DebugBreak)"
+            );
+        }
+        let count = count.max(0) as usize;
+        let elements_count = elements_count.max(0) as usize;
+
+        let mut disease = Disease::new();
+        disease.disease_names.resize(count, MsvcString::default());
+        for i in 0..count {
+            // KleiString：u32 字节长度 + UTF-8 字节（C# WriteKleiString，无 NUL）
+            let name_len = reader.read_uint()? as usize;
+            let name_bytes = reader.read_bytes(name_len)?;
+            let hash_id = reader.read_uint()?;
+            let strength = reader.read_float()?;
+            let temperature_range = read_range_info(reader)?;
+            let temperature_half_lives = read_range_info(reader)?;
+            let pressure_range = read_range_info(reader)?;
+            let pressure_half_lives = read_range_info(reader)?;
+            let radiation_kill_rate = reader.read_float()?;
+
+            // 8 个 ElemGrowthInfo vector resize 到 elements_count（对照 L25790-25804）
+            let mut eg = ElemGrowthInfo::default();
+            eg.under_population_death_rate.resize(elements_count, 0.0);
+            eg.population_half_life.resize(elements_count, 0.0);
+            eg.over_population_half_life.resize(elements_count, 0.0);
+            eg.diffusion_scale.resize(elements_count, 0.0);
+            eg.min_count_per_kg.resize(elements_count, 0.0);
+            eg.max_count_per_kg.resize(elements_count, 0.0);
+            eg.min_diffusion_count.resize(elements_count, 0);
+            eg.min_diffusion_infestation_tick_count.resize(elements_count, 0);
+            // 逐元素读取（对照 L25808-25875：6×f32 + i32 + u8）
+            for j in 0..elements_count {
+                eg.under_population_death_rate.set(j, reader.read_float()?);
+                eg.population_half_life.set(j, reader.read_float()?);
+                eg.over_population_half_life.set(j, reader.read_float()?);
+                eg.diffusion_scale.set(j, reader.read_float()?);
+                eg.min_count_per_kg.set(j, reader.read_float()?);
+                eg.max_count_per_kg.set(j, reader.read_float()?);
+                eg.min_diffusion_count.set(j, reader.read_int()?);
+                eg.min_diffusion_infestation_tick_count.set(j, reader.read_byte()?);
+            }
+
+            let info = DiseaseInfo {
+                hash_id,
+                strength,
+                temperature_range,
+                temperature_half_lives,
+                pressure_range,
+                pressure_half_lives,
+                elem_growth_info: eg,
+                radiation_kill_rate,
+            };
+            let mut name = MsvcString::default();
+            name.set_bytes(&name_bytes);
+            disease.disease_names.set(i, name);
+            // DiseaseInfo 非 Copy（含 MsvcVector），用 push_unchecked（2x 增长）。
+            disease.diseases.push_unchecked(info);
+        }
+        Ok(disease)
+    }
+
     /// GetDiseaseIndex — 按 hashId 查找病菌索引。
     /// 对照源码 11_msvcrt_ignored.c L26386-26419。
     ///
@@ -95,9 +180,20 @@ impl Disease {
     }
 }
 
+/// 读取一个 RangeInfo（4×f32，顺序 minViable/minGrowth/maxGrowth/maxViable）。
+fn read_range_info(reader: &mut BinaryBufferReader) -> Result<RangeInfo, BufferError> {
+    Ok(RangeInfo {
+        min_viable: reader.read_float()?,
+        min_growth: reader.read_float()?,
+        max_growth: reader.read_float()?,
+        max_viable: reader.read_float()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::a_framework::buffer::{BinaryBufferReader, BinaryBufferWriter};
     use std::mem::size_of;
 
     #[test]
@@ -137,5 +233,133 @@ mod tests {
         assert_eq!(di.strength, 0.0);
         assert_eq!(di.radiation_kill_rate, 0.0);
         assert_eq!(di.temperature_range.min_viable, 0.0);
+    }
+
+    /// 按 C# SimMessages.CreateDiseaseTable 写入顺序构造消息字节：
+    /// count(i32) + elements_count(i32) +
+    /// 每病菌：KleiString(名字) + hash(u32) + strength(f32) + 4×RangeInfo(4×f32) +
+    ///         radiationKillRate(f32) + elements_count×(6×f32 + i32 + u8)。
+    fn build_disease_table_msg(count: i32, elements_count: i32, hash: u32) -> Vec<u8> {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(count);
+        w.write_int(elements_count);
+        for _ in 0..count {
+            w.write_int(11); // KleiString 字节长度
+            w.write_bytes(b"TestDisease");
+            w.write_uint(hash);
+            w.write_float(1.5); // strength
+            // 4×RangeInfo（minViable/minGrowth/maxGrowth/maxViable）
+            for v in [
+                1.0, 2.0, 3.0, 4.0,   // temperature_range
+                5.0, 6.0, 7.0, 8.0,   // temperature_half_lives
+                9.0, 10.0, 11.0, 12.0, // pressure_range
+                13.0, 14.0, 15.0, 16.0, // pressure_half_lives
+            ] {
+                w.write_float(v);
+            }
+            w.write_float(17.5); // radiationKillRate
+            for i in 0..elements_count {
+                w.write_float(0.1 + i as f32);
+                w.write_float(0.2 + i as f32);
+                w.write_float(0.3 + i as f32);
+                w.write_float(0.4 + i as f32);
+                w.write_float(0.5 + i as f32);
+                w.write_float(0.6 + i as f32);
+                w.write_int(7 + i);
+                w.write_byte(8 + i as u8);
+            }
+        }
+        w.into_bytes()
+    }
+
+    #[test]
+    fn disease_from_stream_parses_all_fields() {
+        let data = build_disease_table_msg(1, 2, 0x11223344);
+        let mut reader = BinaryBufferReader::new(&data);
+        let d = Disease::from_stream(&mut reader).expect("parse ok");
+
+        assert_eq!(d.disease_names.len(), 1);
+        assert_eq!(d.disease_names.as_slice()[0].as_bytes(), b"TestDisease");
+
+        let di = &d.diseases.as_slice()[0];
+        assert_eq!(di.hash_id, 0x11223344);
+        assert_eq!(di.strength, 1.5);
+        assert_eq!(di.temperature_range.min_viable, 1.0);
+        assert_eq!(di.temperature_range.max_viable, 4.0);
+        assert_eq!(di.temperature_half_lives.min_growth, 6.0);
+        assert_eq!(di.temperature_half_lives.max_viable, 8.0);
+        assert_eq!(di.pressure_range.min_viable, 9.0);
+        assert_eq!(di.pressure_range.max_growth, 11.0);
+        assert_eq!(di.pressure_half_lives.min_viable, 13.0);
+        assert_eq!(di.pressure_half_lives.max_viable, 16.0);
+        assert_eq!(di.radiation_kill_rate, 17.5);
+
+        let eg = &di.elem_growth_info;
+        assert_eq!(eg.under_population_death_rate.as_slice(), &[0.1, 1.1]);
+        assert_eq!(eg.population_half_life.as_slice(), &[0.2, 1.2]);
+        assert_eq!(eg.over_population_half_life.as_slice(), &[0.3, 1.3]);
+        assert_eq!(eg.diffusion_scale.as_slice(), &[0.4, 1.4]);
+        assert_eq!(eg.min_count_per_kg.as_slice(), &[0.5, 1.5]);
+        assert_eq!(eg.max_count_per_kg.as_slice(), &[0.6, 1.6]);
+        assert_eq!(eg.min_diffusion_count.as_slice(), &[7, 8]);
+        assert_eq!(eg.min_diffusion_infestation_tick_count.as_slice(), &[8, 9]);
+    }
+
+    #[test]
+    fn disease_from_stream_multiple_diseases_preserves_order() {
+        let data = build_disease_table_msg(2, 1, 0x99);
+        let mut reader = BinaryBufferReader::new(&data);
+        let d = Disease::from_stream(&mut reader).expect("parse ok");
+        assert_eq!(d.diseases.len(), 2);
+        assert_eq!(d.disease_names.len(), 2);
+        assert_eq!(d.diseases.as_slice()[0].hash_id, 0x99);
+        assert_eq!(d.diseases.as_slice()[1].hash_id, 0x99);
+        assert_eq!(d.diseases.as_slice()[0].elem_growth_info.min_diffusion_count.as_slice(), &[7]);
+    }
+
+    #[test]
+    fn disease_from_stream_elements_count_mismatch_is_warn_only() {
+        // elements_count 与元素表数量（测试环境无表 = 0）不匹配：
+        // 原版 DebugBreak + KCrashReporterReportMessage，本项目 warn 不中断、表仍可读。
+        let data = build_disease_table_msg(1, 2, 0x1234);
+        let mut reader = BinaryBufferReader::new(&data);
+        let d = Disease::from_stream(&mut reader).expect("mismatch should still parse");
+        assert_eq!(d.diseases.len(), 1);
+        assert_eq!(d.diseases.as_slice()[0].hash_id, 0x1234);
+    }
+
+    #[test]
+    fn disease_from_stream_empty_is_empty_table() {
+        let data = build_disease_table_msg(0, 0, 0);
+        let mut reader = BinaryBufferReader::new(&data);
+        let d = Disease::from_stream(&mut reader).expect("empty parse ok");
+        assert!(d.diseases.is_empty());
+        assert!(d.disease_names.is_empty());
+    }
+
+    #[test]
+    fn disease_from_stream_truncated_returns_err() {
+        let data = build_disease_table_msg(1, 2, 0x1234);
+        let mut reader = BinaryBufferReader::new(&data[..data.len() - 4]);
+        assert!(Disease::from_stream(&mut reader).is_err());
+    }
+
+    #[test]
+    fn disease_from_stream_long_name_roundtrips() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(1);
+        w.write_int(0);
+        let long_name = b"RadiationSickness"; // 16 字节，超过 SSO 15 字节上限
+        w.write_int(long_name.len() as i32);
+        w.write_bytes(long_name);
+        w.write_uint(0x5);
+        w.write_float(1.0);
+        for _ in 0..16 {
+            w.write_float(0.0);
+        }
+        w.write_float(0.5);
+        let mut reader = BinaryBufferReader::new(&w.into_bytes());
+        let d = Disease::from_stream(&mut reader).expect("parse ok");
+        assert_eq!(d.disease_names.as_slice()[0].as_bytes(), long_name);
     }
 }
