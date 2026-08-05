@@ -887,6 +887,13 @@ cosmic/钳制）、接线顺序（辐射任务→UpdateComponents(0.2,region)）
 **记录（依赖未实现）**：病菌辐射贡献（RadiationSickness → +count×0.001，
 L42860-42870）依赖病菌表，留待病菌模块实现时补。
 
+**核对结论（2026-08-05）**：SimplePulse / RadialBeams / Attractor 三种辐射类型
+**无需实现**——C# 全项目搜索确认无任何实体配置这三种类型（只用 Constant 与
+Pulsing）；原版 simDLL switch 也无 RadialBeams case（C# 枚举残留）。项目版
+`_ => {}` 跳过与原版行为等价。原版行为备忘：SimplePulse = 脉冲环直接
++emitRads（无吸收/linger）；Attractor = 从环格吸辐射转移到发射器中心格；
+RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
+
 **保留的等价防御（Minor）**：tickConstant 0 半径 max(1)（原版除零）、
 线走查越界跳过（原版断言）。
 
