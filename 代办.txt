@@ -1100,3 +1100,21 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
 - **下一步（阶段 4）**：辐射病菌贡献——RadiationSickness（hash 0xd49f77d6）→
   `+count×0.001`（radiation.rs 预留段；挂接位已在 update_data 留注释占位 L145106）。
 
+## [已完成] 病菌模块·阶段 4：辐射病菌贡献（2026-08-05 内联 TDD）
+
+- 规格：docs/superpowers/specs/2026-08-05-disease-radiation-contribution-design.md（7ba2ffc）
+- 计划：docs/superpowers/plans/2026-08-05-disease-radiation-contribution.md（93649dd）
+- **已实现（c04664b，严格对照 SimDLL_Source.c L42860-42870）**：
+  - `run_radiation_task` 逐格循环内（元素辐射扩散之后、宇宙辐射应用之前）插入：
+    `disease_idx[cell] == GetDiseaseIndex(gDisease, 0xd49f77d6)` 时
+    `radiation[cell] += disease_count[cell] × 0.001`；
+  - RS 索引循环外算一次；gDisease 缺失 → 跳过（防御）；表无 RS → 返回 0xff
+    无病菌格匹配 +0（原版语义）。
+- **测试**：+6 条（RS 贡献 count×0.001 / 非 RS 不贡献 / 0xff+0 / 表缺失跳过 /
+  表无 RS 无操作 / update_data 全管线集成）；全量 541 测试串行全过
+  （489 lib + 52 集成）；release 构建成功。
+- **病菌模块至此四阶段全部完成**（表解析→格子模拟→消息/组件→辐射贡献）。
+- **后续**：病菌 C# 侧疾病状态/治疗由 C# DiseaseContainers 消费（simDLL 仅提供
+  病菌数据 + Grid 病菌）；若日后做病菌全量回归，注意 RadiationSickness 为 DLC
+  专属病菌（单星存档无此表项 → 贡献自动跳过）。
+
