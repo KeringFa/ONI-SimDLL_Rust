@@ -119,6 +119,7 @@ pub fn handle_allocate_cells(reader: &mut BinaryBufferReader) -> *mut c_void {
     // 原版注册表在 Sim 内、跨存档靠 Remove 消息清理；本项目为全局静态，
     // 显式清空避免"上个存档辐射残留"（旧发射器继续向新世界发射）。
     crate::c_simulation::radiation_emitter::clear_radiation_emitters();
+    crate::c_simulation::disease_component::clear_disease_emitters();
 
     tracing::info!(width, height, flag1, flag2, "AllocateCells done");
     sim_data_ptr as *mut c_void
@@ -1372,6 +1373,7 @@ pub fn handle_initialize_from_cells(reader: &mut BinaryBufferReader) -> *mut c_v
     }
     global_sim_data.0 = new_ptr;
     crate::c_simulation::radiation_emitter::clear_radiation_emitters();
+    crate::c_simulation::disease_component::clear_disease_emitters();
 
     unsafe {
         let sim_data = &mut *new_ptr;

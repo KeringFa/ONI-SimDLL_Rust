@@ -8,6 +8,355 @@
 use crate::a_framework::game_data::DiseaseConsumedCallback;
 use crate::a_framework::sim_data::SimData;
 use crate::a_framework::sim_frame_manager::SimFrameInfo;
+use crate::d1_activity::RegionBounds;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+
+/// game→sim 坐标换算（原版 L37492 Modify 同款）。
+fn game_to_sim_cell(game_cell: i32, width: i32) -> i32 {
+    let gw = width - 2;
+    (game_cell / gw + 1) * width + game_cell % gw + 1
+}
+
+/// AddDiseaseEmitterMessage（4B：{int callbackIdx}）。
+#[derive(Clone, Copy, Default, Debug)]
+pub struct AddDiseaseEmitterMsg {
+    pub callback_idx: i32,
+}
+
+impl AddDiseaseEmitterMsg {
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 4 {
+            return None;
+        }
+        Some(Self {
+            callback_idx: i32::from_le_bytes(b[0..4].try_into().ok()?),
+        })
+    }
+}
+
+/// ModifyDiseaseEmitterMessage（20B：{int handle, int gameCell, byte diseaseIdx,
+/// byte maxDepth, pad, pad, float emitInterval, int emitCount}）。
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ModifyDiseaseEmitterMsg {
+    pub handle: i32,
+    pub game_cell: i32,
+    pub disease_idx: u8,
+    pub max_depth: u8,
+    pub emit_interval: f32,
+    pub emit_count: i32,
+}
+
+impl ModifyDiseaseEmitterMsg {
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 20 {
+            return None;
+        }
+        Some(Self {
+            handle: i32::from_le_bytes(b[0..4].try_into().ok()?),
+            game_cell: i32::from_le_bytes(b[4..8].try_into().ok()?),
+            disease_idx: b[8],
+            max_depth: b[9],
+            emit_interval: f32::from_le_bytes(b[12..16].try_into().ok()?),
+            emit_count: i32::from_le_bytes(b[16..20].try_into().ok()?),
+        })
+    }
+}
+
+/// RemoveDiseaseEmitterMessage（8B：{int handle, int callbackIdx}）。
+#[derive(Clone, Copy, Default, Debug)]
+pub struct RemoveDiseaseEmitterMsg {
+    pub handle: i32,
+    pub callback_idx: i32,
+}
+
+impl RemoveDiseaseEmitterMsg {
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(Self {
+            handle: i32::from_le_bytes(b[0..4].try_into().ok()?),
+            callback_idx: i32::from_le_bytes(b[4..8].try_into().ok()?),
+        })
+    }
+}
+
+/// DiseaseEmitterData（20B = 0x14，00_types_reference.c L3319）。
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DiseaseEmitterData {
+    pub cell: i32,          // sim 格 @0
+    pub disease_idx: u8,    // @4
+    pub range: u8,          // @5
+    pub emit_count: i32,    // @8
+    pub emit_interval: f32, // @0xc
+    pub elapsed_time: f32,  // @0x10
+}
+
+/// DiseaseEmitter 注册表（版本句柄 + free list，仿 radiation_emitter.rs）。
+pub struct DiseaseEmitterRegistry {
+    records: Vec<DiseaseEmitterData>,
+    items: Vec<i32>,
+    versions: Vec<u8>,
+    free_handles: Vec<i32>,
+    emitted_info: Vec<crate::a_framework::game_data::DiseaseEmittedInfo>,
+}
+
+impl DiseaseEmitterRegistry {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            items: Vec::new(),
+            versions: Vec::new(),
+            free_handles: Vec::new(),
+            emitted_info: Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.items.clear();
+        self.versions.clear();
+        self.free_handles.clear();
+        self.emitted_info.clear();
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.items.iter().filter(|&&ri| ri >= 0).count()
+    }
+
+    pub fn record(&self, handle: i32) -> Option<&DiseaseEmitterData> {
+        let index = (handle & 0xffffff) as usize;
+        let version = ((handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return None;
+        }
+        let ri = self.items[index];
+        if ri < 0 {
+            return None;
+        }
+        self.records.get(ri as usize)
+    }
+
+    /// Register（原版 L37549）：分配槽，默认 cell=-1/diseaseIdx=0xff/range=0/
+    /// emitCount=0/interval=0/elapsedTime=0；返回 handle。
+    pub fn register(&mut self) -> i32 {
+        let index;
+        if let Some(free) = self.free_handles.pop() {
+            index = free as usize;
+            let ri = self.records.len() as i32;
+            self.items[index] = ri;
+            self.records.push(DiseaseEmitterData::default());
+            self.versions[index] = self.versions[index].wrapping_add(1);
+        } else {
+            index = self.items.len();
+            let ri = self.records.len() as i32;
+            self.items.push(ri);
+            self.records.push(DiseaseEmitterData::default());
+            self.versions.push(0);
+        }
+        let record = &mut self.records[self.items[index] as usize];
+        record.cell = -1;
+        record.disease_idx = 0xff;
+        ((self.versions[index] as i32) << 24) | (index as i32 & 0xffffff)
+    }
+
+    /// Modify（原版 L37492）：版本校验后写字段；不重置 elapsedTime。
+    pub fn modify(&mut self, sim: &SimData, msg: &ModifyDiseaseEmitterMsg) -> bool {
+        let index = (msg.handle & 0xffffff) as usize;
+        let version = ((msg.handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return false;
+        }
+        let ri = self.items[index];
+        if ri < 0 {
+            return false;
+        }
+        let rec = &mut self.records[ri as usize];
+        rec.cell = game_to_sim_cell(msg.game_cell, sim.width);
+        rec.disease_idx = msg.disease_idx;
+        rec.range = msg.max_depth;
+        rec.emit_count = msg.emit_count;
+        rec.emit_interval = msg.emit_interval;
+        true
+    }
+
+    /// Unregister（原版 L37635）：释放槽 + 版本+1（立即释放；原版 CompactedVector::Free）。
+    pub fn remove(&mut self, handle: i32) -> bool {
+        let index = (handle & 0xffffff) as usize;
+        let version = ((handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return false;
+        }
+        let ri = self.items[index];
+        if ri < 0 {
+            return false;
+        }
+        let ri = ri as usize;
+        self.records.swap_remove(ri);
+        // 修复被 swap 移动的记录引用（原最后一条 → ri）
+        for it in self.items.iter_mut() {
+            if *it as usize == self.records.len() {
+                *it = ri as i32;
+            }
+        }
+        self.versions[index] = self.versions[index].wrapping_add(1);
+        self.items[index] = -1;
+        self.free_handles.push(index as i32);
+        true
+    }
+}
+
+fn push_state_changed(sim: &mut SimData, callback_idx: i32, sim_handle: i32) {
+    if sim.sim_events.ptr.is_null() {
+        return;
+    }
+    let events = unsafe { &mut *sim.sim_events.ptr };
+    events.component_state_changed_messages.push(
+        crate::a_framework::game_data::ComponentStateChangedMessage {
+            callback_idx,
+            sim_handle,
+        },
+    );
+}
+
+static DISEASE_EMITTER_MANAGER: Lazy<Mutex<DiseaseEmitterRegistry>> =
+    Lazy::new(|| Mutex::new(DiseaseEmitterRegistry::new()));
+
+/// 新世界分配时清空（与 radiation emitter 同约定；原版组件在 SimData 内，随分配重建）。
+pub fn clear_disease_emitters() {
+    DISEASE_EMITTER_MANAGER.lock().clear();
+}
+
+pub fn disease_emitter_count() -> usize {
+    DISEASE_EMITTER_MANAGER.lock().active_count()
+}
+
+#[cfg(test)]
+pub(crate) fn disease_emitter_record(handle: i32) -> Option<DiseaseEmitterData> {
+    DISEASE_EMITTER_MANAGER.lock().record(handle).copied()
+}
+
+#[cfg(test)]
+pub(crate) fn disease_emitter_handle(ordinal: usize) -> Option<i32> {
+    let mgr = DISEASE_EMITTER_MANAGER.lock();
+    let mut seen = 0usize;
+    for (index, &ri) in mgr.items.iter().enumerate() {
+        if ri >= 0 {
+            if seen == ordinal {
+                return Some(((mgr.versions[index] as i32) << 24) | (index as i32 & 0xffffff));
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn disease_emitter_emitted(ordinal: usize) -> Option<(u8, i32)> {
+    let mgr = DISEASE_EMITTER_MANAGER.lock();
+    mgr.emitted_info.get(ordinal).map(|e| (e.disease_idx, e.count))
+}
+
+/// 处理帧内 disease_emitter_messages：adds(4B) → modifies(20B) → removes(8B)。
+/// Register 回调推 {handle, callbackIdx}；Remove 回调推 {−1, callbackIdx}（原版 frame manager）。
+pub fn process_disease_emitter_messages(
+    frame: &crate::a_framework::sim_frame_manager::SimFrameInfo,
+    sim: &mut SimData,
+) {
+    let mut mgr = DISEASE_EMITTER_MANAGER.lock();
+    for b in frame.disease_emitter_messages.adds.as_slice().chunks(4) {
+        if let Some(msg) = AddDiseaseEmitterMsg::from_bytes(b) {
+            let handle = mgr.register();
+            if msg.callback_idx != -1 {
+                push_state_changed(sim, msg.callback_idx, handle);
+            }
+        }
+    }
+    for b in frame.disease_emitter_messages.modifies.as_slice().chunks(20) {
+        if let Some(msg) = ModifyDiseaseEmitterMsg::from_bytes(b) {
+            mgr.modify(sim, &msg);
+        }
+    }
+    for b in frame.disease_emitter_messages.removes.as_slice().chunks(8) {
+        if let Some(msg) = RemoveDiseaseEmitterMsg::from_bytes(b) {
+            mgr.remove(msg.handle);
+            if msg.callback_idx != -1 {
+                push_state_changed(sim, msg.callback_idx, -1);
+            }
+        }
+    }
+    // 注意：frame 向量清空由调用方（frame_processor）统一处理（与 radiation emitter 同约定）。
+}
+
+/// DiseaseEmitter::Update（原版 L37651）：区域门控 + interval 触发 +
+/// GetReachableCells 发射（emitCount 正负两分支）+ emittedInfo 输出。
+pub(crate) fn update_disease_emitters(sim: &mut SimData, dt: f32, bounds: RegionBounds) {
+    let mut mgr = DISEASE_EMITTER_MANAGER.lock();
+    let width = sim.width as usize;
+    if width < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let record_count = mgr.records.len();
+    mgr.emitted_info.resize(record_count, Default::default());
+    let disease_ptr = crate::globals::G_DISEASE.lock().0;
+    let disease = if disease_ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*disease_ptr })
+    };
+    for idx in 0..mgr.records.len() {
+        let rec = mgr.records[idx];
+        if rec.disease_idx == 0xff {
+            continue;
+        }
+        let cell = rec.cell as usize;
+        let x = cell % width;
+        let y = cell / width;
+        if x < bounds.min_x || x > bounds.max_x || y < bounds.min_y || y > bounds.max_y {
+            continue;
+        }
+        let interval = rec.emit_interval;
+        let elapsed = rec.elapsed_time;
+        if interval <= elapsed {
+            let emit_count = rec.emit_count;
+            let disease_idx = rec.disease_idx;
+            if let Some(d) = disease {
+                if (disease_idx as usize) < d.diseases.len() {
+                    let reachable = get_reachable_cells(sim, x, y, rec.range as usize);
+                    if emit_count < 0 {
+                        // 仅同病菌格累加（负 emitCount 用于清除）
+                        for &c in &reachable {
+                            let updated = unsafe { &mut *sim.updated_cells.ptr };
+                            if updated.disease_idx.get(c) == disease_idx {
+                                crate::c2_physics::liquid_flow::add_disease_to_cell(
+                                    updated, c, disease_idx, emit_count,
+                                );
+                            }
+                        }
+                    } else {
+                        for &c in &reachable {
+                            let updated = unsafe { &mut *sim.updated_cells.ptr };
+                            crate::c2_physics::liquid_flow::add_disease_to_cell(
+                                updated, c, disease_idx, emit_count,
+                            );
+                        }
+                    }
+                    if idx < mgr.emitted_info.len() {
+                        mgr.emitted_info[idx] =
+                            crate::a_framework::game_data::DiseaseEmittedInfo {
+                                disease_idx,
+                                padding: [0; 3],
+                                count: emit_count,
+                            };
+                    }
+                }
+            }
+            mgr.records[idx].elapsed_time = elapsed - interval;
+        }
+        mgr.records[idx].elapsed_time += dt;
+    }
+}
 
 /// GetReachableCells — 4 向 BFS 泛洪（原版 Flood L33466 + GetReachableCells L34451）。
 ///
@@ -362,6 +711,220 @@ mod tests {
             assert_eq!(u.disease_count.get(7), 10, "idx=0xff 直加 count");
             assert_eq!(u.disease_idx.get(7), 0xff, "直加路径不改 idx（原版语义）");
         }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    // ===== 任务 3：DiseaseEmitter 组件 =====
+
+    fn push_add_emitter(frame: &mut SimFrameInfo, callback_idx: i32) {
+        for b in callback_idx.to_le_bytes() {
+            frame.disease_emitter_messages.adds.push_unchecked(b);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_modify_emitter(
+        frame: &mut SimFrameInfo,
+        handle: i32,
+        game_cell: i32,
+        disease_idx: u8,
+        max_depth: u8,
+        emit_interval: f32,
+        emit_count: i32,
+    ) {
+        for b in handle.to_le_bytes() {
+            frame.disease_emitter_messages.modifies.push_unchecked(b);
+        }
+        for b in game_cell.to_le_bytes() {
+            frame.disease_emitter_messages.modifies.push_unchecked(b);
+        }
+        frame.disease_emitter_messages.modifies.push_unchecked(disease_idx);
+        frame.disease_emitter_messages.modifies.push_unchecked(max_depth);
+        frame.disease_emitter_messages.modifies.push_unchecked(0);
+        frame.disease_emitter_messages.modifies.push_unchecked(0);
+        for b in emit_interval.to_le_bytes() {
+            frame.disease_emitter_messages.modifies.push_unchecked(b);
+        }
+        for b in emit_count.to_le_bytes() {
+            frame.disease_emitter_messages.modifies.push_unchecked(b);
+        }
+    }
+
+    fn push_remove_emitter(frame: &mut SimFrameInfo, handle: i32, callback_idx: i32) {
+        for b in handle.to_le_bytes() {
+            frame.disease_emitter_messages.removes.push_unchecked(b);
+        }
+        for b in callback_idx.to_le_bytes() {
+            frame.disease_emitter_messages.removes.push_unchecked(b);
+        }
+    }
+
+    #[test]
+    fn disease_emitter_register_modify_remove() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clear_disease_emitters();
+        create_solid_table();
+        install_disease_table();
+        let mut sd = make_sim();
+        let mut frame = SimFrameInfo::default();
+        // Register(callback=5) → handle + componentStateChanged{5, handle}
+        push_add_emitter(&mut frame, 5);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.adds.clear_keep_capacity();
+        assert_eq!(disease_emitter_count(), 1);
+        let handle = {
+            let events = unsafe { &*sd.sim_events.ptr };
+            assert_eq!(events.component_state_changed_messages.len(), 1);
+            events.component_state_changed_messages.as_slice()[0].sim_handle
+        };
+        // 默认记录：diseaseIdx=0xff、range=0、emitCount=0、interval=0
+        let rec = disease_emitter_record(handle).expect("record exists");
+        assert_eq!(rec.disease_idx, 0xff);
+
+        // Modify(handle, gameCell=0 → simCell=7, idx=0, range=1, interval=1.0, count=10)
+        push_modify_emitter(&mut frame, handle, 0, 0, 1, 1.0, 10);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.modifies.clear_keep_capacity();
+        let rec = disease_emitter_record(handle).expect("record exists");
+        assert_eq!(rec.cell, 7, "gameCell=0 → simCell=7（width=6）");
+        assert_eq!(rec.disease_idx, 0);
+        assert_eq!(rec.range, 1);
+        assert_eq!(rec.emit_interval, 1.0);
+        assert_eq!(rec.emit_count, 10);
+
+        // Remove(handle, callback=-1) → 释放 + 版本+1，无回调
+        push_remove_emitter(&mut frame, handle, -1);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.removes.clear_keep_capacity();
+        assert_eq!(disease_emitter_count(), 0);
+        assert!(disease_emitter_record(handle).is_none(), "释放后句柄失效");
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.component_state_changed_messages.len(), 1, "无回调");
+        }
+        clear_disease_emitters();
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    fn set_cell_disease(sd: &mut SimData, cell: usize, d_idx: u8, count: i32) {
+        unsafe {
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let c = &mut *buf_ptr;
+                c.disease_idx.set(cell, d_idx);
+                c.disease_count.set(cell, count);
+            }
+        }
+    }
+
+    #[test]
+    fn disease_emitter_update_emits_on_interval() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clear_disease_emitters();
+        create_solid_table();
+        install_disease_table();
+        let mut sd = make_sim();
+        set_cell_disease(&mut sd, 7, 0, 100);
+        let mut frame = SimFrameInfo::default();
+        push_add_emitter(&mut frame, -1);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.adds.clear_keep_capacity();
+        let handle = disease_emitter_handle(0).expect("handle 0");
+        push_modify_emitter(&mut frame, handle, 0, 0, 1, 1.0, 10);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.modifies.clear_keep_capacity();
+        let bounds = crate::d1_activity::RegionBounds {
+            min_x: 1,
+            min_y: 1,
+            max_x: 1,
+            max_y: 1,
+        };
+        // interval=1.0：elapsedTime 0.2×5=1.0；第 6 次调用时 1.0<=1.0 触发 → cell7 +10
+        for _ in 0..5 {
+            update_disease_emitters(&mut sd, 0.2, bounds);
+        }
+        unsafe {
+            assert_eq!((*sd.updated_cells.ptr).disease_count.get(7), 100, "未到 interval 不发射");
+        }
+        update_disease_emitters(&mut sd, 0.2, bounds);
+        unsafe {
+            assert_eq!((*sd.updated_cells.ptr).disease_count.get(7), 110, "range=1 仅中心 +10");
+        }
+        let (idx, cnt) = disease_emitter_emitted(0).expect("emitted info");
+        assert_eq!(idx, 0);
+        assert_eq!(cnt, 10);
+        clear_disease_emitters();
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn disease_emitter_negative_count_only_same_disease() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clear_disease_emitters();
+        create_solid_table();
+        install_disease_table();
+        let mut sd = make_sim();
+        set_cell_disease(&mut sd, 7, 0, 100);
+        set_cell_disease(&mut sd, 8, 0, 100);
+        set_cell_disease(&mut sd, 13, 1, 100);
+        let mut frame = SimFrameInfo::default();
+        push_add_emitter(&mut frame, -1);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.adds.clear_keep_capacity();
+        let handle = disease_emitter_handle(0).expect("handle 0");
+        push_modify_emitter(&mut frame, handle, 0, 0, 2, 0.2, -5);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.modifies.clear_keep_capacity();
+        let bounds = crate::d1_activity::RegionBounds {
+            min_x: 1,
+            min_y: 1,
+            max_x: 3,
+            max_y: 3,
+        };
+        // interval=0.2：第 1 次 elapsed=0 不触发；第 2 次 elapsed=0.2 触发
+        update_disease_emitters(&mut sd, 0.2, bounds);
+        update_disease_emitters(&mut sd, 0.2, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 95, "同病菌格 −5");
+            assert_eq!(u.disease_count.get(8), 95);
+            assert_eq!(u.disease_count.get(13), 100, "异病菌格不变（emitCount<0 仅同病菌）");
+        }
+        clear_disease_emitters();
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn disease_emitter_region_gate_skips_outside() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clear_disease_emitters();
+        create_solid_table();
+        install_disease_table();
+        let mut sd = make_sim();
+        set_cell_disease(&mut sd, 7, 0, 100);
+        let mut frame = SimFrameInfo::default();
+        push_add_emitter(&mut frame, -1);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.adds.clear_keep_capacity();
+        let handle = disease_emitter_handle(0).expect("handle 0");
+        push_modify_emitter(&mut frame, handle, 0, 0, 1, 0.2, 10);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.modifies.clear_keep_capacity();
+        // bounds 不含 cell7（(1,1)）→ 不发射
+        let bounds = crate::d1_activity::RegionBounds {
+            min_x: 2,
+            min_y: 2,
+            max_x: 2,
+            max_y: 2,
+        };
+        update_disease_emitters(&mut sd, 0.2, bounds);
+        unsafe {
+            assert_eq!((*sd.updated_cells.ptr).disease_count.get(7), 100, "区域外不发射");
+        }
+        clear_disease_emitters();
         uninstall_disease_table();
         DestroyElementsTable();
     }

@@ -269,6 +269,9 @@ pub fn update_data(sim_data: &mut SimData) {
             0.2,
             bounds,
         );
+        // 病菌阶段 3（2026-08-05）：DiseaseEmitter 组件 Update（原版 L145434
+        // UpdateComponents 位置：辐射任务后、太空真空前）。
+        crate::c_simulation::disease_component::update_disease_emitters(sim_data, 0.2, bounds);
         // PostProcessCell（原版 L43023：挤压/密度分层/升华）
         crate::c2_physics::liquid_flow::post_process_loop(sim_data, bounds);
         // 病菌阶段 2（2026-08-05）：原版 L145539 病菌生长（PostProcess，
