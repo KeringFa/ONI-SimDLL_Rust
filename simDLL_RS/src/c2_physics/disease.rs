@@ -7,7 +7,7 @@
 //!
 //! 公式对照 C# Klei.AI.Disease（HalfLifeToGrowthRate / CalculateRangeHalfLife）与
 //! Klei.AI.DiseaseGrowthRules.ElemGrowthInfo.CalculateDiseaseCountDelta；dt 固定 0.2。
-use crate::a_framework::sim_data::SimData;
+use crate::a_framework::sim_data::{CellSOA, SimData};
 use crate::b_elements::disease::{Disease, RangeInfo};
 use crate::d1_activity::RegionBounds;
 
@@ -221,6 +221,134 @@ pub(crate) fn run_disease_diffusion_task(sim: &mut SimData, bounds: RegionBounds
             }
             if down_ok {
                 update_cells(disease, sim, cell, cell + width);
+            }
+        }
+    }
+}
+
+/// PostProcess 单格生长（原版 L26424-26640 第一遍）。
+///
+/// 温度因子（calculate_range_half_life + half_life_to_growth_rate，dt=0.2）+
+/// 种群因子（count<min → −underPopDeath×0.2；count>max → 过密半活期；否则种群半活期）+
+/// radiationEnabled 时 −radiation×radiationKillRate；
+/// 汇总后 acc_err 存小数、count 加整数部分。
+fn post_process_cell(
+    disease: &Disease,
+    updated: &mut CellSOA,
+    cell: usize,
+    radiation_enabled: bool,
+) {
+    if cell >= updated.element_idx.len()
+        || cell >= updated.temperature.len()
+        || cell >= updated.mass.len()
+        || cell >= updated.disease_idx.len()
+        || cell >= updated.disease_count.len()
+        || cell >= updated.disease_growth_accumulated_error.len()
+        || cell >= updated.disease_infestation_tick_count.len()
+    {
+        return;
+    }
+    let d_idx = updated.disease_idx.get(cell);
+    if d_idx == 0xff {
+        return;
+    }
+    let diseases = disease.diseases.as_slice();
+    if (d_idx as usize) >= diseases.len() {
+        return;
+    }
+    let di = &diseases[d_idx as usize];
+    let elem = updated.element_idx.get(cell) as usize;
+    let eg = &di.elem_growth_info;
+    if elem >= eg.min_count_per_kg.len()
+        || elem >= eg.max_count_per_kg.len()
+        || elem >= eg.under_population_death_rate.len()
+        || elem >= eg.population_half_life.len()
+        || elem >= eg.over_population_half_life.len()
+    {
+        return;
+    }
+
+    // A. 温度因子（对照 C# CalculateRangeHalfLife + HalfLifeToGrowthRate）
+    let temp = updated.temperature.get(cell);
+    let hl = calculate_range_half_life(temp, &di.temperature_range, &di.temperature_half_lives);
+    let factor = half_life_to_growth_rate(hl, 0.2);
+
+    // B. 种群因子（对照 C# ElemGrowthInfo.CalculateDiseaseCountDelta，dt=0.2）
+    let count_f = updated.disease_count.get(cell) as f32;
+    let mass = updated.mass.get(cell);
+    let min_c = eg.min_count_per_kg.get(elem) * mass;
+    let max_c = eg.max_count_per_kg.get(elem) * mass;
+    let growth = if count_f < min_c {
+        -eg.under_population_death_rate.get(elem) * 0.2
+    } else if count_f > max_c {
+        (half_life_to_growth_rate(eg.over_population_half_life.get(elem), 0.2) - 1.0) * count_f
+    } else {
+        (half_life_to_growth_rate(eg.population_half_life.get(elem), 0.2) - 1.0) * count_f
+    };
+
+    // C. 汇总：f25 = (count×factor + acc − count) + growth [− radiation×killRate]
+    let acc = updated.disease_growth_accumulated_error.get(cell);
+    let mut f25 = (count_f * factor + acc - count_f) + growth;
+    if radiation_enabled && cell < updated.radiation.len() {
+        f25 -= updated.radiation.get(cell) * di.radiation_kill_rate;
+    }
+    if !f25.is_finite() {
+        return; // 防御（原版依赖数据不变量；越界/除零产生 NaN 时跳过本格）
+    }
+    let trunc = f25.trunc();
+    updated.disease_growth_accumulated_error.set(cell, f25 - trunc);
+    updated
+        .disease_count
+        .set(cell, updated.disease_count.get(cell) + trunc as i32);
+}
+
+/// PostProcess 区域循环（原版 L26424-26640，两遍）。
+///
+/// 第一遍：逐格生长（跳过 disease==0xff）；
+/// 第二遍：count<1 → 清四字段；tick = min(tick+1, 0xfe)。
+/// 注意原版怪癖：第二遍无条件执行，count<1（含无病菌格）先清零再 +1 → tick=1。
+pub(crate) fn run_disease_growth_task(sim: &mut SimData, bounds: RegionBounds) {
+    let disease_ptr = crate::globals::G_DISEASE.lock().0;
+    if disease_ptr.is_null() {
+        return;
+    }
+    let disease = unsafe { &*disease_ptr };
+    let width = sim.width as usize;
+    let height = sim.height as usize;
+    if width < 3 || height < 3 || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let radiation_enabled = sim.radiation_enabled;
+    {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        for row in bounds.min_y..=bounds.max_y {
+            for col in bounds.min_x..=bounds.max_x {
+                let cell = row * width + col;
+                if cell >= updated.disease_count.len() {
+                    continue;
+                }
+                post_process_cell(disease, updated, cell, radiation_enabled);
+            }
+        }
+    }
+    {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        for row in bounds.min_y..=bounds.max_y {
+            for col in bounds.min_x..=bounds.max_x {
+                let cell = row * width + col;
+                if cell >= updated.disease_count.len() || cell >= updated.disease_idx.len() {
+                    continue;
+                }
+                if updated.disease_count.get(cell) < 1 {
+                    updated.disease_idx.set(cell, 0xff);
+                    updated.disease_count.set(cell, 0);
+                    updated.disease_infestation_tick_count.set(cell, 0);
+                    updated.disease_growth_accumulated_error.set(cell, 0.0);
+                }
+                let tick = updated.disease_infestation_tick_count.get(cell);
+                updated
+                    .disease_infestation_tick_count
+                    .set(cell, tick.saturating_add(1).min(0xfe));
             }
         }
     }
@@ -491,6 +619,208 @@ mod tests {
         }
         uninstall_disease_table();
         DestroyElementsTable();
+    }
+
+    // ===== 任务 3：PostProcess 生长 =====
+
+    /// 1 病菌表（idx0）：
+    /// tempRange(0,20,40,60)、tempHalfLives(5,2,2,5)、radiationKillRate=0.5
+    /// elem0：minCountPerKG=100 maxCountPerKG=1000 popHL=10 overPopHL=10 underPopDeath=1.0
+    fn install_growth_table() {
+        let mut t = Disease::new();
+        let mut eg = ElemGrowthInfo::default();
+        eg.min_count_per_kg.resize(1, 0.0);
+        eg.min_count_per_kg.set(0, 100.0);
+        eg.max_count_per_kg.resize(1, 0.0);
+        eg.max_count_per_kg.set(0, 1000.0);
+        eg.population_half_life.resize(1, 0.0);
+        eg.population_half_life.set(0, 10.0);
+        eg.over_population_half_life.resize(1, 0.0);
+        eg.over_population_half_life.set(0, 10.0);
+        eg.under_population_death_rate.resize(1, 0.0);
+        eg.under_population_death_rate.set(0, 1.0);
+        t.diseases.push_unchecked(DiseaseInfo {
+            hash_id: 0xD1,
+            strength: 1.0,
+            temperature_range: RangeInfo {
+                min_viable: 0.0,
+                min_growth: 20.0,
+                max_growth: 40.0,
+                max_viable: 60.0,
+            },
+            temperature_half_lives: RangeInfo {
+                min_viable: 5.0,
+                min_growth: 2.0,
+                max_growth: 2.0,
+                max_viable: 5.0,
+            },
+            elem_growth_info: eg,
+            radiation_kill_rate: 0.5,
+            ..Default::default()
+        });
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    /// 设置 updatedCells 指定格（elem0）：温度/质量/病菌 idx/count/tick/acc/radiation。
+    #[allow(clippy::too_many_arguments)]
+    fn set_updated(
+        sd: &mut SimData,
+        cell: usize,
+        temp: f32,
+        mass: f32,
+        d_idx: u8,
+        d_count: i32,
+        tick: u8,
+        acc: f32,
+        rad: f32,
+    ) {
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(cell, 0);
+            u.temperature.set(cell, temp);
+            u.mass.set(cell, mass);
+            u.disease_idx.set(cell, d_idx);
+            u.disease_count.set(cell, d_count);
+            u.disease_infestation_tick_count.set(cell, tick);
+            u.disease_growth_accumulated_error.set(cell, acc);
+            u.radiation.set(cell, rad);
+        }
+    }
+
+    #[test]
+    fn post_process_optimal_temp_within_population_range() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_growth_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        // temp=30（最优带 → f=1.0）、count=500、mass=1.0（min=100≤500≤1000）、acc=0
+        // growth=(2^-0.02-1)×500=-6.88365；f25=-6.88365 → count=494、acc=-0.88365、tick 5→6
+        set_updated(&mut sd, 7, 30.0, 1.0, 0, 500, 5, 0.0, 0.0);
+        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+        run_disease_growth_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 494);
+            assert!((u.disease_growth_accumulated_error.get(7) - (-0.8836478)).abs() < 1e-5);
+            assert_eq!(u.disease_infestation_tick_count.get(7), 6, "存活格 tick+1");
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn post_process_below_min_viable_decays() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_growth_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        // temp=-10 → hl[0]=5 → f=2^-0.04=0.97265495
+        // f25=(500×0.97265495-500)+(-6.88365)=-20.5562 → count=480、acc=-0.5562
+        set_updated(&mut sd, 7, -10.0, 1.0, 0, 500, 5, 0.0, 0.0);
+        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+        run_disease_growth_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 480);
+            assert!((u.disease_growth_accumulated_error.get(7) - (-0.5561741)).abs() < 1e-5);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn post_process_under_population_constant_death() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_growth_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        // count=50 < min=100 → growth=-1.0×0.2=-0.2；temp 最优 → f=1.0
+        // f25=-0.2 → count+=trunc(-0.2)=0 → 50；acc=-0.2
+        set_updated(&mut sd, 7, 30.0, 1.0, 0, 50, 5, 0.0, 0.0);
+        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+        run_disease_growth_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 50);
+            assert!((u.disease_growth_accumulated_error.get(7) - (-0.2)).abs() < 1e-6);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn post_process_over_population_half_life() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_growth_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        // count=2000 > max=1000 → growth=(2^-0.02-1)×2000=-27.5346
+        // f25=-27.5346 → count=1973、acc=-0.5346
+        set_updated(&mut sd, 7, 30.0, 1.0, 0, 2000, 5, 0.0, 0.0);
+        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+        run_disease_growth_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 1973);
+            assert!((u.disease_growth_accumulated_error.get(7) - (-0.5346)).abs() < 1e-3);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn post_process_accumulated_error_carries() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_growth_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        // acc=0.4、count=500、temp 最优 → f25=0.4-6.88365=-6.48365 → count=494、acc=-0.48365
+        set_updated(&mut sd, 7, 30.0, 1.0, 0, 500, 5, 0.4, 0.0);
+        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+        run_disease_growth_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 494);
+            assert!((u.disease_growth_accumulated_error.get(7) - (-0.4836478)).abs() < 1e-5);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn post_process_radiation_kills_when_enabled() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_growth_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        // radiation_enabled=true、radiation=10、killRate=0.5
+        // f25=-6.88365-5.0=-11.88365 → count=489、acc=-0.88365
+        set_updated(&mut sd, 7, 30.0, 1.0, 0, 500, 5, 0.0, 10.0);
+        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+        run_disease_growth_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 489, "辐射杀伤 5");
+            assert!((u.disease_growth_accumulated_error.get(7) - (-0.8836478)).abs() < 1e-5);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn post_process_second_pass_clears_and_increments_tick() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_growth_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        // count=0、tick=0、acc=0.5：第一遍 f25=0.3 → count 仍 0；
+        // 第二遍 count<1 → 清四字段 → tick=0+1=1（原版怪癖）
+        set_updated(&mut sd, 7, 30.0, 1.0, 0, 0, 0, 0.5, 0.0);
+        // 无病菌格（0xff, count=0, tick=7）→ 第二遍同样 count<1 → 清除 → tick=1
+        set_updated(&mut sd, 8, 30.0, 1.0, 0xff, 0, 7, 0.0, 0.0);
+        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+        run_disease_growth_task(&mut sd, bounds);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_idx.get(7), 0xff);
+            assert_eq!(u.disease_count.get(7), 0);
+            assert_eq!(u.disease_infestation_tick_count.get(7), 1, "清除后 tick=1 怪癖");
+            assert_eq!(u.disease_growth_accumulated_error.get(7), 0.0);
+            assert_eq!(u.disease_infestation_tick_count.get(8), 1, "无病菌格同样重置 tick=1");
+            assert_eq!(u.disease_idx.get(8), 0xff);
+        }
+        uninstall_disease_table();
     }
 
     #[test]
