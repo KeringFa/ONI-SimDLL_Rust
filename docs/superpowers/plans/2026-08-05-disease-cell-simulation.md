@@ -1,7 +1,7 @@
-# 病菌模块・阶段 2 实现计划（格子病菌模拟：扩散 + 生长）
+﻿# 病菌模块・阶段 2 实现计划（格子病菌模拟：扩散 + 生长）
 
 > **面向 AI 代理的工作者：** 本计划由主代理内联执行（用户已明确"终止，切回内联执行"，不使用子代理驱动）。
-> 每步使用复选（`- [ ]`）语法跟踪进度。
+> 每步使用复选（`- [x]`）语法跟踪进度。
 
 **目标：** 实现 `Disease::UpdateCells`（扩散，L26646）/ `Disease::PostProcess`（生长，L26424）/ `Disease::GetDiffusionScale`（L26329），并按原版顺序挂接 update_data（L145069 CopyFrom → L145088 扩散 → L145539 生长）。
 
@@ -17,7 +17,7 @@
 - 创建：`simDLL_RS/src/c2_physics/disease.rs`（`half_life_to_growth_rate` + `calculate_range_half_life` + 测试）
 - 修改：`simDLL_RS/src/c2_physics/mod.rs`（`pub mod disease;`）
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```rust
 #[test]
@@ -69,12 +69,12 @@ fn calculate_range_half_life_inf_propagates() {
 }
 ```
 
-- [ ] **步骤 2：运行确认失败**（函数不存在 → 编译失败）
-- [ ] **步骤 3：最小实现**
+- [x] **步骤 2：运行确认失败**（函数不存在 → 编译失败）
+- [x] **步骤 3：最小实现**
   - `half_life_to_growth_rate(half_life, dt)`：0→0、INF→1、`powf(2, −dt/hl)`；
   - `calculate_range_half_life(temp, range, half_lives)`：找第一个 `temp <= range[i]`，lower=max(i−1,0)、upper=i；无匹配 lower=upper=3；`lower==1&&upper==2` 或任一半活期 INF → INF；否则插值。
-- [ ] **步骤 4：运行确认通过**
-- [ ] **步骤 5：Commit**（`git add simDLL_RS/src/c2_physics/disease.rs simDLL_RS/src/c2_physics/mod.rs` → `feat(c2): disease helpers - half-life formulas (task 1/4)`）
+- [x] **步骤 4：运行确认通过**
+- [x] **步骤 5：Commit**（`git add simDLL_RS/src/c2_physics/disease.rs simDLL_RS/src/c2_physics/mod.rs` → `feat(c2): disease helpers - half-life formulas (task 1/4)`）
 
 ---
 
@@ -83,7 +83,7 @@ fn calculate_range_half_life_inf_propagates() {
 **文件：**
 - 修改：`simDLL_RS/src/c2_physics/disease.rs`（+`get_diffusion_scale` / `update_cells` / `run_disease_diffusion_task` + 测试）
 
-- [ ] **步骤 1：编写失败测试**（helper：3 元素表 + 病菌表 + SimData）
+- [x] **步骤 1：编写失败测试**（helper：3 元素表 + 病菌表 + SimData）
 
 ```rust
 /// 3 元素最小表：0=气体(state=1)、1=液体(state=2)、2=固体(state=3)。
@@ -131,13 +131,13 @@ fn update_cells_element_state_gate_blocks() {
 }
 ```
 
-- [ ] **步骤 2：运行确认失败**
-- [ ] **步骤 3：最小实现**（对照 L26646-26812）
+- [x] **步骤 2：运行确认失败**
+- [x] **步骤 3：最小实现**（对照 L26646-26812）
   - `get_diffusion_scale(disease, sim, cell)`：disease_idx/elem 越界→0.0；count<tick 门控；返回 diffusionScale；
   - `update_cells(disease, sim, cell_a, cell_b)`：元素相态门控（`get_element_post_process_data(e).state & 3` 相等）；四分支算 transfer（`(int)` 截断）；`add_disease_to_cell(updated, a, src_disease, +t)` / `(updated, b, src_disease, −t)`；
   - `run_disease_diffusion_task(sim, bounds)`：锁 G_DISEASE 一次（null → 返回）；区域每格按右/下邻门控调 update_cells。
-- [ ] **步骤 4：运行确认通过**
-- [ ] **步骤 5：Commit**（`feat(c2): disease cell diffusion - UpdateCells (task 2/4)`）
+- [x] **步骤 4：运行确认通过**
+- [x] **步骤 5：Commit**（`feat(c2): disease cell diffusion - UpdateCells (task 2/4)`）
 
 ---
 
@@ -146,7 +146,7 @@ fn update_cells_element_state_gate_blocks() {
 **文件：**
 - 修改：`simDLL_RS/src/c2_physics/disease.rs`（+`run_disease_growth_task` + 测试）
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```rust
 /// 1 病菌表（idx0）：
@@ -198,12 +198,12 @@ fn post_process_second_pass_clears_and_increments_tick() {
 }
 ```
 
-- [ ] **步骤 2：运行确认失败**
-- [ ] **步骤 3：最小实现**（对照 L26424-26640）
+- [x] **步骤 2：运行确认失败**
+- [x] **步骤 3：最小实现**（对照 L26424-26640）
   - 第一遍：跳过 disease==0xff；温度因子（calculate_range_half_life + half_life_to_growth_rate，dt=0.2）；种群因子三分支；`f25=(count×f+acc−count)+growth`；radiationEnabled 时 `−=radiation×killRate`；`acc=frac(f25)`、`count+=trunc(f25)`（防御越界/非有限跳过）；
   - 第二遍：count<1 → 清四字段；`tick=min(tick+1,0xfe)`（清除后 tick=1 怪癖保留）。
-- [ ] **步骤 4：运行确认通过**
-- [ ] **步骤 5：Commit**（`feat(c2): disease cell growth - PostProcess (task 3/4)`）
+- [x] **步骤 4：运行确认通过**
+- [x] **步骤 5：Commit**（`feat(c2): disease cell growth - PostProcess (task 3/4)`）
 
 ---
 
@@ -213,7 +213,7 @@ fn post_process_second_pass_clears_and_increments_tick() {
 - 修改：`simDLL_RS/src/c2_physics/mod.rs`（挂接）
 - 修改：`simDLL_RS/src/c2_physics/disease.rs`（集成测试）
 
-- [ ] **步骤 1：编写失败测试**（集成：update_data 全管线）
+- [x] **步骤 1：编写失败测试**（集成：update_data 全管线）
 
 ```rust
 #[test]
@@ -225,8 +225,8 @@ fn update_data_hooks_disease_diffusion_after_liquid() {
 }
 ```
 
-- [ ] **步骤 2：运行确认失败**（未挂接 → 不变）
-- [ ] **步骤 3：最小实现**（update_data 区域循环）
+- [x] **步骤 2：运行确认失败**（未挂接 → 不变）
+- [x] **步骤 3：最小实现**（update_data 区域循环）
 
 ```rust
 // 现有：update_liquid_loop(sim_data, bounds);
@@ -237,17 +237,17 @@ crate::c2_physics::disease::run_disease_diffusion_task(sim_data, bounds);  // �
 crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);     // 原版 L145539
 ```
 
-- [ ] **步骤 4：运行确认通过** + 全量回归
-- [ ] **步骤 5：Commit**（`feat(c2): hook disease diffusion/growth into update_data (task 4/4)`）
+- [x] **步骤 4：运行确认通过** + 全量回归
+- [x] **步骤 5：Commit**（`feat(c2): hook disease diffusion/growth into update_data (task 4/4)`）
 
 ---
 
 ## 任务 5：全量回归 + release + 更新代办
 
-- [ ] **步骤 1：全量测试串行**：`cargo test -- --test-threads=1`（基线 500，预计 +25 左右）
-- [ ] **步骤 2：release 构建**：`cargo build --release`
-- [ ] **步骤 3：更新 `代办.txt`**：病菌阶段 2 完成 → 阶段 3（病菌消息/组件 DiseaseEmitter/Consumer、ConsumeDisease、CellDiseaseModification）
-- [ ] **步骤 4：Commit**（`feat(c2): disease cell simulation done - regression green + release`）
+- [x] **步骤 1：全量测试串行**：`cargo test -- --test-threads=1`（基线 500，预计 +25 左右）
+- [x] **步骤 2：release 构建**：`cargo build --release`
+- [x] **步骤 3：更新 `代办.txt`**：病菌阶段 2 完成 → 阶段 3（病菌消息/组件 DiseaseEmitter/Consumer、ConsumeDisease、CellDiseaseModification）
+- [x] **步骤 4：Commit**（`feat(c2): disease cell simulation done - regression green + release`）
 
 ---
 
