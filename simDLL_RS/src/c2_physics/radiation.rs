@@ -192,9 +192,10 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::a_framework::buffer::{BinaryBufferReader, BinaryBufferWriter};
     use crate::a_framework::sim_data::SimData;
     use crate::b_elements::element::Element;
-    use crate::b_elements::elements_table::{DestroyElementsTable, G_ELEMENTS_TABLE};
+    use crate::b_elements::elements_table::{CreateElementsTable, DestroyElementsTable, G_ELEMENTS_TABLE};
     use crate::LIB_TESTS_LOCK;
 
     /// 最小元素表：0=真空（factor=0）、1=固体（factor=0.5, rads=0）、
@@ -399,6 +400,108 @@ mod tests {
         run_radiation_task(&mut sd, bounds, 0.0);
         unsafe {
             assert_eq!((*sd.updated_cells.ptr).radiation.get(9), 0.0, "无 RS 病菌 → 无贡献");
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    /// 1 固体元素表（state=3，low=-273/high=1000 → update_data 全管线不触发相变）。
+    fn create_solid_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(1);
+        let mut elem = Element::default();
+        elem.id = 0;
+        elem.state = 3;
+        elem.low_temp = -273.0;
+        elem.high_temp = 1000.0;
+        elem.number_of_gradient_colors = 1;
+        let elem_bytes = unsafe {
+            std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+        };
+        w.write_bytes(&elem_bytes);
+        w.write_int(0);
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// RS 病菌表（idx0=0xd49f77d6）：生长恒 0（popHL/overPopHL=INF、underPopDeath=0、
+    /// min=0、max=INF、tempHL 全 INF）、minDiffusionCount 巨大 → 扩散门控 0。
+    fn install_rs_integration_table() {
+        use crate::b_elements::disease::{Disease, DiseaseInfo, ElemGrowthInfo, RangeInfo};
+        let mut t = Disease::new();
+        let mut eg = ElemGrowthInfo::default();
+        eg.diffusion_scale.resize(1, 1.0);
+        eg.min_diffusion_count.resize(1, 1_000_000);
+        eg.min_diffusion_infestation_tick_count.resize(1, 0);
+        eg.min_count_per_kg.resize(1, 0.0);
+        eg.max_count_per_kg.resize(1, f32::INFINITY);
+        eg.population_half_life.resize(1, f32::INFINITY);
+        eg.over_population_half_life.resize(1, f32::INFINITY);
+        eg.under_population_death_rate.resize(1, 0.0);
+        t.diseases.push_unchecked(DiseaseInfo {
+            hash_id: 0xd49f77d6,
+            strength: 1.0,
+            temperature_range: RangeInfo {
+                min_viable: -f32::INFINITY,
+                min_growth: -f32::INFINITY,
+                max_growth: f32::INFINITY,
+                max_viable: f32::INFINITY,
+            },
+            temperature_half_lives: RangeInfo {
+                min_viable: f32::INFINITY,
+                min_growth: f32::INFINITY,
+                max_growth: f32::INFINITY,
+                max_viable: f32::INFINITY,
+            },
+            elem_growth_info: eg,
+            radiation_kill_rate: 0.0,
+            ..Default::default()
+        });
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    #[test]
+    fn update_data_applies_radiation_sickness_contribution() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        create_solid_table();
+        install_rs_integration_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false); // radiation_enabled=true
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let c = &mut *buf_ptr;
+                for i in 0..30usize {
+                    c.element_idx.set(i, 0);
+                    c.temperature.set(i, 300.0);
+                    c.mass.set(i, 1000.0);
+                    c.disease_idx.set(i, 0xff);
+                    c.disease_count.set(i, 0);
+                    c.radiation.set(i, 0.0);
+                }
+            }
+        }
+        set_cell_disease(&mut sd, 7, 0, 5000); // cell7=(1,1) RS count 5000
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 1,
+            min_y: 1,
+            max_x: 1,
+            max_y: 1,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        });
+        crate::c2_physics::update_data(&mut sd);
+        unsafe {
+            assert!(
+                ((*sd.updated_cells.ptr).radiation.get(7) - 5.0).abs() < 1e-3,
+                "update_data 全管线：RS 病菌 radiation += count×0.001 = 5.0"
+            );
         }
         uninstall_disease_table();
         DestroyElementsTable();
