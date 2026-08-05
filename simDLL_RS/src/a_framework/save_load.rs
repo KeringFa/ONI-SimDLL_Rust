@@ -11,6 +11,7 @@ use crate::a_framework::game_data::GameData;
 use crate::a_framework::game_data_update::GameDataUpdate;
 use crate::a_framework::sim_data::{CellSOA, SimData, WorldOffsetData};
 use crate::a_framework::stl_shim::UniquePtr;
+use crate::b_elements::disease::Disease;
 use crate::b_elements::elements_table;
 use crate::globals;
 use std::ffi::c_void;
@@ -1273,12 +1274,29 @@ pub fn handle_resize_and_initialize_vacuum_cells(reader: &mut BinaryBufferReader
     std::ptr::null_mut()
 }
 
-/// CreateDiseaseTable handler 桩。
-/// 对照源码 02_save_load.c L494-518。
-/// 任务 4 实现真实逻辑。
-pub fn handle_create_disease_table(_reader: &mut BinaryBufferReader) -> *mut c_void {
-    tracing::warn!("CreateDiseaseTable handler stub (task 4 will implement)");
-    std::ptr::null_mut()
+/// CreateDiseaseTable — 解析病菌表并挂接 gDisease。
+/// 对照源码 02_save_load.c L494-517：
+/// 1. `Disease::Disease(this, param_1)` 从消息流构造病菌表（L25718-26091）；
+/// 2. unique_ptr 替换 gDisease，旧表析构释放（L507-516）；
+/// 3. 返回 `(void*)0x0`（L517）。
+pub fn handle_create_disease_table(reader: &mut BinaryBufferReader) -> *mut c_void {
+    match Disease::from_stream(reader) {
+        Ok(table) => {
+            let mut g = globals::G_DISEASE.lock();
+            if !g.0.is_null() {
+                unsafe {
+                    let _ = Box::from_raw(g.0);
+                }
+            }
+            g.0 = Box::into_raw(Box::new(table));
+            tracing::info!("CreateDiseaseTable success");
+            std::ptr::null_mut()
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "CreateDiseaseTable failed");
+            std::ptr::null_mut()
+        }
+    }
 }
 
 // ===== 4 个非 save_load handler（任务 6 桩）=====
@@ -2739,5 +2757,132 @@ mod tests {
             assert_eq!(cells.element_idx.get(outside), 5);
         }
         clean_up();
+    }
+
+    // ===== 任务 2：CreateDiseaseTable handler 挂接 =====
+
+    /// 按 C# SimMessages.CreateDiseaseTable 写入顺序构造病菌表消息。
+    fn make_disease_table_message(count: i32, elements_count: i32, hash: u32) -> Vec<u8> {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(count);
+        w.write_int(elements_count);
+        for _ in 0..count {
+            w.write_int(4); // KleiString 长度
+            w.write_bytes(b"Test");
+            w.write_uint(hash);
+            w.write_float(2.0); // strength
+            for v in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+                      9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0] {
+                w.write_float(v);
+            }
+            w.write_float(0.5); // radiationKillRate
+            for i in 0..elements_count {
+                w.write_float(0.1 + i as f32);
+                w.write_float(0.2 + i as f32);
+                w.write_float(0.3 + i as f32);
+                w.write_float(0.4 + i as f32);
+                w.write_float(0.5 + i as f32);
+                w.write_float(0.6 + i as f32);
+                w.write_int(7 + i);
+                w.write_byte(8 + i as u8);
+            }
+        }
+        w.into_bytes()
+    }
+
+    #[test]
+    fn handle_create_disease_table_sets_global() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        let data = make_disease_table_message(1, 0, 0x11223344);
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = handle_create_disease_table(&mut reader);
+        assert!(result.is_null(), "原版 CreateDiseaseTable 返回 null");
+
+        let g = globals::G_DISEASE.lock().0;
+        assert!(!g.is_null(), "gDisease 应已挂接");
+        let d = unsafe { &*g };
+        assert_eq!(d.diseases.len(), 1);
+        assert_eq!(d.diseases.as_slice()[0].hash_id, 0x11223344);
+        assert_eq!(d.diseases.as_slice()[0].strength, 2.0);
+        assert_eq!(d.disease_names.len(), 1);
+
+        clean_up();
+        assert!(globals::G_DISEASE.lock().0.is_null(), "clean_up 应释放 gDisease");
+    }
+
+    #[test]
+    fn handle_create_disease_table_replaces_old() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        let data1 = make_disease_table_message(1, 0, 0x11111111);
+        let mut reader1 = BinaryBufferReader::new(&data1);
+        handle_create_disease_table(&mut reader1);
+        let old_ptr = globals::G_DISEASE.lock().0;
+        assert!(!old_ptr.is_null());
+
+        let data2 = make_disease_table_message(2, 0, 0x22222222);
+        let mut reader2 = BinaryBufferReader::new(&data2);
+        let result = handle_create_disease_table(&mut reader2);
+        assert!(result.is_null());
+
+        let new_ptr = globals::G_DISEASE.lock().0;
+        assert!(!new_ptr.is_null());
+        let d = unsafe { &*new_ptr };
+        // 内容必须来自第二张表（旧表 1 条 / 新表 2 条，hash 不同）：
+        // 注意：分配器可能复用旧表地址，不能断言指针不同。
+        assert_eq!(d.diseases.len(), 2, "应替换为新表");
+        assert_eq!(d.diseases.as_slice()[0].hash_id, 0x22222222);
+
+        clean_up();
+    }
+
+    #[test]
+    fn handle_create_disease_table_truncated_returns_null_and_keeps_old() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        // 先挂一张有效表
+        let data1 = make_disease_table_message(1, 0, 0x33333333);
+        let mut reader1 = BinaryBufferReader::new(&data1);
+        handle_create_disease_table(&mut reader1);
+        let old_ptr = { globals::G_DISEASE.lock().0 };
+
+        // 截断消息 → 解析失败 → 返回 null，旧表保留
+        let mut data2 = make_disease_table_message(1, 0, 0x44444444);
+        data2.truncate(data2.len() - 8);
+        let mut reader2 = BinaryBufferReader::new(&data2);
+        let result = handle_create_disease_table(&mut reader2);
+        assert!(result.is_null(), "截断消息应返回 null");
+        // 注意：不要用 `let d = unsafe { &*globals::G_DISEASE.lock().0 };` ——
+        // let 绑定引用会延长临时 MutexGuard 的生命周期到函数结束，
+        // 末尾 clean_up 同线程重锁 G_DISEASE 会死锁。必须显式作用域持锁。
+        let ptr_now = { globals::G_DISEASE.lock().0 };
+        assert_eq!(ptr_now, old_ptr, "失败时不应替换旧表");
+        let hash_now = {
+            let guard = globals::G_DISEASE.lock();
+            let d = unsafe { &*guard.0 };
+            d.diseases.as_slice()[0].hash_id
+        };
+        assert_eq!(hash_now, 0x33333333);
+
+        clean_up();
+    }
+
+    #[test]
+    fn clean_up_after_create_disease_table_does_not_panic() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        let data = make_disease_table_message(3, 2, 0x55555555);
+        let mut reader = BinaryBufferReader::new(&data);
+        handle_create_disease_table(&mut reader);
+        assert!(!globals::G_DISEASE.lock().0.is_null());
+
+        clean_up(); // 替换后 clean_up 释放 Box，不应崩溃
+        clean_up(); // 幂等
+        assert!(globals::G_DISEASE.lock().0.is_null());
     }
 }
