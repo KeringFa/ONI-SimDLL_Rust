@@ -77,6 +77,12 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     frame.disease_emitter_messages.modifies.clear_keep_capacity();
     frame.disease_emitter_messages.removes.clear_keep_capacity();
 
+    // DiseaseConsumer 消息（阶段 3：防御链路；C# 无发送方，注册表恒空）
+    crate::c_simulation::disease_component::process_disease_consumer_messages(frame, sim_data);
+    frame.disease_consumer_messages.adds.clear_keep_capacity();
+    frame.disease_consumer_messages.modifies.clear_keep_capacity();
+    frame.disease_consumer_messages.removes.clear_keep_capacity();
+
     // 原版 ProcessFrame 末尾（L117034-117046）：frame.debugProperties → simData.debugProperties。
     // 缺失导致 building_temperature_scale 恒 0 → 建筑↔格子换热 k=0 失效，is_debug_editing 恒 false。
     sim_data.debug_properties = frame.debug_properties;
@@ -1854,10 +1860,6 @@ fn process_component_messages_stubs(frame: &mut SimFrameInfo, _sim_data: &mut Si
     frame.element_emitter_messages.modifies.clear_keep_capacity();
     frame.element_emitter_messages.removes.clear_keep_capacity();
 
-    // disease_consumer_messages
-    frame.disease_consumer_messages.adds.clear_keep_capacity();
-    frame.disease_consumer_messages.modifies.clear_keep_capacity();
-    frame.disease_consumer_messages.removes.clear_keep_capacity();
 
     // radiation_params_modifications
     frame.radiation_params_modifications.clear_keep_capacity();

@@ -358,6 +358,136 @@ pub(crate) fn update_disease_emitters(sim: &mut SimData, dt: f32, bounds: Region
     }
 }
 
+/// DiseaseConsumerData（12B，00_types_reference.c L1514）。
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DiseaseConsumerData {
+    pub consumption_rate: f32,          // @0
+    pub max_depth: u8,                  // @4
+    pub cell_x: u16,                    // @5
+    pub cell_y: u16,                    // @7
+    pub property_mask: u16,             // @9
+}
+
+/// DiseaseConsumer 注册表（防御：C# 仅 SimMessageHashes 枚举、无发送方；
+/// 原版 Register 不读消息字段，注册零值记录）。
+pub struct DiseaseConsumerRegistry {
+    records: Vec<DiseaseConsumerData>,
+    items: Vec<i32>,
+    versions: Vec<u8>,
+    free_handles: Vec<i32>,
+}
+
+impl DiseaseConsumerRegistry {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            items: Vec::new(),
+            versions: Vec::new(),
+            free_handles: Vec::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.items.clear();
+        self.versions.clear();
+        self.free_handles.clear();
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.items.iter().filter(|&&ri| ri >= 0).count()
+    }
+
+    /// Register（原版 L37036）：分配槽，注册零值记录（消息字段未读）。
+    pub fn register(&mut self) -> i32 {
+        let index;
+        if let Some(free) = self.free_handles.pop() {
+            index = free as usize;
+            let ri = self.records.len() as i32;
+            self.items[index] = ri;
+            self.records.push(DiseaseConsumerData::default());
+            self.versions[index] = self.versions[index].wrapping_add(1);
+        } else {
+            index = self.items.len();
+            let ri = self.records.len() as i32;
+            self.items.push(ri);
+            self.records.push(DiseaseConsumerData::default());
+            self.versions.push(0);
+        }
+        ((self.versions[index] as i32) << 24) | (index as i32 & 0xffffff)
+    }
+
+    /// Unregister（原版 L37115）：释放槽 + 版本+1。
+    pub fn remove(&mut self, handle: i32) -> bool {
+        let index = (handle & 0xffffff) as usize;
+        let version = ((handle >> 24) & 0xff) as u8;
+        if index >= self.versions.len() || self.versions[index] != version {
+            return false;
+        }
+        let ri = self.items[index];
+        if ri < 0 {
+            return false;
+        }
+        let ri = ri as usize;
+        self.records.swap_remove(ri);
+        for it in self.items.iter_mut() {
+            if *it as usize == self.records.len() {
+                *it = ri as i32;
+            }
+        }
+        self.versions[index] = self.versions[index].wrapping_add(1);
+        self.items[index] = -1;
+        self.free_handles.push(index as i32);
+        true
+    }
+}
+
+static DISEASE_CONSUMER_MANAGER: Lazy<Mutex<DiseaseConsumerRegistry>> =
+    Lazy::new(|| Mutex::new(DiseaseConsumerRegistry::new()));
+
+/// 新世界分配时清空（与 emitter 同约定）。
+pub fn clear_disease_consumers() {
+    DISEASE_CONSUMER_MANAGER.lock().clear();
+}
+
+pub fn disease_consumer_count() -> usize {
+    DISEASE_CONSUMER_MANAGER.lock().active_count()
+}
+
+/// 处理帧内 disease_consumer_messages：adds(12B) → modifies(20B，接受忽略) → removes(8B)。
+/// C# 无发送方 → 生产环境注册表恒空；本实现为防御性完整消息链路。
+pub fn process_disease_consumer_messages(
+    frame: &crate::a_framework::sim_frame_manager::SimFrameInfo,
+    sim: &mut SimData,
+) {
+    let mut mgr = DISEASE_CONSUMER_MANAGER.lock();
+    // adds：12B/条；原版 Register 不读字段（注册零值记录）；回调推 {handle, callbackIdx}
+    for b in frame.disease_consumer_messages.adds.as_slice().chunks(12) {
+        if b.len() < 8 {
+            continue;
+        }
+        let callback_idx = i32::from_le_bytes(b[4..8].try_into().unwrap_or([0; 4]));
+        let handle = mgr.register();
+        if callback_idx != -1 {
+            push_state_changed(sim, callback_idx, handle);
+        }
+    }
+    // modifies：20B/条；原版 vtable 未解析 + C# 无发送方 → 接受忽略（预留）
+    for _ in frame.disease_consumer_messages.modifies.as_slice().chunks(20) {}
+    // removes：8B/条 {handle, callbackIdx}
+    for b in frame.disease_consumer_messages.removes.as_slice().chunks(8) {
+        if b.len() < 8 {
+            continue;
+        }
+        let handle = i32::from_le_bytes(b[0..4].try_into().unwrap_or([0; 4]));
+        let callback_idx = i32::from_le_bytes(b[4..8].try_into().unwrap_or([0; 4]));
+        mgr.remove(handle);
+        if callback_idx != -1 {
+            push_state_changed(sim, callback_idx, -1);
+        }
+    }
+}
+
 /// GetReachableCells — 4 向 BFS 泛洪（原版 Flood L33466 + GetReachableCells L34451）。
 ///
 /// 从 (x,y) 起，深度 < range 的格全部可达（三个 state 过滤 flag 全 false →
@@ -923,6 +1053,124 @@ mod tests {
         update_disease_emitters(&mut sd, 0.2, bounds);
         unsafe {
             assert_eq!((*sd.updated_cells.ptr).disease_count.get(7), 100, "区域外不发射");
+        }
+        clear_disease_emitters();
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    // ===== 任务 4：DiseaseConsumer 防御 + update_data 集成 =====
+
+    #[test]
+    fn disease_consumer_messages_register_and_remove() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clear_disease_consumers();
+        create_solid_table();
+        install_disease_table();
+        let mut sd = make_sim();
+        let mut frame = SimFrameInfo::default();
+        // Add 12B：{gameCell=0, callbackIdx=9, ...4B} → 注册零值记录 + 回调{9, handle}
+        for b in 0i32.to_le_bytes() {
+            frame.disease_consumer_messages.adds.push_unchecked(b);
+        }
+        for b in 9i32.to_le_bytes() {
+            frame.disease_consumer_messages.adds.push_unchecked(b);
+        }
+        for _ in 0..4 {
+            frame.disease_consumer_messages.adds.push_unchecked(0);
+        }
+        process_disease_consumer_messages(&mut frame, &mut sd);
+        frame.disease_consumer_messages.adds.clear_keep_capacity();
+        assert_eq!(disease_consumer_count(), 1);
+        let handle = unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.component_state_changed_messages.len(), 1);
+            events.component_state_changed_messages.as_slice()[0].sim_handle
+        };
+        // Remove 8B {handle, callback=-1} → 释放
+        for b in handle.to_le_bytes() {
+            frame.disease_consumer_messages.removes.push_unchecked(b);
+        }
+        for b in (-1i32).to_le_bytes() {
+            frame.disease_consumer_messages.removes.push_unchecked(b);
+        }
+        process_disease_consumer_messages(&mut frame, &mut sd);
+        assert_eq!(disease_consumer_count(), 0);
+        clear_disease_consumers();
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    /// 集成用病菌表：生长恒 0（popHL/overPopHL=INF、underPopDeath=0、min=0、max=INF、
+    /// tempHL 全 INF → 温度因子 1.0）；minDiffusionCount 巨大 → 扩散门控 0。
+    fn install_integration_table() {
+        let mut t = Disease::new();
+        let mut eg = crate::b_elements::disease::ElemGrowthInfo::default();
+        eg.diffusion_scale.resize(1, 1.0);
+        eg.min_diffusion_count.resize(1, 1_000_000);
+        eg.min_diffusion_infestation_tick_count.resize(1, 0);
+        eg.min_count_per_kg.resize(1, 0.0);
+        eg.max_count_per_kg.resize(1, f32::INFINITY);
+        eg.population_half_life.resize(1, f32::INFINITY);
+        eg.over_population_half_life.resize(1, f32::INFINITY);
+        eg.under_population_death_rate.resize(1, 0.0);
+        t.diseases.push_unchecked(crate::b_elements::disease::DiseaseInfo {
+            hash_id: 0xE3,
+            strength: 1.0,
+            temperature_range: crate::b_elements::disease::RangeInfo {
+                min_viable: -f32::INFINITY,
+                min_growth: -f32::INFINITY,
+                max_growth: f32::INFINITY,
+                max_viable: f32::INFINITY,
+            },
+            temperature_half_lives: crate::b_elements::disease::RangeInfo {
+                min_viable: f32::INFINITY,
+                min_growth: f32::INFINITY,
+                max_growth: f32::INFINITY,
+                max_viable: f32::INFINITY,
+            },
+            elem_growth_info: eg,
+            radiation_kill_rate: 0.0,
+            ..Default::default()
+        });
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    #[test]
+    fn update_data_emits_disease_via_emitter() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clear_disease_emitters();
+        create_solid_table();
+        install_integration_table();
+        let mut sd = make_sim();
+        set_cell_disease(&mut sd, 7, 0, 100);
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 1,
+            min_y: 1,
+            max_x: 1,
+            max_y: 1,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        });
+        // 注册发射器 gameCell=0 → simCell7；idx=0, range=1, interval=0.0（每次子步触发）, count=10
+        let mut frame = SimFrameInfo::default();
+        push_add_emitter(&mut frame, -1);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.adds.clear_keep_capacity();
+        let handle = disease_emitter_handle(0).expect("handle 0");
+        push_modify_emitter(&mut frame, handle, 0, 0, 1, 0.0, 10);
+        process_disease_emitter_messages(&mut frame, &mut sd);
+        frame.disease_emitter_messages.modifies.clear_keep_capacity();
+        crate::c2_physics::update_data(&mut sd);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.disease_count.get(7), 110, "update_data 经发射器 +10");
+            assert_eq!(u.disease_idx.get(7), 0);
+            assert_eq!(u.disease_infestation_tick_count.get(7), 1, "生长第二遍 tick+1");
         }
         clear_disease_emitters();
         uninstall_disease_table();
