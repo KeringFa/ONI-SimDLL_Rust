@@ -859,6 +859,32 @@ StepTheSim 从 GDU 重取（无 C# 缓存），残留必来自旧发射器继续
   改共享原语需全量回归（所有组件都用它）。
 - **待办**：与"元素表每格加锁性能"合并立项，专项处理。
 
+## [已完成] 性能专项第一步：MsvcVector::resize 容量感知（2026-08-05）
+
+- **根因**（2026-08-04 日志实证）：`MsvcVector::resize` 无条件 alloc+零填充+
+  释放旧缓冲（不看现有容量）→ `copy_sim_data_to_game` 每帧对 GameData cells
+  11 字段 × 2 缓冲 resize（225040 格 ≈ 12MB/帧 分配+释放），2.4 分钟内
+  radiation 缓冲出现 62 个不同地址（双缓冲本应只有 2 个）。
+- **修复（0c78947）**：resize 改为 MSVC 容量感知语义——
+  - 同长度/收缩：只调 end 指针，**不重新分配**（核心性能点）；
+  - 容量内增长：只填新增长段 value，已有元素保留；
+  - 超容量增长：分配精确 new_len，**拷贝旧元素**（此前增长丢旧值）+ 填新段；
+  - clear(0) 保持释放；释放尺寸改用 capacity（此前用 len，收缩后 clear
+    的 dealloc 尺寸不匹配）。
+- **调用点审计**：75 处 resize 中，每帧热点 = copy_rows_from_stripped
+  （11 字段×2 缓冲）、radiation occlusion（225040×4B）、element_chunk/
+  conduit/element_emitter 输出（小）；element_emitter/copy*/occlusion 均
+  全量覆盖或显式重填（安全）；**element_chunk 输出只写活跃槽位 → 显式清零
+  未覆盖槽位**（resize 保留旧值后防残留）。
+- 测试：4 条 resize 语义回归（同长度不重分配/容量内增长/收缩/超容量保留值/
+  clear 释放）；全量 480 测试串行全过；release 构建成功。
+- **待实测**：部署 → ① 1x 相机移动卡顿是否消失/减轻（主嫌疑）；
+  ② 存档加载/液体/温度/管道不回归；③ simdll 日志 GDU 指针应稳定在 2 个地址
+  （双缓冲），不再每帧变化。
+- **下一步（待实测后决策）**：元素表每格加锁（G_ELEMENTS_TABLE Mutex，
+  68+ 调用点，约 150 万次锁/子步）——方案待定（元素表运行期只读 → 初始化后
+  冻结无锁读 / 子步快照）。若 1x 卡顿已随 resize 消除，此项优先级下调。
+
 ## [已完成] 辐射模块全量对照审查（2026-08-04 内联）
 
 - 报告：.superpowers/sdd/review-radiation.md
