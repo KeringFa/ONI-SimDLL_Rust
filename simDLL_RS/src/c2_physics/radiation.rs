@@ -66,6 +66,16 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
     let base_w = sim.radiation_base_weight;
     let dens_w = sim.radiation_density_weight;
     let const_f = sim.radiation_constructed_factor;
+    // 阶段 4：RadiationSickness 病菌索引（原版 L42860-42870 在循环外算一次；
+    // gDisease 缺失 → 跳过贡献）。
+    let rs_idx = {
+        let ptr = crate::globals::G_DISEASE.lock().0;
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr }.get_disease_index(0xd49f77d6))
+        }
+    };
 
     // occlusion 缓冲：全网格填 1.0（原版 L42688 resize 初值 1.0）
     sim.cosmic_radiation_occlusion.resize(total, 1.0);
@@ -149,6 +159,17 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
                         let u = unsafe { &mut *sim.updated_cells.ptr };
                         u.radiation.set(t, u.radiation.get(t) + add);
                     }
+                }
+            }
+            // 病菌辐射贡献（原版 L42860-42870）：RadiationSickness 病菌自身辐射
+            // radiation[cell] += disease_count[cell] × 0.001
+            if let Some(rs) = rs_idx {
+                let u = unsafe { &mut *sim.updated_cells.ptr };
+                if u.disease_idx.get(cell) == rs {
+                    u.radiation.set(
+                        cell,
+                        u.radiation.get(cell) + u.disease_count.get(cell) as f32 * 0.001,
+                    );
                 }
             }
             // 宇宙辐射应用（原版 L42875-42884）
@@ -240,6 +261,147 @@ mod tests {
             f(&mut *sd.cells.ptr);
             f(&mut *sd.updated_cells.ptr);
         }
+    }
+
+    // ===== 阶段 4：RadiationSickness 病菌辐射贡献（原版 L42860-42870）=====
+
+    /// 病菌表挂 G_DISEASE：idx0 = RadiationSickness（hash 0xd49f77d6）、idx1 = 其他病菌。
+    fn install_rs_table(include_rs: bool) {
+        use crate::b_elements::disease::{Disease, DiseaseInfo};
+        let mut t = Disease::new();
+        if include_rs {
+            t.diseases.push_unchecked(DiseaseInfo {
+                hash_id: 0xd49f77d6,
+                ..Default::default()
+            });
+        }
+        t.diseases.push_unchecked(DiseaseInfo {
+            hash_id: 0x9999,
+            ..Default::default()
+        });
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    fn uninstall_disease_table() {
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+            g.0 = std::ptr::null_mut();
+        }
+    }
+
+    fn set_cell_disease(sd: &mut SimData, cell: usize, d_idx: u8, count: i32) {
+        unsafe {
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let c = &mut *buf_ptr;
+                c.disease_idx.set(cell, d_idx);
+                c.disease_count.set(cell, count);
+            }
+        }
+    }
+
+    fn set_cell_radiation(sd: &mut SimData, cell: usize, rad: f32) {
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.radiation.set(cell, rad);
+        }
+    }
+
+    #[test]
+    fn radiation_sickness_disease_contributes_count_times_0001() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        install_rs_table(true);
+        let mut sd = make_sim();
+        // cell9 = (1,1) 在 full_grid_bounds(8×8) 区域内；
+        // disease_idx=0（RS）、count=5000 → radiation += 5000×0.001 = 5.0
+        set_cell_disease(&mut sd, 9, 0, 5000);
+        set_cell_radiation(&mut sd, 9, 0.0);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, bounds, 0.0);
+        unsafe {
+            assert!(((*sd.updated_cells.ptr).radiation.get(9) - 5.0).abs() < 1e-4);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn non_radiation_sickness_disease_does_not_contribute() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        install_rs_table(true);
+        let mut sd = make_sim();
+        // cell9 disease_idx=1（非 RS）、count=5000 → 不贡献
+        set_cell_disease(&mut sd, 9, 1, 5000);
+        set_cell_radiation(&mut sd, 9, 0.0);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, bounds, 0.0);
+        unsafe {
+            assert_eq!((*sd.updated_cells.ptr).radiation.get(9), 0.0);
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn no_disease_cell_contributes_zero() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        install_rs_table(true);
+        let mut sd = make_sim();
+        // cell9 无病菌（0xff、count=0）→ 原版 uVar14==0xff 匹配但 count=0 → +0
+        set_cell_disease(&mut sd, 9, 0xff, 0);
+        set_cell_radiation(&mut sd, 9, 1.0);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, bounds, 0.0);
+        unsafe {
+            // 辐射任务第一遍先衰减：1.0 − 1.0/1.1 = 0.090909；病菌贡献 count=0 → +0
+            let expected = 1.0 - 1.0 / 1.1;
+            assert!(
+                ((*sd.updated_cells.ptr).radiation.get(9) - expected).abs() < 1e-5,
+                "count=0 → +0（仅衰减）"
+            );
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn missing_disease_table_skips_contribution() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        uninstall_disease_table();
+        let mut sd = make_sim();
+        set_cell_disease(&mut sd, 9, 0, 5000);
+        set_cell_radiation(&mut sd, 9, 0.0);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, bounds, 0.0); // 不 panic
+        unsafe {
+            assert_eq!((*sd.updated_cells.ptr).radiation.get(9), 0.0);
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn table_without_radiation_sickness_is_noop() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        install_rs_table(false); // 表无 RS → GetDiseaseIndex 返回 0xff
+        let mut sd = make_sim();
+        set_cell_disease(&mut sd, 9, 0, 5000);
+        set_cell_radiation(&mut sd, 9, 0.0);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        run_radiation_task(&mut sd, bounds, 0.0);
+        unsafe {
+            assert_eq!((*sd.updated_cells.ptr).radiation.get(9), 0.0, "无 RS 病菌 → 无贡献");
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
     }
 
     /// 任务 3a：DLC 门控——radiation_enabled=false → 零执行（辐射不变、occlusion 不被填）。
