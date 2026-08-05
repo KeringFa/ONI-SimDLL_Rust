@@ -1235,6 +1235,51 @@ mod tests {
         );
     }
 
+    /// 端到端：盐水（水，100kg 20°C）被热源缓慢加热 → 分批 5kg 蒸发全程
+    /// **不产生矿渣（盐）**——partial 分支无 SpawnOre，且本格温度保持
+    /// < high−3 时不会触发 DoStateTransition（产盐路径）。原版同款行为。
+    #[test]
+    fn partial_evaporation_completes_without_ore() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_partial_heat_table();
+        let mut sd = make_sim();
+        // cell14=盐水(水 1：high=100 → 蒸汽 3) 100kg 20°C；cell15=热固体 600°C；
+        // below20=蒸汽（排放目标，DisplaceGas 用）
+        fill(&mut sd, 14, 1, 100.0, 20.0);
+        fill(&mut sd, 15, 4, 100.0, 600.0);
+        fill(&mut sd, 20, 3, 1.0, 300.0);
+        let events_before = unsafe { &*sd.sim_events.ptr }.spawn_ore_info.len();
+        // 模拟 30 tick：热源缓慢加热（每 tick +1°C，远低于蒸发完所需），
+        // 每 tick 先 partial（温度 < high−3=97 时触发），温度超限后停止。
+        for _ in 0..30 {
+            let t = unsafe { (*sd.updated_cells.ptr).temperature.get(14) };
+            unsafe { (*sd.updated_cells.ptr).temperature.set(14, t + 1.0) };
+            let etd = crate::b_elements::elements_table::get_element_temperature_data(1).unwrap();
+            if do_state_transition(&mut sd, 14, &etd) {
+                break; // 温度超过 high+3 → 整格相变（产盐路径）
+            }
+            if !do_partial_heat_transition(&mut sd, 14, 15) {
+                break;
+            }
+        }
+        let u = unsafe { &*sd.updated_cells.ptr };
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(
+            events.spawn_ore_info.len(),
+            events_before,
+            "分批蒸发全程不得产生矿渣（盐）"
+        );
+        assert!(
+            u.mass.get(14) < 0.01,
+            "100kg 盐水应经 partial 全部蒸发为蒸汽，剩 {}kg",
+            u.mass.get(14)
+        );
+        assert_eq!(u.element_idx.get(14), 1, "本格仍为盐水（未整格相变）");
+        // partial 每次把新 5kg 蒸汽放入下方格、旧蒸汽被 DisplaceGas 挤到更下方，
+        // 下方格始终 ~5kg；总蒸汽量体现在被挤走的格子。此处只断言盐水耗尽 + 无盐。
+        assert_eq!(u.element_idx.get(20), 3, "下方格为蒸汽排放口");
+    }
+
     #[test]
     fn partial_melt_spawns_droplet_and_deducts_solid() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
