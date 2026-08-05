@@ -410,6 +410,10 @@ pub(crate) fn update_element_chunks_inner(
 ) {
     // 输出按 handle index 索引（原版 Update 首行 _Resize 到 items 数，写 output[handleIndex]）
     mgr.output.resize(mgr.items.len(), ElementChunkInfo::default());
+    // resize 现为容量感知（保留旧值）→ 未活跃槽位须显式清零，防 C# 读到残留
+    for idx in 0..mgr.items.len() {
+        mgr.output.set(idx, ElementChunkInfo::default());
+    }
     if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
         return;
     }
@@ -501,6 +505,9 @@ pub(crate) fn update_element_chunks_inner(
 /// ——否则 C# `SimTemperatureTransfer.OnSimRegistered` 读 `simData.elementChunks[handleIndex]` 时 NRE。
 pub(crate) fn update_element_chunks_data_list_only_inner(mgr: &mut ElementChunkManager) {
     mgr.output.resize(mgr.items.len(), ElementChunkInfo::default());
+    for idx in 0..mgr.items.len() {
+        mgr.output.set(idx, ElementChunkInfo::default());
+    }
     for index in 0..mgr.items.len() {
         let ri = mgr.items[index];
         if ri < 0 {

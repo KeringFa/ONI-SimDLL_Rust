@@ -143,7 +143,14 @@ impl<T: Default + Copy> MsvcVector<T> {
 
     /// 调整容量到 new_len，新元素用 value 填充。
     ///
-    /// 对应 MSVC vector::resize。简化实现：分配新缓冲区，释放旧缓冲区。
+    /// 对应 MSVC vector::resize（**容量感知**）：new_len ≤ 容量时不重新分配，
+    /// 只调整 size（end），新增长段填 value、已有元素保留；收缩截断（超出
+    /// size 的元素不可见，内存保留）。仅 new_len > 容量时分配新缓冲并拷贝
+    /// 旧元素。**性能修复（2026-08-05）**：此前无条件 alloc+零填充+释放旧缓冲，
+    /// 导致 copy_sim_data_to_game 每帧对 GameData cells 的 11 个字段 resize
+    /// 触发全量重分配（~12MB/帧 抖动，日志实证 62 个不同缓冲地址），疑为
+    /// 1x 相机卡顿主因之一。另修正：释放时按 capacity（非 len）计算尺寸，
+    /// 避免收缩后 clear 的 dealloc 尺寸不匹配。
     pub fn resize(&mut self, new_len: usize, value: T) {
         let elem_size = std::mem::size_of::<T>();
         let elem_align = std::mem::align_of::<T>().max(8);
@@ -159,18 +166,37 @@ impl<T: Default + Copy> MsvcVector<T> {
             self.capacity_end = std::ptr::null_mut();
             return;
         }
+        let cur_len = self.len();
+        let cur_cap = if !self.begin.is_null() && !self.capacity_end.is_null() {
+            (self.capacity_end as usize).saturating_sub(self.begin as usize) / elem_size
+        } else {
+            0
+        };
+        if new_len <= cur_cap {
+            // 容量内：只填新增长段（已有元素保留）；收缩仅调 end。
+            if new_len > cur_len {
+                for i in cur_len..new_len {
+                    unsafe { std::ptr::write(self.begin.add(i), value) };
+                }
+            }
+            self.end = unsafe { self.begin.add(new_len) };
+            return;
+        }
+        // 增长：分配精确 new_len，拷贝旧元素（保留值）+ 填新段。
         let new_byte_len = new_len.checked_mul(elem_size).expect("overflow");
         let layout = Layout::from_size_align(new_byte_len, elem_align).unwrap();
         let new_buf = unsafe { alloc(layout) as *mut T };
         if new_buf.is_null() {
             return;
         }
-        for i in 0..new_len {
+        for i in 0..cur_len {
+            unsafe { std::ptr::write(new_buf.add(i), std::ptr::read(self.begin.add(i))) };
+        }
+        for i in cur_len..new_len {
             unsafe { std::ptr::write(new_buf.add(i), value) };
         }
         if !self.begin.is_null() {
-            let old_len = self.len();
-            let old_byte_len = old_len * elem_size;
+            let old_byte_len = cur_cap * elem_size;
             let old_layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
             unsafe { dealloc(self.begin as *mut u8, old_layout) };
         }
@@ -487,5 +513,75 @@ mod tests {
     fn msvc_vector_default_is_empty() {
         let v: MsvcVector<i32> = MsvcVector::default();
         assert!(v.is_empty());
+    }
+
+    /// 容量感知 resize：同长度 resize 不重新分配（begin 指针不变）、旧值保留。
+    /// 这是性能专项的核心断言——此前每帧同尺寸 resize 全量重分配（12MB/帧）。
+    #[test]
+    fn msvc_vector_resize_same_len_keeps_buffer_and_values() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(4, 7);
+        v.set(0, 1);
+        v.set(1, 2);
+        let begin_before = v.begin as usize;
+        v.resize(4, 9); // 同长度：不重分配、不覆盖已有值
+        assert_eq!(v.begin as usize, begin_before, "同长度 resize 不得重分配");
+        assert_eq!(v.len(), 4);
+        assert_eq!(v.get(0), 1, "已有值必须保留");
+        assert_eq!(v.get(1), 2, "已有值必须保留");
+        // 同长度 resize（MSVC 语义 n == size）不填任何值：2/3 保留初始 7
+        assert_eq!(v.get(2), 7);
+        assert_eq!(v.get(3), 7);
+    }
+
+    /// 容量内增长：旧值保留、新段填 value；收缩截断（超出不可见）。
+    #[test]
+    fn msvc_vector_resize_grow_within_capacity_and_shrink() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(2, 0);
+        v.set(0, 5);
+        v.set(1, 6);
+        v.resize(4, 8); // 容量内增长（旧实现会重分配；容量感知仅填新段）
+        assert_eq!(v.len(), 4);
+        assert_eq!(v.get(0), 5);
+        assert_eq!(v.get(1), 6);
+        assert_eq!(v.get(2), 8);
+        assert_eq!(v.get(3), 8);
+        v.resize(1, 0); // 收缩：截断
+        assert_eq!(v.len(), 1);
+        assert_eq!(v.get(0), 5);
+        v.resize(2, 9); // 收缩后同容量增长：新段填 value
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.get(0), 5);
+        assert_eq!(v.get(1), 9);
+    }
+
+    /// 增长超容量：分配新缓冲，旧元素保留（此前增长会丢旧值）。
+    #[test]
+    fn msvc_vector_resize_grow_beyond_capacity_keeps_values() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(2, 0);
+        v.set(0, 11);
+        v.set(1, 22);
+        v.resize(6, 7);
+        assert_eq!(v.len(), 6);
+        assert_eq!(v.get(0), 11, "增长必须保留旧值");
+        assert_eq!(v.get(1), 22);
+        assert_eq!(v.get(2), 7);
+        assert_eq!(v.get(5), 7);
+    }
+
+    /// clear（resize 0）释放内存；之后 resize 全新分配。
+    #[test]
+    fn msvc_vector_clear_frees_then_resize_fresh() {
+        let mut v: MsvcVector<i32> = MsvcVector::new();
+        v.resize(5, 3);
+        v.clear();
+        assert!(v.begin.is_null());
+        assert!(v.is_empty());
+        v.resize(3, 9);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.get(0), 9);
+        assert_eq!(v.get(2), 9);
     }
 }
