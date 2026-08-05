@@ -319,7 +319,11 @@ pub fn reset_for_test() {
     ELEMENT_CHUNK_MANAGER.lock().clear();
 }
 
-/// ExchangeHeatEnergyWithWorld（原版 L139789-139890）。返回热流（正 = 碎片失热给格子）。
+/// ExchangeHeatEnergyWithWorld（原版 L139789-139890）。返回 **cell 的热量变化**
+/// （正 = 环境失热给碎片；负 = 碎片失热给环境）——原版 CalculateTemperatureExchange
+/// wrapper 冷侧在前、energy = (T1−new_T1)×HC1（T1=cell），L37923-37990 直接返回该值。
+/// C# CreatureSimTemperatureTransfer 采样 deltaKJ：正 → 环境比碎片热（炎热）；
+/// 负 → 碎片比环境热（寒冷）。此前返回碎片失热（符号相反）→ 20°C 空气误报炎热。
 pub(crate) fn exchange_heat_energy_with_world(
     sim: &mut SimData,
     chunk: &mut ElementChunkData,
@@ -392,7 +396,7 @@ pub(crate) fn exchange_heat_energy_with_world(
         (*sim.updated_cells.ptr).temperature.set(cell, new_cell);
     }
     let _ = cell_mass;
-    heat
+    -heat
 }
 
 /// ElementChunk::Update（原版 L140092-140202）。
@@ -634,7 +638,10 @@ mod tests {
             ..Default::default()
         };
         let heat = exchange_heat_energy_with_world(&mut sd, &mut chunk, 14, 1.0, 0.2);
-        assert!(heat > 0.0, "碎片（热）应失热给格子");
+        assert!(
+            heat < 0.0,
+            "碎片（热）失热给格子 → cell 得热 → 返回值（cell 失热）为负，got {heat}"
+        );
         assert!(chunk.temperature < 400.0, "碎片应降温，got {}", chunk.temperature);
         unsafe {
             assert!(
@@ -642,6 +649,80 @@ mod tests {
                 "格子应升温"
             );
         }
+    }
+
+    /// 反向：碎片冷于格子 → 环境失热给碎片 → 返回值为正（环境变冷）。
+    #[test]
+    fn exchange_heat_energy_with_world_positive_when_cell_loses_heat() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut sd = make_sim();
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(14, 5);
+            u.mass.set(14, 100.0);
+            u.temperature.set(14, 500.0);
+            u.insulation.set(14, 255);
+        }
+        let mut chunk = ElementChunkData {
+            cell: 14,
+            temperature: 300.0,
+            heat_capacity: 200.0,
+            thermal_conductivity: 4.0,
+            max_energy_transfer_scale_factor: 1000.0,
+            ..Default::default()
+        };
+        let heat = exchange_heat_energy_with_world(&mut sd, &mut chunk, 14, 1.0, 0.2);
+        assert!(
+            heat > 0.0,
+            "格子（热）失热给碎片 → 返回值为正，got {heat}"
+        );
+        assert!(chunk.temperature > 300.0, "碎片应升温，got {}", chunk.temperature);
+    }
+
+    /// 回归：复制人（Creature：SHC 3.47、TC 0.6、mass 30、体温 310K、SA 1、厚度 0.002）
+    /// 站在 20°C（293K）氧气（SHC 1.01、TC 0.024）中——碎片比环境热 →
+    /// delta（cell 失热）必须为**负**。此前符号反了 → 正 delta → C# 误报炎热。
+    #[test]
+    fn duplicant_in_cool_air_produces_negative_delta() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            // elem6 = 氧气（气体）
+            let mut o2 = ElementTemperatureData::default();
+            o2.state = 1;
+            o2.specific_heat_capacity = 1.01;
+            o2.thermal_conductivity = 0.024;
+            table.temperature_data.push(o2);
+        }
+        let mut sd = make_sim();
+        // 格 14：氧气 20°C，mass 1.0kg，ins 255
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(14, 6);
+            u.mass.set(14, 1.0);
+            u.temperature.set(14, 293.0);
+            u.insulation.set(14, 255);
+        }
+        let mut chunk = ElementChunkData {
+            cell: 14,
+            temperature: 310.0,                       // 复制人体温
+            heat_capacity: 30.0 * 3.47,               // 30kg × SHC 3.47
+            thermal_conductivity: 0.6,                // Creature TC
+            max_energy_transfer_scale_factor: 1.0 / 0.002, // SA 1 / thickness 0.002
+            ..Default::default()
+        };
+        let delta = exchange_heat_energy_with_world(&mut sd, &mut chunk, 14, 1.0, 0.2);
+        assert!(
+            delta < 0.0,
+            "复制人（310K）在 20°C 氧气中 → cell 得热 → delta 为负，got {delta}"
+        );
+        // 量级：ΔT=17、k=min(0.6, 1.0×0.024)×500×0.001=0.012 → ΔT×k×dt≈0.0408
+        assert!(
+            delta.abs() < 0.1,
+            "delta 量级应约 0.04（kJ/tick），got {delta}"
+        );
     }
 
     #[test]
