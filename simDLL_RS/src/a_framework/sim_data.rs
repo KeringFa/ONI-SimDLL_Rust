@@ -641,12 +641,16 @@ impl SimData {
         self.saved_options = settings;
     }
 
-    /// InitializeBoundary — 初始化外围边界格。
-    /// 对照源码 11_msvcrt_ignored.c L23949-24195。
+    /// InitializeBoundary — 初始化顶/底边界行（原版 SimDLL_Source.c L123236+，
+    /// 与 11_msvcrt_ignored.c L23949+ 同函数）。
     ///
-    /// 底行=unobtanium、顶行=vacuum、左右列=unobtanium；
-    /// mass=9999.0（0x461C3C00）、temperature=0、病菌清零；
-    /// 背墙=vacuum 索引/0/0。cells 与 updated_cells 双缓冲都写。
+    /// 逐列初始化：
+    /// - 底行（row 0）= gSimData+0x1e = **unobtanium**；
+    /// - 顶行（row height−1）= gSimData+0x1c = **vacuum**；
+    /// - mass=9999.0（0x461C3C00）、temperature=0、病菌清零；
+    /// - 背墙=vacuum 索引/0/0。
+    /// cells 与 updated_cells 双缓冲都写。左右列**不处理**（原版仅顶/底两行，
+    /// 左右边界来自存档地图数据）。
     pub fn initialize_boundary(&mut self) {
         let width = self.width as usize;
         let height = self.height as usize;
@@ -678,13 +682,6 @@ impl SimData {
                 set_boundary_cell(cells, updated, backwall, x, unobtanium, bw_vacuum);
                 let top = (height - 1) * width + x;
                 set_boundary_cell(cells, updated, backwall, top, vacuum, bw_vacuum);
-            }
-            // 左右列（row 1..height-1）（对照 L24074-24195）
-            for y in 1..height.saturating_sub(1) {
-                let cells = &mut *self.cells.ptr;
-                let updated = &mut *self.updated_cells.ptr;
-                set_boundary_cell(cells, updated, backwall, y * width, unobtanium, bw_vacuum);
-                set_boundary_cell(cells, updated, backwall, (y + 1) * width - 1, unobtanium, bw_vacuum);
             }
         }
     }
@@ -924,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_boundary_sets_four_edges_both_buffers() {
+    fn initialize_boundary_sets_top_bottom_rows_both_buffers() {
         let mut sd = SimData::new_for_allocate(6, 5, 0, false, false);
         sd.initialize_boundary();
         let unob = elements_table::get_element_index_pub(0x6d95058c);
@@ -944,12 +941,9 @@ mod tests {
                     assert_eq!(buf.element_idx.get(top), vacuum, "top x={}", x);
                     assert_eq!(buf.mass.get(top), 9999.0);
                 }
-                for y in 1..4usize {
-                    // 左右列 = unobtanium
-                    assert_eq!(buf.element_idx.get(y * 6), unob, "left y={}", y);
-                    assert_eq!(buf.element_idx.get(y * 6 + 5), unob, "right y={}", y);
-                    assert_eq!(buf.mass.get(y * 6), 9999.0);
-                }
+                // 左右列不处理（原版仅顶/底两行）——左列 (1,0) 保持零值
+                assert_eq!(buf.element_idx.get(6), 0, "left col row1 不受影响");
+                assert_eq!(buf.mass.get(6), 0.0);
                 // 内部格不受影响（with_size 零值）
                 assert_eq!(buf.element_idx.get(8), 0);
                 assert_eq!(buf.mass.get(8), 0.0);

@@ -1189,3 +1189,20 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
 - **待实测**：部署 → 挖空沙子/碎石下方 → 下落实体 + 落地回注；稳定期
   （3-5 tick）延迟塌方；回归液体/气体流动无差异。
 
+## [已完成] InitializeBoundary 接线收尾（2026-08-06）
+
+- **背景**：Start（save_load.rs L978）里 InitializeBoundary 是 A3 遗留桩
+  （"skipped (A3 stub)"，实现早已存在但被注释）——最后一个真实 A3 桩。
+- **对齐原版**：原版 InitializeBoundary（SimDLL_Source.c L123236+ 与
+  11_msvcrt_ignored.c L23949+ 同函数）**只初始化顶/底两行**：逐列
+  底行（row 0）= gSimData+0x1e = unobtanium、顶行（row height−1）=
+  gSimData+0x1c = vacuum；mass=9999（0x461C3C00）、temp=0、病菌清零、
+  背墙=vacuum/0/0，双缓冲。原实现多加了左右列（原版不处理，左右边界来自
+  存档地图数据）——已删除。
+- **接线**：Start L249 启用 `sim_data.initialize_boundary()`。
+- **测试**：`initialize_boundary_sets_top_bottom_rows_both_buffers`
+  （改名+断言改为顶/底两行、左右列不受影响）；全量 503 lib + 53 集成
+  串行全过；release 构建成功。
+- **待实测**：部署 → 加载存档/开局边界正常（顶行真空/底行 unobtanium）；
+  太空暴露删除、气体/液体不回归。
+

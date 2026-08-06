@@ -973,9 +973,8 @@ pub fn handle_start(_reader: &mut BinaryBufferReader) -> *mut c_void {
         updated_cells,
     );
 
-    // L249: SimData::InitializeBoundary（A3 阶段桩，C 类阶段实现）
-    // sim_data.initialize_boundary();
-    tracing::debug!("Start: InitializeBoundary skipped (A3 stub)");
+    // L249: SimData::InitializeBoundary（顶/底边界行，原版 L123236+）
+    sim_data.initialize_boundary();
 
     // L250-251: CellSOA::CopyFrom(cells, updated_cells)
     let cells_ptr = sim_data.cells.ptr;
