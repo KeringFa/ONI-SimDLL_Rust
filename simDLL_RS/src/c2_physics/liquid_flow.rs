@@ -4156,6 +4156,84 @@ mod tests {
         DestroyElementsTable();
     }
 
+    /// 全管线 L 布局实证（update_data 30 帧）：气1(4,4)、液1(4,5)、液2(5,5)、
+    /// 三格砖封。记录气体最终位置，与原版"下一 tick 传送到液2位置"对照。
+    #[test]
+    fn full_pipeline_l_corner_gas_behavior() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_displacement_table();
+        let mut sd = SimData::new_for_allocate(12, 10, 12345, false, true);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        let w = sd.width as usize;
+        let gas = 4 * w + 4; // (4,4) 气1
+        let liq1 = gas + 1; // (4,5) 液1
+        let liq2 = liq1 + w; // (5,5) 液2
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(gas, 3);
+                buf.mass.set(gas, 10.0);
+                buf.temperature.set(gas, 250.0);
+                buf.element_idx.set(liq1, 1);
+                buf.mass.set(liq1, 100.0);
+                buf.temperature.set(liq1, 300.0);
+                buf.element_idx.set(liq2, 1);
+                buf.mass.set(liq2, 100.0);
+                buf.temperature.set(liq2, 300.0);
+                // 砖封三格：气1 上/左/下；液1 右/下；液2 上/左/右
+                for c in [
+                    gas + w,      // (5,4)
+                    gas - 1,      // (4,3)
+                    gas - w,      // (3,4)
+                    liq1 + 1,     // (4,6)
+                    liq1 - w,     // (3,5)
+                    liq2 + w,     // (6,5)
+                    liq2 - 1,     // (5,4)
+                    liq2 + 1,     // (5,6)
+                    liq1 - w - 1, // (3,3)
+                    liq1 - w + 1, // (3,6)
+                    gas + w - 1,  // (5,3)
+                    liq2 + w + 1, // (6,6)
+                    liq2 + w - 1, // (6,4)
+                ] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                    buf.temperature.set(c, 300.0);
+                }
+            }
+        }
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 2,
+            min_y: 2,
+            max_x: 9,
+            max_y: 7,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        });
+        for _ in 0..30 {
+            crate::c2_physics::update_data(&mut sd);
+        }
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            let gas_cells = (0..(12 * 10))
+                .filter(|&c| updated.element_idx.get(c) == 3)
+                .collect::<Vec<_>>();
+            let liquid_cells = (0..(12 * 10))
+                .filter(|&c| updated.element_idx.get(c) == 1)
+                .collect::<Vec<_>>();
+            assert!(
+                gas_cells.len() == 1,
+                "气体应仍为 1 格（不凭空消失），got {gas_cells:?}"
+            );
+            assert_eq!(
+                gas_cells[0], 52,
+                "密封 L 布局 30 帧后气体应仍在原位 52（无任何机制可移动它），got {gas_cells:?}"
+            );
+            assert!(liquid_cells.len() >= 1, "液体应保留");
+        }
+        DestroyElementsTable();
+    }
+
     /// 下落压缩修复（2026-08-02）：fVar22 = max(mass×1.01, max_mass) - below_mass。
     /// ① 上层 100 → 下层 990：f22 = max(101,1000)-990 = 10 → f23 = min(min(100,50),5) = 5
     ///    （下层逐步逼近满格 1000，而非 0.1kg 滴漏）。
