@@ -57,6 +57,11 @@ pub fn update_liquids(sim: &mut crate::a_framework::sim_data::SimData) {
 }
 
 /// UpdateLiquid 遍历循环（原版 11_msvcrt_ignored.c L42408-42435）。
+/// **自上而下**遍历（行从 max_y → min_y）：先处理上方液体格——用户实测（2026-08-06）：
+/// 竖井 [气1 下][液1 中][液2 上] 满格时，液2 先分支 1 合并 5kg 给液1，
+/// 随后液1/液2 分支 3 与气体换位（"先判定合并，再判定气体可否转移"）。
+/// 此前自下而上遍历 → 液1 先与气体交换，液2 的分支 1 目标格已变气体，
+/// displace_gas 失败 → 5kg 合并丢失。
 /// 2026-08-04 拆分：与 post_process_loop 分离，供 update_data 在两者之间插入
 /// 太空真空任务（原版 worldZones 特判位于 UpdateLiquid 之后、PostProcessCell 之前，
 /// L145466-145520）。
@@ -69,7 +74,7 @@ pub(crate) fn update_liquid_loop(
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
         return;
     }
-    for row in bounds.min_y..=bounds.max_y {
+    for row in (bounds.min_y..=bounds.max_y).rev() {
         for col in bounds.min_x..=bounds.max_x {
             if row >= height - 1 || col >= width - 1 {
                 continue;
@@ -4156,80 +4161,139 @@ mod tests {
         DestroyElementsTable();
     }
 
-    /// 全管线 L 布局实证（update_data 30 帧）：气1(4,4)、液1(4,5)、液2(5,5)、
-    /// 三格砖封。记录气体最终位置，与原版"下一 tick 传送到液2位置"对照。
+    /// 正确布局复现（2026-08-06 用户精确坐标 (x,y)，y 向上）：
+    /// 气1(1,1)=1kg、液1(1,2)=1000kg（液1 在气1 **正上方**）、液2(2,2)=300kg
+    /// （液2 在液1 右侧），三格隔热砖封闭。
+    /// 原版机制 = update_liquid 分支 3 角落检查 + SwapCells：
+    /// - 液2 为液体（不可渗透）→ 液1 右下无角落 → SwapCells(液1,气1) → 气体上升到
+    ///   液1 原位；液2 为真空（可渗透）→ 右下形成角落 → SpawnFallingLiquid 液滴 →
+    ///   气体**不动**（用户实测"真空时不转移"）。
     #[test]
-    fn full_pipeline_l_corner_gas_behavior() {
+    fn gas_above_correct_layout_swap_vs_vacuum() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         create_liquid_displacement_table();
-        let mut sd = SimData::new_for_allocate(12, 10, 12345, false, true);
+        let w = 12usize;
+        let gas = 1 * w + 1; // (x=1,y=1) 气1
+        let liq1 = gas + w; // (x=1,y=2) 液1（气1 正上方）
+        let liq2 = liq1 + 1; // (x=2,y=2) 液2（液1 右侧）
+        // 隔热砖封闭（气1/液1/液2 三格周围；气1=13、液1=25、液2=26）
+        let bricks = [
+            liq1 - 1,     // (2,0) 液1 左
+            liq2 + 1,     // (2,3) 液2 右
+            liq1 + w,     // (3,1) 液1 上
+            liq2 + w,     // (3,2) 液2 上
+            liq1 + w - 1, // (3,0) 液1 左上
+            gas - 1,      // (1,0) 气1 左
+            gas - w,      // (0,1) 气1 下
+            gas - w - 1,  // (0,0) 气1 左下
+            gas - w + 1,  // (0,2) 气1 右下
+            liq2 - w,     // (1,2) 液2 下
+            liq2 - w + 1, // (1,3) 液2 右下
+            liq2 + w + 1, // (3,3) 液2 右上
+        ];
+        for (liq2_elem, liq2_mass, expect_gas_at) in
+            [(1u16, 300.0f32, liq1), (0u16, 0.0f32, gas)]
+        {
+            let mut sd = SimData::new_for_allocate(12, 10, 12345, false, true);
+            sd.vacuum_element_idx = 0;
+            sd.void_element_idx = 0xFFFF;
+            unsafe {
+                for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                    buf.element_idx.set(gas, 3);
+                    buf.mass.set(gas, 1.0);
+                    buf.temperature.set(gas, 250.0);
+                    buf.element_idx.set(liq1, 1);
+                    buf.mass.set(liq1, 1000.0); // 满格
+                    buf.temperature.set(liq1, 300.0);
+                    buf.element_idx.set(liq2, liq2_elem);
+                    buf.mass.set(liq2, liq2_mass);
+                    buf.temperature.set(liq2, 300.0);
+                    for &c in &bricks {
+                        buf.element_idx.set(c, 4);
+                        buf.mass.set(c, 500.0);
+                        buf.temperature.set(c, 300.0);
+                    }
+                }
+            }
+            sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+                min_x: 0,
+                min_y: 0,
+                max_x: 11,
+                max_y: 9,
+                current_sunlight_intensity: 0.0,
+                current_cosmic_radiation_intensity: 0.0,
+            });
+            for _ in 0..5 {
+                crate::c2_physics::update_data(&mut sd);
+            }
+            unsafe {
+                let updated = &*sd.updated_cells.ptr;
+                let gas_cells = (0..(12 * 10))
+                    .filter(|&c| updated.element_idx.get(c) == 3)
+                    .collect::<Vec<_>>();
+                assert!(
+                    gas_cells.len() == 1 && gas_cells[0] == expect_gas_at,
+                    "liq2_elem={liq2_elem}: 气体应在 {expect_gas_at}，got {gas_cells:?}"
+                );
+            }
+        }
+        DestroyElementsTable();
+    }
+
+    /// 满格合并 + 气体上顶（2026-08-06 用户实测）：竖井 [气1 下][液1 中][液2 上]，
+    /// 液1=液2=1000kg（满格）、气1=1kg。原版先走分支 1 同元素合并
+    /// （f22 = max(1000×1.01,1000) − 1000 = 10 → f23 = min(1000, viscosity, 5) = 5，
+    /// 液2 → 液1 转移 5kg），随后分支 3 SwapCells 级联把气体顶到顶部。
+    /// 验证：液2 出现 995kg（5kg 已合并）、气体最终在顶部液2 原位。
+    #[test]
+    fn full_column_merge_then_gas_swap_cascade() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_displacement_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
-        sd.void_element_idx = 0xFFFF;
-        let w = sd.width as usize;
-        let gas = 4 * w + 4; // (4,4) 气1
-        let liq1 = gas + 1; // (4,5) 液1
-        let liq2 = liq1 + w; // (5,5) 液2
         unsafe {
             for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
-                buf.element_idx.set(gas, 3);
-                buf.mass.set(gas, 10.0);
-                buf.temperature.set(gas, 250.0);
-                buf.element_idx.set(liq1, 1);
-                buf.mass.set(liq1, 100.0);
-                buf.temperature.set(liq1, 300.0);
-                buf.element_idx.set(liq2, 1);
-                buf.mass.set(liq2, 100.0);
-                buf.temperature.set(liq2, 300.0);
-                // 砖封三格：气1 上/左/下；液1 右/下；液2 上/左/右
-                for c in [
-                    gas + w,      // (5,4)
-                    gas - 1,      // (4,3)
-                    gas - w,      // (3,4)
-                    liq1 + 1,     // (4,6)
-                    liq1 - w,     // (3,5)
-                    liq2 + w,     // (6,5)
-                    liq2 - 1,     // (5,4)
-                    liq2 + 1,     // (5,6)
-                    liq1 - w - 1, // (3,3)
-                    liq1 - w + 1, // (3,6)
-                    gas + w - 1,  // (5,3)
-                    liq2 + w + 1, // (6,6)
-                    liq2 + w - 1, // (6,4)
-                ] {
+                buf.element_idx.set(8, 3); // (1,2) 气1
+                buf.mass.set(8, 1.0);
+                buf.temperature.set(8, 250.0);
+                buf.element_idx.set(14, 1); // (2,2) 液1（满格）
+                buf.mass.set(14, 1000.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1); // (3,2) 液2（满格）
+                buf.mass.set(20, 1000.0);
+                buf.temperature.set(20, 300.0);
+                for c in [7usize, 9, 13, 15, 19, 21, 2] {
                     buf.element_idx.set(c, 4);
                     buf.mass.set(c, 500.0);
                     buf.temperature.set(c, 300.0);
                 }
             }
         }
-        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
-            min_x: 2,
-            min_y: 2,
-            max_x: 9,
-            max_y: 7,
-            current_sunlight_intensity: 0.0,
-            current_cosmic_radiation_intensity: 0.0,
-        });
-        for _ in 0..30 {
-            crate::c2_physics::update_data(&mut sd);
-        }
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        // 帧 1：液1（row2）先处理——分支 3 与气1 交换；液2（row3）后处理——
+        // 分支 1 判定读 cells（稳定快照）仍是液1 → 转移 5kg 到 updated 里的气体格？？
+        update_liquid_loop(&mut sd, b);
         unsafe {
             let updated = &*sd.updated_cells.ptr;
-            let gas_cells = (0..(12 * 10))
+            let gas_cells = (0..30)
                 .filter(|&c| updated.element_idx.get(c) == 3)
                 .collect::<Vec<_>>();
-            let liquid_cells = (0..(12 * 10))
-                .filter(|&c| updated.element_idx.get(c) == 1)
-                .collect::<Vec<_>>();
+            assert_eq!(updated.element_idx.get(14), 3, "帧1后液1↔气1 交换，气体在中部 14");
             assert!(
-                gas_cells.len() == 1,
-                "气体应仍为 1 格（不凭空消失），got {gas_cells:?}"
+                (updated.mass.get(20) - 995.0).abs() < 1e-3,
+                "帧1液2 应先合并 5kg → 995（分支 1：max(1000×1.01,1000)−1000=10→×0.5=5），got {}",
+                updated.mass.get(20)
             );
-            assert_eq!(
-                gas_cells[0], 52,
-                "密封 L 布局 30 帧后气体应仍在原位 52（无任何机制可移动它），got {gas_cells:?}"
-            );
-            assert!(liquid_cells.len() >= 1, "液体应保留");
+        }
+        // 帧 2：液2 的分支判定（cells 已同步）看到下方是气体 → 分支 3 交换
+        unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
+        update_liquid_loop(&mut sd, b);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            let gas_cells = (0..30)
+                .filter(|&c| updated.element_idx.get(c) == 3)
+                .collect::<Vec<_>>();
+            assert_eq!(updated.element_idx.get(20), 3, "气体应被顶到顶部 20（液2 原位）");
         }
         DestroyElementsTable();
     }
