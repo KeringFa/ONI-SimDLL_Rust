@@ -250,6 +250,10 @@ pub fn update_data(sim_data: &mut SimData) {
 
         // C2 阶段实现：液体流动（原版 L42408+）
         crate::c2_physics::liquid_flow::update_liquid_loop(sim_data, bounds);
+        // 液体压力位移（原版 11_msvcrt_ignored.c L42480-42557：UpdateLiquid 之后、
+        // CopyFrom 之前）——液体↔液体挤压（DoLiquidPressureDisplacement）。
+        // 2026-08-06 补齐：此前缺失 → 异元素液体邻格不会被压力挤开。
+        crate::c2_physics::liquid_flow::run_liquid_displacement_task(sim_data, bounds);
         // 病菌阶段 2（2026-08-05）：原版 L145069 液体阶段后 CopyFrom
         // （病菌扩散读 cells 稳定缓冲）→ L145088 病菌扩散（右/下邻）。
         crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
