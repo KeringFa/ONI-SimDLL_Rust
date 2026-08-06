@@ -4477,7 +4477,7 @@ mod tests {
                 buf.mass.set(8, 1000.0);
                 buf.temperature.set(8, 300.0);
                 buf.element_idx.set(14, 1);
-                buf.mass.set(14, 300.0);
+                buf.mass.set(14, 1000.0); // 用户"液2=1000kg"用例
                 buf.temperature.set(14, 300.0);
                 for c in [13usize, 6, 1, 2, 9, 15, 20, 0, 3, 21, 19] {
                     buf.element_idx.set(c, 4);
@@ -4614,10 +4614,15 @@ mod tests {
         DestroyElementsTable();
     }
 
-    /// 探针：用户布局（气1=7、液1=8=1000kg、液2=14=300kg）对角换位后，
-    /// 追踪液1 质量变化与总质量守恒。
+    /// 满格 1000/1000 回归（2026-08-06 用户实测"液2 换位后达 1200kg"根因）：
+    /// 自下而上遍历时，换位帧（帧 0）液2 先分支 1 合并 5kg → 995，再阶段 E 换位；
+    /// 液1（同帧先处理）左邻仍是 cells 快照中的气体 → displace_gas 被挡 → **帧内
+    /// 无扩散**。帧 1 起液1 才开始水平均质化（2.5kg/帧 → 1000/1000）。
+    /// 此前自上而下遍历：液2 先换位 → 液1 左分支从 cells 快照读气体质量 0 →
+    /// f23=(1005−0)×0.25 被 viscosity 截断 → 灌入已换位的液2（同元素合并）→
+    /// 液2 膨胀（测试表 viscosity=50 → 1045；游戏水=125 → 1120+，用户实测 1200）。
     #[test]
-    fn probe_liquid1_mass_after_diagonal_swap() {
+    fn diagonal_swap_no_mass_inflation_bottom_up() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -4631,7 +4636,7 @@ mod tests {
                 buf.mass.set(8, 1000.0);
                 buf.temperature.set(8, 300.0);
                 buf.element_idx.set(14, 1);
-                buf.mass.set(14, 300.0);
+                buf.mass.set(14, 1000.0);
                 buf.temperature.set(14, 300.0);
                 for c in [13usize, 6, 1, 2, 9, 15, 20, 0, 3, 21, 19] {
                     buf.element_idx.set(c, 4);
@@ -4641,24 +4646,32 @@ mod tests {
             }
         }
         let b = crate::d1_activity::full_grid_bounds(&sd);
-        for frame in 0..30 {
-            crate::c2_physics::update_data(&mut sd);
-            if frame < 8 || frame == 29 {
-                unsafe {
-                    let updated = &*sd.updated_cells.ptr;
-                    let total_liq: f32 = (0..30)
-                        .filter(|&c| updated.element_idx.get(c) == 1)
-                        .map(|c| updated.mass.get(c))
-                        .sum();
-                    eprintln!(
-                        "frame {frame}: m7={:.3} m8={:.3} m14={:.3} total_liq={:.3}",
-                        updated.mass.get(7),
-                        updated.mass.get(8),
-                        updated.mass.get(14),
-                        total_liq
-                    );
-                }
-            }
+        crate::c2_physics::update_data(&mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 3, "换位帧内气体应已到 14");
+            assert_eq!(updated.element_idx.get(7), 1, "液2 应已到 7");
+            // 换位帧：无扩散膨胀（自上而下时此处为 1045）
+            assert!(
+                (updated.mass.get(7) - 995.0).abs() < 1e-3,
+                "帧 0 液2 应恰为 995（合并 5kg 后换位，无帧内扩散），got {}",
+                updated.mass.get(7)
+            );
+            assert!(
+                (updated.mass.get(8) - 1005.0).abs() < 1e-3,
+                "帧 0 液1 应恰为 1005，got {}",
+                updated.mass.get(8)
+            );
+        }
+        // 帧 1 起液1 才开始均质化（2.5kg/帧）
+        crate::c2_physics::update_data(&mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(
+                (updated.mass.get(7) - 997.5).abs() < 1e-3,
+                "帧 1 液2 应 997.5（液1 开始均质化），got {}",
+                updated.mass.get(7)
+            );
         }
         DestroyElementsTable();
     }
