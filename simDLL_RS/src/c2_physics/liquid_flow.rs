@@ -794,9 +794,11 @@ pub(crate) fn add_mass_and_update_temperature(
 ///
 /// 病菌强度混合，逐分支对照原版：
 /// - 同病菌：count 累加（L26173-26174）；
-/// - 异病菌：默认替换为新病菌（L26175-26177）；
-/// - 双方真实病菌（cur!=0xff 且 new!=0xff）→ 默认保留当前（L26178-26179）+
-///   强度混合（L26180-26219）：
+/// - 异病菌：默认取输入（L26175-26177），但格内已有真实病菌时"保留当前"
+///   先执行（L26178 逗号表达式 iVar9=iVar6, bVar7=bVar1）→
+///   干净输入（new==0xff）不清除现有病菌；
+/// - 双方真实病菌（cur!=0xff 且 new!=0xff）→ 从"保留当前"起点做强度混合
+///   （L26180-26219）：
 ///     f10 = cur_count × strength[cur]，f11 = new_count × strength[new]
 ///     f10<=f11：cur<0 → result=-cur, idx=new；否则保留当前
 ///     f10>f11：d=(int)(new - (f10/f11)×cur)；d<0 → idx=cur；
@@ -816,11 +818,20 @@ pub(crate) fn add_disease_to_cell(
     let (new_idx, new_count) = if cur_idx == disease_idx {
         (disease_idx, cur_count + disease_count)
     } else {
-        // 默认：替换为新病菌（原版 L26175-26177）
-        let mut result_idx = disease_idx;
-        let mut result_count = disease_count;
-        // 双方真实病菌 → 默认保留当前 + 强度混合（L26178-26219）
-        if cur_idx != 0xFF && disease_idx != 0xFF {
+        // 原版 L26175-26178：先默认取输入；但格内已有真实病菌时"保留当前"
+        // 先执行（L26178 逗号表达式 iVar9=iVar6, bVar7=bVar1），
+        // 因此输入 0xff（干净质量）流入带菌格不会清除病菌。
+        // 2026-08-06 修复：此前输入 0xff 走"替换" → 孢子兰格被补充的
+        // 干净 CO2 每子步清空病菌（用户实测：流动补充环境病菌消失，
+        // 高压→低压无补充则正常；原版保留病菌）。
+        let mut result_idx = cur_idx;
+        let mut result_count = cur_count;
+        if cur_idx == 0xFF {
+            // 格内无病菌：输入（含 0xff）直接生效（原版 L26175-26177 默认值）
+            result_idx = disease_idx;
+            result_count = disease_count;
+        } else if disease_idx != 0xFF {
+            // 双方真实病菌 → 强度混合（原版 L26178-26219，起点为保留当前）
             let table_ptr = crate::globals::G_DISEASE.lock().0;
             let strengths = if table_ptr.is_null() {
                 None
@@ -830,8 +841,6 @@ pub(crate) fn add_disease_to_cell(
             };
             match strengths {
                 Some(s) if (cur_idx as usize) < s.len() && (disease_idx as usize) < s.len() => {
-                    result_count = cur_count;
-                    result_idx = cur_idx;
                     let f10 = cur_count as f32 * s[cur_idx as usize].strength;
                     let f11 = disease_count as f32 * s[disease_idx as usize].strength;
                     if f10 <= f11 {
@@ -854,8 +863,6 @@ pub(crate) fn add_disease_to_cell(
                 }
                 _ => {
                     // 表缺失 / 索引越界（理论不发生的脏数据）→ 保留当前
-                    result_count = cur_count;
-                    result_idx = cur_idx;
                 }
             }
         }
@@ -887,19 +894,6 @@ fn modify_disease_count(cells: &mut CellSOA, cell: usize, delta: i32) {
 
 /// CellSOA::ClearDisease（原版 11_msvcrt_ignored.c L43186-43214）。
 pub(crate) fn clear_disease(cells: &mut CellSOA, cell: usize) {
-    // 诊断（2026-08-05 孢子兰病菌丢失）：仅当该格确实携带病菌（idx≠0xff 或 count≠0）
-    // 被清除时记录——定位清除者（PostProcess 第二遍 / 气体液体流动 / 消费等）。
-    let d_idx = cells.disease_idx.get(cell);
-    let count = cells.disease_count.get(cell);
-    if d_idx != 0xFF || count != 0 {
-        tracing::warn!(
-            cell,
-            d_idx,
-            count,
-            tick = cells.disease_infestation_tick_count.get(cell),
-            "clear_disease: clearing diseased cell"
-        );
-    }
     cells.disease_idx.set(cell, 0xFF);
     cells.disease_count.set(cell, 0);
     cells.disease_infestation_tick_count.set(cell, 0);
@@ -1128,17 +1122,7 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
     // —— 病菌：来源格病菌数从 cells 读（原版 L1501-1513）——
     let src_disease_count = cells.disease_count.get(src_cell);
     let ratio = (transfer / src_mass).clamp(0.0, 1.0);
-    // 2026-08-06 修复（孢子兰在流动气体中病菌被稀释至不可见）：压力均衡的
-    // 病菌携带仅保留给**液体驱动**压力（原版代码对气体压力同样转移，但用户
-    // 实测气体压力均衡会把孢子兰病菌持续带走——每子步 12.5%×多邻格迭代，
-    // 永远达不到扩散阈值 5100，病菌被稀释消失）。病菌在气体中的扩散由独立的
-    // 病菌扩散模块（UpdateCells）负责；气体压力只均衡质量/温度。
-    // 液体压力保持原版病菌转移（液体 off-gassing 带菌是设计行为）。
-    let disease_to_transfer = if cell_state == 2 {
-        (ratio * src_disease_count as f32) as i32
-    } else {
-        0
-    };
+    let disease_to_transfer = (ratio * src_disease_count as f32) as i32;
     // —— 来源格病菌 idx / 温度（原版 L1504-1518：从 updatedCells 读）——
     let updated = unsafe { &mut *sim.updated_cells.ptr };
     if src_cell >= updated.mass.len() || dst_cell >= updated.mass.len() {
@@ -1147,25 +1131,19 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
     let src_disease_idx = updated.disease_idx.get(src_cell);
     let src_temp = updated.temperature.get(src_cell);
     // —— 接收格质量/温度/病菌（原版 L1519-1556，复用质量加权混合）——
-    // 2026-08-06 修复（孢子兰病菌被气体流动销毁）：病菌转移量钳制到源格 updated
-    // **实际剩余**。原版同一子步内源格会因本格 + 多邻格迭代被多次调用，每次从
-    // cells（稳定缓冲）读计数、从 updated 扣减——若源格病菌已被抽走，扣减会为负
-    // → ClearDisease 销毁病菌（用户实测：气压稳定时病菌正常、流动时被清空）。
-    // 质量侧已 clamp（max(0)），病菌同样按实际可转移量移动（净零，不凭空产生/销毁）。
-    let actual_disease = disease_to_transfer.min(updated.disease_count.get(src_cell));
     add_mass_and_update_temperature(
         updated,
         dst_cell,
         transfer,
         src_temp,
         src_disease_idx,
-        actual_disease,
+        disease_to_transfer,
     );
     // —— 来源格质量减少（原版 L1559-1567，clamp >= 0）——
     let src_mass_new = (updated.mass.get(src_cell) - transfer).max(0.0);
     updated.mass.set(src_cell, src_mass_new);
     // —— 来源格病菌减少（原版 L1568-1580）——
-    modify_disease_count(updated, src_cell, -actual_disease);
+    modify_disease_count(updated, src_cell, -disease_to_transfer);
     // —— 元素段（原版 L1581-1608）：仅接收格非真空才产生事件 ——
     if bvar12 != 0 {
         return f18; // 接收格已是气体/液体/固体：不改变元素、不产生事件（原版 L1581-1583）
@@ -4396,6 +4374,43 @@ mod tests {
         DestroyElementsTable();
     }
 
+    #[test]
+    fn update_pressure_clean_replenishment_keeps_disease() {
+        // 2026-08-06 孢子兰"补充质量删病菌"端到端回归：
+        // 高压干净气体补充进带菌低压格 → 质量流入、病菌保留（原版 L26178）。
+        // 此前 add_disease_to_cell(0xff,0) 走替换 → 病菌被清空（用户实测）。
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0); // 高压干净气体
+                buf.temperature.set(14, 300.0);
+                buf.disease_idx.set(14, 0xff);
+                buf.disease_count.set(14, 0);
+                buf.element_idx.set(13, 1);
+                buf.mass.set(13, 2.0); // 低压带菌格（孢子兰判定格）
+                buf.temperature.set(13, 300.0);
+                buf.disease_idx.set(13, 0x05);
+                buf.disease_count.set(13, 1000);
+            }
+        }
+        let r = update_pressure(&mut sd, 14, 13);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert!(r > 0.0, "干净高压气体应流入带菌格，r={}", r);
+            assert!(updated.mass.get(13) > 2.0, "带菌格应收到补充质量");
+            assert_eq!(
+                updated.disease_count.get(13),
+                1000,
+                "干净补充质量不清除带菌格病菌"
+            );
+            assert_eq!(updated.disease_idx.get(13), 0x05, "病菌 idx 保留");
+        }
+        DestroyElementsTable();
+    }
+
     /// 自建 3 元素压力表：0=真空、1=液体(state=2, flow=50)、2=气体(state=1, flow=0.12)。
     fn create_pressure_gas_table() {
         let mut w = BinaryBufferWriter::new();
@@ -5967,6 +5982,32 @@ mod tests {
             add_disease_to_cell(cells, 0, 1, 42);
             assert_eq!(cells.disease_idx.get(0), 1);
             assert_eq!(cells.disease_count.get(0), 42);
+        }
+        uninstall_disease_table();
+    }
+
+    #[test]
+    fn add_disease_to_cell_clean_inflow_keeps_current() {
+        // 原版 L26178 逗号表达式：bVar1 != 0xff 时先"保留当前"(iVar9=iVar6, bVar7=bVar1)，
+        // 再判 param_3 != 0xff —— 干净质量（0xff,0）流入已有病菌格 → 保留当前病菌。
+        // 2026-08-06 孢子兰"补充质量删病菌"根因：此前输入 0xff 走替换 → 病菌被清空。
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        install_disease_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            cells.disease_idx.set(0, 0);
+            cells.disease_count.set(0, 1000);
+            cells.disease_infestation_tick_count.set(0, 5);
+            // 干净质量流入（如无病菌气体补充进已带菌格）
+            add_disease_to_cell(cells, 0, 0xff, 0);
+            assert_eq!(cells.disease_idx.get(0), 0, "干净输入不覆盖当前病菌 idx");
+            assert_eq!(cells.disease_count.get(0), 1000, "干净输入不清除当前病菌");
+            assert_eq!(
+                cells.disease_infestation_tick_count.get(0),
+                5,
+                "idx 未变化 → infestation 不清零"
+            );
         }
         uninstall_disease_table();
     }
