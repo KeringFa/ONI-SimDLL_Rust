@@ -648,4 +648,116 @@ mod tests {
             "45000 帧时上半区 CO2 应归零（全部沉底），趋势={trend:?}"
         );
     }
+
+    /// 回归（2026-08-06 气体纹理根因）：原版 Sim::Main 在 BeginFrameProcessing 后
+    /// **每帧 memset 清零 flow**（帧内增量累加器，08_sim_frame_manager.c L2118-2119）；
+    /// C# Property.Flow 以 0.25/帧混合衰减 → 平衡后动画静止。
+    /// 此前项目缺该清零 → flow 累积历史总量，平衡后 raw 纹理仍 ~30.6，动画永不停止。
+    ///
+    /// 复现：密封房间 100kg 气体（pressure flow=0.1 真实值）扩散至平衡。
+    /// 每帧按 sim_main_loop 顺序 clear_flow → copy → 翻转 iterateDir → 气体任务 →
+    /// copy；断言平衡后 raw flow 纹理趋近 0（不再有历史累积）。
+    #[test]
+    fn flow_texture_returns_to_rest_when_cleared_each_frame() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 表：0=真空(state0)、1=气体(state1, flow=0.1 真实值)、3=固体
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            table.elements.clear();
+            table.element_names.clear();
+            table.state_data.clear();
+            table.liquid_data.clear();
+            table.pressure_data.clear();
+            table.post_process_data.clear();
+            table.temperature_data.clear();
+            for (id, state, flow) in [(0i32, 0u8, 0.0f32), (1i32, 1u8, 0.1f32), (3i32, 3u8, 0.0f32)] {
+                let mut elem = Element::default();
+                elem.id = id;
+                elem.state = state;
+                elem.flow = flow;
+                table.elements.push(elem);
+                table.state_data.push(ElementStateData { state });
+                table.liquid_data.push(crate::b_elements::element::ElementLiquidData {
+                    state,
+                    flow,
+                    viscosity: 50.0,
+                    max_mass: 1000.0,
+                    ..Default::default()
+                });
+                table.pressure_data.push(ElementPressureData { state, flow });
+                table.post_process_data.push(crate::b_elements::element::ElementPostProcessData {
+                    state,
+                    ..Default::default()
+                });
+            }
+            table.element_indices.insert(0u32, 0u16);
+            table.element_indices.insert(1u32, 1u16);
+            table.element_indices.insert(3u32, 3u16);
+        }
+
+        let mut sd = SimData::new_for_allocate(14, 10, 12345, false, true);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        let w = sd.width as usize;
+        let h = sd.height as usize;
+        let src = 3 * w + 3; // 内部 (3,3)，100kg
+        fill_both(&mut sd, |b| {
+            for y in 0..h {
+                for x in 0..w {
+                    let c = y * w + x;
+                    if y == 0 || y == h - 1 || x == 0 || x == w - 1 {
+                        b.element_idx.set(c, 3); // 固体边界
+                        b.mass.set(c, 1000.0);
+                        b.temperature.set(c, 300.0);
+                    } else {
+                        b.element_idx.set(c, 0); // 真空
+                        b.temperature.set(c, 300.0);
+                    }
+                }
+            }
+            b.element_idx.set(src, 1);
+            b.mass.set(src, 100.0);
+        });
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+
+        let mut last = 0usize;
+        let mut raw_max = 0.0f32;
+        for frame in 1..=20000usize {
+            // sim_main_loop 帧序（对照原版 Sim::Main）：清 flow → 处理帧 → 拷贝
+            crate::c_simulation::sim_data_ops::clear_flow(&mut sd);
+            unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
+            sd.iterate_direction = -sd.iterate_direction;
+            crate::c2_physics::gas_flow::run_gas_pressure_task(&mut sd, b);
+            crate::c2_physics::gas_flow::run_gas_displacement_task(&mut sd, b);
+            unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
+
+            raw_max = unsafe {
+                let flow = std::slice::from_raw_parts(sd.flow.ptr, w * h);
+                let u = &*sd.updated_cells.ptr;
+                let mut rmax = 0.0f32;
+                for y in 1..h - 1 {
+                    for x in 1..w - 1 {
+                        let c = y * w + x;
+                        if u.element_idx.get(c) != 1 {
+                            continue;
+                        }
+                        let inv = 1.0 / u.mass.get(c).max(1.0);
+                        let f = flow[c];
+                        rmax = rmax
+                            .max(((f.x - f.y) * inv).abs())
+                            .max(((f.w - f.z) * inv).abs());
+                    }
+                }
+                rmax
+            };
+            last = frame;
+        }
+        assert!(last == 20000, "应跑到 20000 帧");
+        // 每帧清零后，flow 只含当前帧增量；平衡时增量 ≈ 0 → 纹理趋零。
+        // 修复前（无清零）此值 = 30.6（历史累积总量）。
+        assert!(
+            raw_max < 0.05,
+            "平衡后 raw flow 纹理应趋近 0（每帧清零增量），got {raw_max}"
+        );
+    }
 }

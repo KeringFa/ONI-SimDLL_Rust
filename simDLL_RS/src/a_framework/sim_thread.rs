@@ -118,6 +118,15 @@ pub fn sim_main_loop(sim_ptr: *mut Sim) {
         // 对照源码 L2118
         let active_frame_count = unsafe { (*frame_manager_ptr).begin_frame_processing() };
 
+        // 5b. 帧开始清零 flow（对照原版 Sim::Main L2119 的 memset）：
+        //     flow 是"帧内增量累加器"——本帧所有子步的转移量累加后由
+        //     CopySimDataToGame 拷给 C#（Property.Flow 25%/帧混合衰减）。
+        //     缺失此清零 → flow 累积历史总量 → 平衡后动画永不停止
+        //     （2026-08-06 气体纹理根因，回归测试 flow_texture_returns_to_rest_when_cleared_each_frame）。
+        if !sim_data_ptr.is_null() {
+            unsafe { sim_data_ops::clear_flow(&mut *sim_data_ptr); }
+        }
+
         // 6. 处理帧
         // 对照源码 L2121-2156
         if active_frame_count < 1 {

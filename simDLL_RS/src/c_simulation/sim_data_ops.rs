@@ -96,6 +96,28 @@ pub fn copy_updated_cells_to_cells(sim_data: &mut SimData) {
     cells.copy_from(updated_cells);
 }
 
+/// 清零整张 flow 数组（Vector4f × width×height，含边界）。
+///
+/// 对照源码 Sim::Main（SimDLL_Source.c L2119）：`BeginFrameProcessing` 之后、
+/// 帧循环之前有 `memset()`——每帧清零 flow，使 flow 成为**帧内增量累加器**。
+/// C# Property.Flow（blend=0.25）把显示值逐帧拉向 raw：扩散中增量非零 → 动画；
+/// 平衡后增量 ≈ 0 → 显示值指数衰减至静止。此前项目缺失此清零，flow 累积历史
+/// 总量（平衡后 raw 纹理 ~30.6），C# 混合收敛到 30.6 → 动画永不停止。
+///
+/// 物理阶段只写 flow（update_liquid / run_pressure_task / gas_flow），不读它做
+/// 决策，故每帧清零对物理零副作用，仅影响纹理。
+pub fn clear_flow(sim_data: &mut SimData) {
+    if sim_data.flow.ptr.is_null() {
+        return;
+    }
+    let total = sim_data.width as usize * sim_data.height as usize;
+    if total == 0 {
+        return;
+    }
+    let flow = unsafe { std::slice::from_raw_parts_mut(sim_data.flow.ptr, total) };
+    flow.fill(crate::a_framework::vector_math::Vector4f::default());
+}
+
 /// SimBase::CopySimDataToGame：将 SimData 拷贝到 GameData。
 ///
 /// 对照源码 11_msvcrt_ignored.c L31168-32200。
@@ -676,6 +698,32 @@ mod tests {
         assert!((dst[0].w - 4.0).abs() < 1e-6, "game[0,0].w 应为 4.0");
         assert!((dst[6].y - 6.0).abs() < 1e-6, "game[1,2].y 应为 6.0");
         assert_eq!(dst[3].x, 0.0, "game 边界行（sim 边界格 9.0）不应被拷贝");
+    }
+
+    /// 2026-08-06 气体纹理根因：Sim::Main 每帧清零 flow（帧内增量累加器）。
+    /// 整张数组（含边界）清为 Vector4f::default()，物理只写不读 flow，零副作用。
+    #[test]
+    fn clear_flow_zeroes_entire_array() {
+        let mut sd = make_test_sim_data();
+        // 分配 flow（36 格 Vector4f）
+        let flow_vec: Vec<crate::a_framework::vector_math::Vector4f> =
+            vec![crate::a_framework::vector_math::Vector4f::default(); 36];
+        sd.flow = UniquePtr { ptr: flow_vec.leak().as_mut_ptr() };
+        unsafe {
+            let src = std::slice::from_raw_parts_mut(sd.flow.ptr, 36);
+            for v in src.iter_mut() {
+                *v = crate::a_framework::vector_math::Vector4f {
+                    x: 1.0, y: 2.0, z: 3.0, w: 4.0,
+                };
+            }
+        }
+        clear_flow(&mut sd);
+        unsafe {
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 36);
+            for v in flow {
+                assert_eq!(*v, crate::a_framework::vector_math::Vector4f::default());
+            }
+        }
     }
 
     /// 验证 accumulated_flow 的 15 帧清零窗口（原版 CopySimDataToGame 局部静态
