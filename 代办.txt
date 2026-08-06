@@ -1118,46 +1118,42 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
   病菌数据 + Grid 病菌）；若日后做病菌全量回归，注意 RadiationSickness 为 DLC
   专属病菌（单星存档无此表项 → 贡献自动跳过）。
 
-## [已修复] 孢子兰病菌被气体流动销毁（2026-08-06 用户实测定位）
+## [已修复·终版] 孢子兰病菌丢失根因：AddDiseaseToCell 干净流入清病菌（2026-08-06 b8f1076）
 
-- **现象**：孢子兰（DiseaseDropper → CellDiseaseModification）每秒发射 1000
-  僵尸孢子病菌，但 before_count 恒 0（病菌 1 秒内被清空）；日志显示孢子兰格
-  被 clear_disease 清除（count=0）且邻格被扣成**负数**（d_idx=255 count=-13/-29…）。
-- **用户关键实测**：环境气体**不流动（气压稳定）时病菌正常传播** → 问题锁定在
-  气体流动对病菌的处理，与生长/扩散无关。
-- **根因**：update_pressure / DoGasPressureDisplacement 的病菌转移——同一子步内
-  源格因本格 + 多邻格迭代被多次调用，每次从 `cells`（稳定缓冲）读计数、从
-  `updated` 扣减；源格病菌已被抽走后继续扣 → **负数 → ClearDisease 销毁**。
-  质量侧已 clamp（max(0)），病菌侧未钳制（原版亦不钳制，但依赖其结构天然同步；
-  本项目复现 75%/子步抽干 + 多邻格过扣）。
-- **修复（2026-08-06，liquid_flow.rs + gas_flow.rs）**：病菌转移量钳制到源格
-  `updated` 实际剩余——`actual = min(disease_to_transfer, updated剩余)`，
-  接收格只收源格实际有的量（净零，不凭空产生/销毁），源格不再被扣成负数。
-- **测试**：`update_pressure_clamps_disease_transfer_to_remaining`（源格 updated
-  只剩 100、cells 计数 1000 → 目标只收 100、源格清零清除而非 -25）；全量 543
-  测试串行全过；release 构建成功。
-- **待实测**：部署 → 孢子兰在流动 CO2 中病菌应持续可见（不再被清空）；
-  回归液体/气体流动无差异（病菌只是随质量比例移动）。
+- **现象**：孢子兰（DiseaseDropper → CellDiseaseModification）每秒 +1000 / 拔除
+  +100000 僵尸孢子病菌，病菌 1 秒内消失；气压稳定环境正常、流动/持续补充环境丢失。
+- **弯路记录（两轮非原版修复，均已撤销）**：cdab65b 病菌转移钳制、
+  9f9a9f7 气体压力不携带病菌——用户判定非原版，逐项对照原版
+  update_pressure（L147500）/DoGasPressureDisplacement（L147342）后确认
+  "病菌随气体质量流动"本身就是原版语义，两轮改动全部还原。
+- **用户关键实测（定位）**：孢子兰格**高压→低压（无补充）病菌正常扩散**；
+  孢子兰格**被持续补充干净 CO2 时病菌被清** → 问题不在流动携带，而在
+  "干净质量流入带菌格"的病菌合并逻辑。
+- **最终根因**：`add_disease_to_cell`（Disease::AddDiseaseToCell 移植）对输入
+  `disease_idx==0xff`（干净质量）走"替换"分支 → 把带菌格清空。原版
+  L26178 逗号表达式：格内已有真实病菌时**先"保留当前"**（iVar9=iVar6,
+  bVar7=bVar1）再判 `param_3!=0xff` → 干净质量流入带菌格**不清除**病菌。
+- **修复（b8f1076）**：恢复原版"先保留当前"语义；回归测试
+  `add_disease_to_cell_clean_inflow_keeps_current`（单元）、
+  `update_pressure_clean_replenishment_keeps_disease`（update_pressure 端到端）、
+  `zombie_spores_100k_burst_survives_update_data`（拔除爆发集成）。
+- **验证**：用户实测植物病菌扩散至气体恢复正常；全量 493 lib + 53 集成测试
+  串行全过；release 构建成功。
 - **另**：用户提示"气体纹理 5kg/格、扩散千层饼"为独立长期问题，尚未定位
-  （可能为高气压存档正常表现或流动渲染差异），待病菌修复验证后再查。
+  （可能为高气压存档正常表现或流动渲染差异），留待病菌模块审查后复查。
 
-## [已修复·二轮] 孢子兰在流动气体中病菌被稀释（2026-08-06）
+## [已完成] 病菌模块全量对照审查（2026-08-06 内联）
 
-- **现象**：钳制修复后孢子兰格不再被销毁（位置 97754 病菌累积正常），但在
-  流动气体区（97753）before_count 仍恒 0——气体压力均衡每子步 12.5%×多邻格
-  迭代把病菌持续带走（稀释至不可见），扩散阈值 5100 永远达不到 → 不扩散。
-- **验证**：原版 update_pressure/DoGasPressureDisplacement 的转移公式、调用
-  次数（3 压力 + 4 置换）、真空格进循环、flow 系数（CO2=0.1）、子步率
-  （C# 0.2s tick → 5/s）、元素表/存档质量解析全部逐项核对**忠实**；用户
-  实测"气压稳定时病菌正常传播"证明病菌扩散模块本身正常。
-- **修复（2026-08-06，liquid_flow.rs）**：压力均衡的病菌携带**仅保留给液体
-  驱动**（cell_state==2）——气体压力只均衡质量/温度，病菌在气体中的扩散由
-  独立病菌扩散模块（UpdateCells）负责。理由：原版字面代码对气体压力同样转移，
-  但用户实测该行为会把孢子兰病菌稀释消失（与扩散机制冲突）；液体压力保持
-  原版病菌转移（液体 off-gassing 带菌是设计行为）。
-- **测试**：`gas_pressure_does_not_transfer_disease`（气体压力质量流动但病菌
-  保留）；`update_pressure_clamps_disease_transfer_to_remaining` 改用液体源格
-  验证钳制仍生效；全量 544 测试串行全过；release 构建成功。
-- **待实测**：部署 → 孢子兰在流动 CO2 中病菌应堆积并扩散（不再是 0）；
-  回归液体/气体流动（质量/温度行为不变，仅病菌携带口径调整）。
+- 审查报告：.superpowers/sdd/review-disease.md
+- **结论：可以继续**——唯一 Critical（AddDiseaseToCell 干净流入清病菌）已在
+  b8f1076 修复并实测确认（植物病菌扩散至气体恢复正常）；其余核对通过。
+- 核对通过：AddDiseaseToCell 各分支（修复后）、ModifyDiseaseCount/ClearDisease、
+  from_stream 字段顺序（C# ElemGrowthInfo.Write 逐字节一致）、GetDiffusionScale/
+  UpdateCells/PostProcess、扩散区域循环门控、CellDiseaseModification 逐行、
+  ConsumeDisease 16B、DiseaseEmitter（正负 emitCount/emittedInfo 8B）、
+  DiseaseEmittedInfo/DiseaseConsumedCallback 布局、辐射病菌贡献（+count×0.001）、
+  update_data 挂接顺序、copy_sim_data_to_game 病菌字段、跨模块调用方统一语义。
+- 全量 493 lib + 53 集成测试串行全过；release 构建成功。
+- **下一步建议**：气体纹理"5kg/格、扩散千层饼"独立问题复查；或推进后续模块
+  （ElementEmitter 本体 / 升华 / 光照 / 辐射之后的气体模拟等）。
 
