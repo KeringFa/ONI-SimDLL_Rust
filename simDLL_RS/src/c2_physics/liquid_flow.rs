@@ -708,19 +708,28 @@ pub fn update_liquid(sim: &mut crate::a_framework::sim_data::SimData, cell: usiz
                 None => 0xFF,
             };
             if br_state == 1 {
+                // 原版 L1139-1145：right（cell+1）非固体且可渗透(bit0==0) → 放弃右下
+                //（与左下分支检查 left 对称；2026-08-06 修正：此前误用 below 导致
+                // 镜像布局（气体在右下对角）不触发）
+                let right = cell + 1;
+                let right_state = match elements_table::get_element_liquid_data(
+                    updated.element_idx.get(right),
+                ) {
+                    Some(d) => d.state & 3,
+                    None => 0xFF,
+                };
+                let mut ok = true;
+                if right_state != 3 {
+                    if updated.properties.get(right) & 1 == 0 {
+                        ok = false;
+                    }
+                }
                 let below_state = match elements_table::get_element_liquid_data(
                     updated.element_idx.get(below),
                 ) {
                     Some(d) => d.state & 3,
                     None => 0xFF,
                 };
-                let mut ok = true;
-                // 原版 L1139-1145：below 非固体且可渗透(bit0==0) → 放弃右下
-                if below_state != 3 {
-                    if updated.properties.get(below) & 1 == 0 {
-                        ok = false;
-                    }
-                }
                 if ok && below_state == 3 {
                     ok = false; // 原版 L1146：below 固体 → 放弃右下
                 }
@@ -4566,6 +4575,46 @@ mod tests {
             let updated = &*sd.updated_cells.ptr;
             assert_eq!(updated.element_idx.get(7), 3, "气1 应保持原位 7（无液2 执行换位）");
             assert_eq!(updated.element_idx.get(14), 0, "14 保持真空");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 镜像布局：气体在液2 的**右下对角**（(3,1)=9），液1(2,1)=8、液2(2,2)=14、
+    /// 砖块(3,2)=15，三格砖封。阶段 E 右下分支（cell−width+1）应与左下分支对称触发。
+    #[test]
+    fn diagonal_swap_mirror_below_right_gas() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_displacement_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(9, 3); // (3,1) 气1（液2 右下对角）
+                buf.mass.set(9, 1.0);
+                buf.temperature.set(9, 250.0);
+                buf.element_idx.set(8, 1); // (2,1) 液1
+                buf.mass.set(8, 1000.0);
+                buf.temperature.set(8, 300.0);
+                buf.element_idx.set(14, 1); // (2,2) 液2
+                buf.mass.set(14, 300.0);
+                buf.temperature.set(14, 300.0);
+                // 砖封：气1 上(15)/右(10)/下(3)；液1 左(7)/下(2)；液2 左(13)/右(15)/上(20)
+                for c in [15usize, 10, 3, 7, 2, 13, 20, 0, 1, 6, 16, 21, 19] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                    buf.temperature.set(c, 300.0);
+                }
+            }
+        }
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        for _ in 0..5 {
+            crate::c2_physics::update_data(&mut sd);
+        }
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 3, "气1 应换位到 14（液2 原位）");
+            assert_eq!(updated.element_idx.get(9), 1, "液2 应换位到 9（气1 原位）");
+            assert_eq!(updated.element_idx.get(8), 1, "液1 不动");
         }
         DestroyElementsTable();
     }
