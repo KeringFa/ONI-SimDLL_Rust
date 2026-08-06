@@ -4050,6 +4050,112 @@ mod tests {
         DestroyElementsTable();
     }
 
+    /// 复现（2026-08-06 用户实测）：密封竖井 [气1 下][液1 中][液2 上]（同元素液体），
+    /// 恢复运行时气体应被**传送**到液2位置（原版 update_liquid 分支 3b SwapCells
+    /// 级联，跨两帧：帧1 液1↔气1 交换（气体升到中部）；帧2 液2↔气体 交换
+    /// （气体升到顶部=液2原位）。分支判定读 cells 稳定快照，故单帧内不级联）。
+    /// 布局（6×5，+width=上）：
+    ///   row3: [19 固] [20 液2] [21 固]
+    ///   row2: [13 固] [14 液1] [15 固]
+    ///   row1: [ 7 固] [ 8 气1] [ 9 固]
+    ///   row0: [     ] [ 2 固] [    ]
+    #[test]
+    fn enclosed_vertical_shaft_gas_teleports_to_top() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_displacement_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                // 竖井液体柱：8=气体、14=液1、20=液2
+                buf.element_idx.set(8, 3);
+                buf.mass.set(8, 10.0);
+                buf.temperature.set(8, 250.0);
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 100.0);
+                buf.temperature.set(20, 300.0);
+                // 砖块封闭：左右侧 + 井底
+                for c in [7usize, 9, 13, 15, 19, 21, 2] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                    buf.temperature.set(c, 300.0);
+                }
+            }
+        }
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        // 帧 1：液1↔气1 交换
+        update_liquid_loop(&mut sd, b);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 3, "帧1后气体应在中部 14");
+            assert_eq!(updated.element_idx.get(8), 1, "帧1后底部应为液体");
+        }
+        // 同步双缓冲后进入帧 2：液2↔气体 交换
+        unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
+        update_liquid_loop(&mut sd, b);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(
+                updated.element_idx.get(20),
+                3,
+                "气体应被传送到顶部液2位置 20"
+            );
+            assert_eq!(updated.element_idx.get(14), 1, "中部应为液体");
+            assert_eq!(updated.element_idx.get(8), 1, "底部应为液体");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 用户字面布局（水平相邻）：气1 在 (1,1)，液1 在其右边 (1,2)，液2 在液1上方
+    /// (2,2)，三格被砖块封闭。多帧运行后检查气体是否移动（记录实际行为，便于
+    /// 与原版对照——水平布局下 displace_gas 对角目标=液2 非气体，应挤不动）。
+    #[test]
+    fn horizontal_gas_liquid_corner_enclosed_behavior() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_displacement_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(7, 3); // (1,1) 气1
+                buf.mass.set(7, 10.0);
+                buf.temperature.set(7, 250.0);
+                buf.element_idx.set(8, 1); // (1,2) 液1
+                buf.mass.set(8, 100.0);
+                buf.temperature.set(8, 300.0);
+                buf.element_idx.set(14, 1); // (2,2) 液2（液1 上方，同元素）
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                // 封闭砖块：气1 上/左/下，液1 上/下，液2 左/右/上
+                for c in [13usize, 15, 9, 3, 2, 1, 6, 12] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                    buf.temperature.set(c, 300.0);
+                }
+            }
+        }
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        for _ in 0..20 {
+            update_liquid_loop(&mut sd, b);
+            unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
+        }
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            let gas_at = (0..30)
+                .filter(|&c| updated.element_idx.get(c) == 3)
+                .collect::<Vec<_>>();
+            eprintln!("horizontal corner: gas cells after 20 frames = {gas_at:?}");
+            assert!(
+                gas_at.len() == 1 && gas_at[0] == 7,
+                "字面水平布局下气体应仍在原位 7（displace_gas 对角目标为液体，挤不动）；got {gas_at:?}"
+            );
+        }
+        DestroyElementsTable();
+    }
+
     /// 下落压缩修复（2026-08-02）：fVar22 = max(mass×1.01, max_mass) - below_mass。
     /// ① 上层 100 → 下层 990：f22 = max(101,1000)-990 = 10 → f23 = min(min(100,50),5) = 5
     ///    （下层逐步逼近满格 1000，而非 0.1kg 滴漏）。
