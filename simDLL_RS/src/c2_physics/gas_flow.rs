@@ -327,15 +327,22 @@ pub(crate) fn do_gas_pressure_displacement(
     let disease_transfer = (src_disease_count as f32 * GAS_FLOW_RATE) as i32;
     if disease_transfer > 0 {
         let src_disease_idx = cells.disease_idx.get(src);
+        // 2026-08-06 修复（与 update_pressure 同款）：钳制到源格 updated 实际剩余，
+        // 防止多邻格迭代把源格病菌扣成负数/凭空产生（质量侧已 clamp）。
+        let remaining = updated.disease_count.get(src);
+        let actual = disease_transfer.min(remaining);
+        if actual <= 0 {
+            return flow;
+        }
         crate::c2_physics::liquid_flow::add_disease_to_cell(
             updated,
             dst,
             src_disease_idx,
-            disease_transfer,
+            actual,
         );
         updated.disease_count.set(
             src,
-            (updated.disease_count.get(src) - disease_transfer).max(0),
+            (updated.disease_count.get(src) - actual).max(0),
         );
     }
     flow

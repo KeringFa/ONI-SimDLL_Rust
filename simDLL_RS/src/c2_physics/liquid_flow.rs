@@ -887,6 +887,19 @@ fn modify_disease_count(cells: &mut CellSOA, cell: usize, delta: i32) {
 
 /// CellSOA::ClearDisease（原版 11_msvcrt_ignored.c L43186-43214）。
 pub(crate) fn clear_disease(cells: &mut CellSOA, cell: usize) {
+    // 诊断（2026-08-05 孢子兰病菌丢失）：仅当该格确实携带病菌（idx≠0xff 或 count≠0）
+    // 被清除时记录——定位清除者（PostProcess 第二遍 / 气体液体流动 / 消费等）。
+    let d_idx = cells.disease_idx.get(cell);
+    let count = cells.disease_count.get(cell);
+    if d_idx != 0xFF || count != 0 {
+        tracing::warn!(
+            cell,
+            d_idx,
+            count,
+            tick = cells.disease_infestation_tick_count.get(cell),
+            "clear_disease: clearing diseased cell"
+        );
+    }
     cells.disease_idx.set(cell, 0xFF);
     cells.disease_count.set(cell, 0);
     cells.disease_infestation_tick_count.set(cell, 0);
@@ -1124,12 +1137,25 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
     let src_disease_idx = updated.disease_idx.get(src_cell);
     let src_temp = updated.temperature.get(src_cell);
     // —— 接收格质量/温度/病菌（原版 L1519-1556，复用质量加权混合）——
-    add_mass_and_update_temperature(updated, dst_cell, transfer, src_temp, src_disease_idx, disease_to_transfer);
+    // 2026-08-06 修复（孢子兰病菌被气体流动销毁）：病菌转移量钳制到源格 updated
+    // **实际剩余**。原版同一子步内源格会因本格 + 多邻格迭代被多次调用，每次从
+    // cells（稳定缓冲）读计数、从 updated 扣减——若源格病菌已被抽走，扣减会为负
+    // → ClearDisease 销毁病菌（用户实测：气压稳定时病菌正常、流动时被清空）。
+    // 质量侧已 clamp（max(0)），病菌同样按实际可转移量移动（净零，不凭空产生/销毁）。
+    let actual_disease = disease_to_transfer.min(updated.disease_count.get(src_cell));
+    add_mass_and_update_temperature(
+        updated,
+        dst_cell,
+        transfer,
+        src_temp,
+        src_disease_idx,
+        actual_disease,
+    );
     // —— 来源格质量减少（原版 L1559-1567，clamp >= 0）——
     let src_mass_new = (updated.mass.get(src_cell) - transfer).max(0.0);
     updated.mass.set(src_cell, src_mass_new);
     // —— 来源格病菌减少（原版 L1568-1580）——
-    modify_disease_count(updated, src_cell, -disease_to_transfer);
+    modify_disease_count(updated, src_cell, -actual_disease);
     // —— 元素段（原版 L1581-1608）：仅接收格非真空才产生事件 ——
     if bvar12 != 0 {
         return f18; // 接收格已是气体/液体/固体：不改变元素、不产生事件（原版 L1581-1583）

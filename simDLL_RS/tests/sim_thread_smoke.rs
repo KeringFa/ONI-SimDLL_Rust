@@ -322,3 +322,63 @@ fn update_data_frame_writes_flow_buffer() {
     }
     SIM_Shutdown();
 }
+
+/// 回归测试（2026-08-05，孢子兰病菌发射）：CellDiseaseModification 消息
+/// 必须经帧生命周期（handle_message emplace → NewGameFrame 入队 → sim 线程
+/// process_frame 步骤 8）把病菌写入 updated_cells——C# DiseaseDropper（EvilFlower
+/// 等）走 SimMessages.ModifyDiseaseOnCell 就是这条链路。
+#[test]
+fn cell_disease_modification_reaches_updated_cells() {
+    let _guard = SIM_THREAD_LOCK.lock().unwrap();
+    do_full_init(4, 4);
+
+    // CellDiseaseModification 12B：gameCell=0 → simCell=7（width=6, game_w=4）
+    let mut msg = Vec::with_capacity(12);
+    msg.extend_from_slice(&0i32.to_le_bytes()); // cellIdx
+    msg.push(3u8); // diseaseIdx
+    msg.push(0u8);
+    msg.push(0u8);
+    msg.push(0u8);
+    msg.extend_from_slice(&1000i32.to_le_bytes()); // diseaseCount
+    let result = SIM_HandleMessage(
+        MessageType::CellDiseaseModification as c_int,
+        msg.len() as c_int,
+        msg.as_ptr() as *mut c_schar,
+    );
+    let _ = result;
+
+    // NewGameFrame（elapsed=0.2）→ 入队 → PrepareGameData 唤醒 sim 线程处理
+    let mut frame_msg = Vec::with_capacity(28);
+    frame_msg.extend_from_slice(&0.2f32.to_le_bytes());
+    frame_msg.extend_from_slice(&0i32.to_le_bytes());
+    frame_msg.extend_from_slice(&0i32.to_le_bytes());
+    frame_msg.extend_from_slice(&0i32.to_le_bytes());
+    frame_msg.extend_from_slice(&0i32.to_le_bytes());
+    frame_msg.extend_from_slice(&0.0f32.to_le_bytes());
+    frame_msg.extend_from_slice(&0.0f32.to_le_bytes());
+    let _ = SIM_HandleMessage(
+        MessageType::SimFrameManager_NewGameFrame as c_int,
+        frame_msg.len() as c_int,
+        frame_msg.as_ptr() as *mut c_schar,
+    );
+    let gdu = SIM_HandleMessage(MessageType::PrepareGameData as c_int, 0, std::ptr::null_mut());
+    assert!(!gdu.is_null(), "first PrepareGameData should return GDU");
+    let gdu2 = SIM_HandleMessage(MessageType::PrepareGameData as c_int, 0, std::ptr::null_mut());
+    assert!(!gdu2.is_null(), "second PrepareGameData should return GDU");
+
+    // updated_cells[7] 应已写入病菌（1000 @ idx 3）
+    let ptr = SimDLL::globals::G_SIM_DATA.lock().0;
+    assert!(!ptr.is_null());
+    unsafe {
+        let sd = &*ptr;
+        let updated = &*sd.updated_cells.ptr;
+        assert_eq!(
+            updated.disease_count.get(7),
+            1000,
+            "CellDiseaseModification 应写入 updated_cells[7]"
+        );
+        assert_eq!(updated.disease_idx.get(7), 3);
+    }
+
+    SIM_Shutdown();
+}

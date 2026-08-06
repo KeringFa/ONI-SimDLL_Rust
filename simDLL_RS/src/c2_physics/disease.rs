@@ -297,9 +297,8 @@ fn post_process_cell(
     }
     let trunc = f25.trunc();
     updated.disease_growth_accumulated_error.set(cell, f25 - trunc);
-    updated
-        .disease_count
-        .set(cell, updated.disease_count.get(cell) + trunc as i32);
+    let new_count = updated.disease_count.get(cell) + trunc as i32;
+    updated.disease_count.set(cell, new_count);
 }
 
 /// PostProcess 区域循环（原版 L26424-26640，两遍）。
@@ -340,6 +339,8 @@ pub(crate) fn run_disease_growth_task(sim: &mut SimData, bounds: RegionBounds) {
                     continue;
                 }
                 if updated.disease_count.get(cell) < 1 {
+                    // 注意：此分支对全图 count<1 的无病菌格每子步都触发；
+                    // 日志已移入 clear_disease（仅真病菌清除才记录），避免刷屏。
                     updated.disease_idx.set(cell, 0xff);
                     updated.disease_count.set(cell, 0);
                     updated.disease_infestation_tick_count.set(cell, 0);

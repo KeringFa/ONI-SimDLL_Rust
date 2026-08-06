@@ -595,6 +595,13 @@ pub(crate) fn process_cell_disease_modifications(frame: &mut SimFrameInfo, sim: 
     let width = sim.width as i32;
     let game_w = width - 2;
     let bytes = frame.cell_disease_modifications.as_slice();
+    if !bytes.is_empty() {
+        tracing::info!(
+            msg_count = bytes.len() / 12,
+            width,
+            "process_cell_disease_modifications: processing"
+        );
+    }
     let mut off = 0usize;
     while off + 12 <= bytes.len() {
         let cell_idx = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
@@ -603,12 +610,27 @@ pub(crate) fn process_cell_disease_modifications(frame: &mut SimFrameInfo, sim: 
         off += 12;
         let sim_cell = (cell_idx / game_w + 1) * width + cell_idx % game_w + 1;
         if sim.updated_cells.ptr.is_null() {
+            tracing::warn!(cell_idx, "cell disease mod: updated_cells null");
             continue;
         }
         let updated = unsafe { &mut *sim.updated_cells.ptr };
         if (sim_cell as usize) >= updated.disease_count.len() {
+            tracing::warn!(
+                cell_idx,
+                sim_cell,
+                len = updated.disease_count.len(),
+                "cell disease mod: sim_cell out of bounds"
+            );
             continue;
         }
+        tracing::info!(
+            cell_idx,
+            sim_cell,
+            disease_idx,
+            disease_count,
+            before_count = updated.disease_count.get(sim_cell as usize),
+            "cell disease mod: applying"
+        );
         if disease_idx == 0xff {
             updated
                 .disease_count
@@ -1173,6 +1195,138 @@ mod tests {
             assert_eq!(u.disease_infestation_tick_count.get(7), 1, "生长第二遍 tick+1");
         }
         clear_disease_emitters();
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    // ===== 2026-08-06：气体流动病菌过扣修复 =====
+
+    /// 4 元素表：0=真空、1=氧气(气体,flow=1.0)、2=CO2(气体,flow=1.0)、3=固体。
+    fn create_gas_table() {
+        use crate::b_elements::element::{
+            ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData,
+        };
+        let mut table =
+            crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        table.elements.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        table.radiation_data.clear();
+        table.property_texture_data.clear();
+        for (id, state, flow) in [(0i32, 0u8, 1.0f32), (1, 1, 1.0), (2, 1, 1.0), (3, 3, 0.0)] {
+            let mut e = Element::default();
+            e.id = id;
+            e.state = state;
+            e.low_temp = -273.0;
+            e.high_temp = 1000.0;
+            table.elements.push(e);
+            table.state_data.push(ElementStateData { state });
+            table.liquid_data.push(ElementLiquidData { state, ..Default::default() });
+            table.pressure_data.push(ElementPressureData { state, flow });
+            table.post_process_data.push(ElementPostProcessData { state, ..Default::default() });
+            table.temperature_data.push(Default::default());
+            table.radiation_data.push(Default::default());
+            table.property_texture_data.push(Default::default());
+        }
+        table.element_indices.insert(0, 0);
+        table.element_indices.insert(1, 1);
+        table.element_indices.insert(2, 2);
+        table.element_indices.insert(3, 3);
+    }
+
+    /// ZombieSpores 式病菌表：idx0（ZombieSpores），CO2 生长恒 0、minDiffusionCount=5100。
+    fn install_zombie_table() {
+        use crate::b_elements::disease::{Disease, DiseaseInfo, ElemGrowthInfo, RangeInfo};
+        let mut t = Disease::new();
+        let mut eg = ElemGrowthInfo::default();
+        eg.diffusion_scale.resize(4, 0.005);
+        eg.min_diffusion_count.resize(4, 5100);
+        eg.min_diffusion_infestation_tick_count.resize(4, 1);
+        eg.min_count_per_kg.resize(4, 250.0);
+        eg.max_count_per_kg.resize(4, 10000.0);
+        eg.population_half_life.resize(4, f32::INFINITY);
+        eg.over_population_half_life.resize(4, 6000.0);
+        eg.under_population_death_rate.resize(4, 0.0);
+        t.diseases.push_unchecked(DiseaseInfo {
+            hash_id: 0xd49f77d6,
+            strength: 50.0,
+            temperature_range: RangeInfo {
+                min_viable: 168.15,
+                min_growth: 258.15,
+                max_growth: 513.15,
+                max_viable: 563.15,
+            },
+            temperature_half_lives: RangeInfo {
+                min_viable: 10.0,
+                min_growth: 1200.0,
+                max_growth: 1200.0,
+                max_viable: 10.0,
+            },
+            elem_growth_info: eg,
+            radiation_kill_rate: 1.0,
+            ..Default::default()
+        });
+        let mut g = crate::globals::G_DISEASE.lock();
+        if !g.0.is_null() {
+            unsafe { let _ = Box::from_raw(g.0); }
+        }
+        g.0 = Box::into_raw(Box::new(t));
+    }
+
+    /// 2026-08-06 回归：气体流动多邻格迭代在同一子步多次从 cells 读病菌计数、
+    /// 从 updated 扣减——源格病菌已被抽走时，未钳制会扣成负数（clear_disease 销毁）；
+    /// 钳制后病菌按源格实际剩余转移（净零，不销毁、不凭空产生）。
+    #[test]
+    fn update_pressure_clamps_disease_transfer_to_remaining() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_gas_table();
+        install_zombie_table();
+        let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            // cells（稳定）：源格 36 质量 1.0、病菌 1000；目标 35 质量 0.5、无菌
+            let c = &mut *sd.cells.ptr;
+            c.element_idx.set(36, 2);
+            c.mass.set(36, 1.0);
+            c.disease_idx.set(36, 0);
+            c.disease_count.set(36, 1000);
+            c.element_idx.set(35, 2);
+            c.mass.set(35, 0.5);
+            c.disease_idx.set(35, 0xff);
+            c.disease_count.set(35, 0);
+            // updated（运行中）：源格质量/病菌已被之前转移抽走（100 剩余）
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(36, 2);
+            u.mass.set(36, 0.2);
+            u.disease_idx.set(36, 0);
+            u.disease_count.set(36, 100);
+            u.element_idx.set(35, 2);
+            u.mass.set(35, 0.5);
+            u.disease_idx.set(35, 0xff);
+            u.disease_count.set(35, 0);
+        }
+        // update_pressure(36, 35)：f18 = 1.0×(1.0−0.5) → clamp 0.125；
+        // ratio=0.125 → disease_to_transfer=125 > 源格 updated 剩余 100。
+        crate::c2_physics::liquid_flow::update_pressure(&mut sd, 36, 35);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(
+                u.disease_count.get(35),
+                100,
+                "目标只收到源格实际剩余 100（未钳制会收 125 = 凭空产生）"
+            );
+            assert_eq!(u.disease_idx.get(35), 0);
+            assert_eq!(
+                u.disease_count.get(36),
+                0,
+                "源格扣减到 0（未钳制会 -25 负数 → 销毁）"
+            );
+            assert_eq!(u.disease_idx.get(36), 0xff, "源格清零后 idx 清除");
+        }
         uninstall_disease_table();
         DestroyElementsTable();
     }
