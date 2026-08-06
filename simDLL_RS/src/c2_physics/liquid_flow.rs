@@ -1946,13 +1946,13 @@ pub(crate) fn do_displacement(sim: &mut SimData, src: usize, dst: usize) {
 /// DisplaceGas — 气体被挤压 → **单方向转移全部质量**（原版 11_msvcrt_ignored.c L34035-34129）。
 ///
 /// 源格必须质量 > 0 且元素为气体（postProcessData.state & 3 == 1）。
-/// 候选顺序（原版 L34068-34074）`[下, 左, 右, 上]`，按 `tickCount` 旋转
+/// 候选顺序（原版 L34068-34074）`[上, 左, 右, 下]`（本项目约定 +width=上），按 `tickCount` 旋转
 /// （原版 `local_60[uVar4 + tickCount & 3]`）——这是"随机单方向"的确定性实现
 /// （每帧 tickCount 递增，起始方向交替变化）。
 ///
 /// 循环 1（主方向 L34075-34092）：候选元素 == 目标气体 或 == vacuum 且
 /// `properties & 1 == 0` → DoDisplacement 全量转移，返回 true。
-/// 循环 2（对角下 L34093-34121）：候选为 左下/右下（按 tickCount 取一），
+/// 循环 2（对角 L34093-34121）：候选为 左上/右上（按 tickCount 取一），
 /// 候选元素 == 目标气体 且 同侧平格（updatedCells）非固体（liquidData.state & 3 != 3）
 /// 且 `properties & 1 == 0` → DoDisplacement。
 ///
@@ -3326,6 +3326,126 @@ mod tests {
             let events = &*sd.sim_events.ptr;
             assert_eq!(events.substance_change_info.len(), 1, "左扩散应产生 1 条事件");
             assert_eq!(events.substance_change_info.get(0).cell_idx, 4);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 复现（2026-08-06 用户实测）：液体水平挤入气体格时，气体正交四路全堵，
+    /// 应沿**右上方对角**逃逸（原版 DisplaceGas 循环 2，11_msvcrt_ignored.c
+    /// L34093-34121：diag = cell+width±1，同侧平格非固体 + properties&1==0）。
+    /// 布局（6×5，+width=上，源格 14）：
+    ///   row3: [18 固] [19 固] [20 气] [21 ..]
+    ///   row2: [12 固] [13 气] [14 液] [15 固]
+    ///   row1: [ 7 固] [ 8 液] [ 9 ..]
+    /// 左扩散 12.5kg → 目标 13 是气体 → displace_gas：正交（19/12/14/7）全堵 →
+    /// 对角 18 固体跳过 → 20（同气体、旁格 14 非固体）→ 气体整体移到 20。
+    #[test]
+    fn liquid_spreads_into_gas_and_gas_escapes_diagonally() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 表：0=真空(state0)、1=液体(state2)、2=气体(state1)、3=固体(state3)
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(4);
+        for elem in [
+            Element::default(),
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 2;
+                e.state = 1; // 气体
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 3;
+                e.state = 3; // 固体
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+        ] {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..4 {
+            w.write_int(0); // 空名称
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null());
+
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                // 源格液体 14 (row2,col2)
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                // 下方同液体 8 (row1,col2)——同元素下落分支，随后水平扩散
+                buf.element_idx.set(8, 1);
+                buf.mass.set(8, 10.0);
+                buf.temperature.set(8, 300.0);
+                // 左邻气体 13 (row2,col1)
+                buf.element_idx.set(13, 2);
+                buf.mass.set(13, 10.0);
+                buf.temperature.set(13, 300.0);
+                // 气体 13 的逃逸路：上 19 / 左 12 / 下 7 = 固体；右 14 = 液体（源）
+                for c in [19usize, 12, 7] {
+                    buf.element_idx.set(c, 3);
+                    buf.mass.set(c, 500.0);
+                    buf.temperature.set(c, 300.0);
+                }
+                // 对角：左上 18 = 固体（强制走右上）；右上 20 = 同气体（逃逸目标）
+                buf.element_idx.set(18, 3);
+                buf.mass.set(18, 500.0);
+                buf.temperature.set(18, 300.0);
+                buf.element_idx.set(20, 2);
+                buf.mass.set(20, 0.0);
+                buf.temperature.set(20, 300.0);
+                // 右邻 15 = 固体（阻断右扩散）
+                buf.element_idx.set(15, 3);
+                buf.mass.set(15, 500.0);
+                buf.temperature.set(15, 300.0);
+            }
+        }
+        update_liquid(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(
+                updated.element_idx.get(13),
+                1,
+                "目标气体格 13 应被液体占据（挤走后变液体）"
+            );
+            assert!(updated.mass.get(13) > 0.0, "13 应获得左扩散的液体质量");
+            assert_eq!(
+                updated.element_idx.get(20),
+                2,
+                "气体应逃逸到右上对角 20"
+            );
+            assert!(
+                (updated.mass.get(20) - 10.0).abs() < 1e-3,
+                "20 应收到原 13 的 10kg 气体，got {}",
+                updated.mass.get(20)
+            );
         }
         DestroyElementsTable();
     }
