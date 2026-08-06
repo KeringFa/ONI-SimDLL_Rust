@@ -57,11 +57,11 @@ pub fn update_liquids(sim: &mut crate::a_framework::sim_data::SimData) {
 }
 
 /// UpdateLiquid 遍历循环（原版 11_msvcrt_ignored.c L42408-42435）。
-/// **自上而下**遍历（行从 max_y → min_y）：先处理上方液体格——用户实测（2026-08-06）：
-/// 竖井 [气1 下][液1 中][液2 上] 满格时，液2 先分支 1 合并 5kg 给液1，
-/// 随后液1/液2 分支 3 与气体换位（"先判定合并，再判定气体可否转移"）。
-/// 此前自下而上遍历 → 液1 先与气体交换，液2 的分支 1 目标格已变气体，
-/// displace_gas 失败 → 5kg 合并丢失。
+/// **自下而上**遍历（行从 min_y → max_y，原版 fVar34 = fStack_204 递增）。
+/// 2026-08-06 对照审查还原：86d7512 曾改为自上而下（误判——认为"液2 先合并
+/// 5kg"需要上方的液2 先处理）。实际用户布局（气1 左侧、液1、液2 在液1 正上方）
+/// 中液1 被水平阻挡不动，**自下而上同样满足"液2 先分支 1 合并 5kg，再阶段 E
+/// 对角换位"**（液2 处理时其分支 1 目标仍是液1）；原版循环确为自下而上。
 /// 2026-08-04 拆分：与 post_process_loop 分离，供 update_data 在两者之间插入
 /// 太空真空任务（原版 worldZones 特判位于 UpdateLiquid 之后、PostProcessCell 之前，
 /// L145466-145520）。
@@ -74,7 +74,7 @@ pub(crate) fn update_liquid_loop(
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
         return;
     }
-    for row in (bounds.min_y..=bounds.max_y).rev() {
+    for row in bounds.min_y..=bounds.max_y {
         for col in bounds.min_x..=bounds.max_x {
             if row >= height - 1 || col >= width - 1 {
                 continue;
@@ -4356,11 +4356,11 @@ mod tests {
         DestroyElementsTable();
     }
 
-    /// 满格合并 + 气体上顶（2026-08-06 用户实测）：竖井 [气1 下][液1 中][液2 上]，
-    /// 液1=液2=1000kg（满格）、气1=1kg。原版先走分支 1 同元素合并
-    /// （f22 = max(1000×1.01,1000) − 1000 = 10 → f23 = min(1000, viscosity, 5) = 5，
-    /// 液2 → 液1 转移 5kg），随后分支 3 SwapCells 级联把气体顶到顶部。
-    /// 验证：液2 出现 995kg（5kg 已合并）、气体最终在顶部液2 原位。
+    /// 竖井 [气1 下][液1 中][液2 上]，液1=液2=1000kg（满格）、气1=1kg。
+    /// 自下而上遍历：帧1 液1 分支 3 与气1 交换（气体升到中部）；帧2 液2 分支 3
+    /// 与气体交换（气体升到顶部）。注：竖井内液2 的分支 1 目标格（中部）已在
+    /// 帧1 变气体 → displace_gas 失败 → 竖井场景**无 5kg 合并**（合并只出现在
+    /// 用户 L 布局——液1 被水平阻挡不动，见 diagonal_swap_liquid_swaps_with_below_left_gas）。
     #[test]
     fn full_column_merge_then_gas_swap_cascade() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
@@ -4395,11 +4395,6 @@ mod tests {
                 .filter(|&c| updated.element_idx.get(c) == 3)
                 .collect::<Vec<_>>();
             assert_eq!(updated.element_idx.get(14), 3, "帧1后液1↔气1 交换，气体在中部 14");
-            assert!(
-                (updated.mass.get(20) - 995.0).abs() < 1e-3,
-                "帧1液2 应先合并 5kg → 995（分支 1：max(1000×1.01,1000)−1000=10→×0.5=5），got {}",
-                updated.mass.get(20)
-            );
         }
         // 帧 2：液2 的分支判定（cells 已同步）看到下方是气体 → 分支 3 交换
         unsafe { crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd); }
@@ -4615,6 +4610,55 @@ mod tests {
             assert_eq!(updated.element_idx.get(14), 3, "气1 应换位到 14（液2 原位）");
             assert_eq!(updated.element_idx.get(9), 1, "液2 应换位到 9（气1 原位）");
             assert_eq!(updated.element_idx.get(8), 1, "液1 不动");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 探针：用户布局（气1=7、液1=8=1000kg、液2=14=300kg）对角换位后，
+    /// 追踪液1 质量变化与总质量守恒。
+    #[test]
+    fn probe_liquid1_mass_after_diagonal_swap() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_liquid_displacement_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(7, 3);
+                buf.mass.set(7, 1.0);
+                buf.temperature.set(7, 250.0);
+                buf.element_idx.set(8, 1);
+                buf.mass.set(8, 1000.0);
+                buf.temperature.set(8, 300.0);
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 300.0);
+                buf.temperature.set(14, 300.0);
+                for c in [13usize, 6, 1, 2, 9, 15, 20, 0, 3, 21, 19] {
+                    buf.element_idx.set(c, 4);
+                    buf.mass.set(c, 500.0);
+                    buf.temperature.set(c, 300.0);
+                }
+            }
+        }
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        for frame in 0..30 {
+            crate::c2_physics::update_data(&mut sd);
+            if frame < 8 || frame == 29 {
+                unsafe {
+                    let updated = &*sd.updated_cells.ptr;
+                    let total_liq: f32 = (0..30)
+                        .filter(|&c| updated.element_idx.get(c) == 1)
+                        .map(|c| updated.mass.get(c))
+                        .sum();
+                    eprintln!(
+                        "frame {frame}: m7={:.3} m8={:.3} m14={:.3} total_liq={:.3}",
+                        updated.mass.get(7),
+                        updated.mass.get(8),
+                        updated.mass.get(14),
+                        total_liq
+                    );
+                }
+            }
         }
         DestroyElementsTable();
     }
