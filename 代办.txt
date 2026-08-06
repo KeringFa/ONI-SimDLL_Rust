@@ -1157,3 +1157,35 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
 - **下一步建议**：气体纹理"5kg/格、扩散千层饼"独立问题复查；或推进后续模块
   （ElementEmitter 本体 / 升华 / 光照 / 辐射之后的气体模拟等）。
 
+## [已完成] 塌方/不稳定方块下落 DoUnstableCheck + SetSavedOptions（2026-08-06 内联 TDD）
+
+- 规格：docs/superpowers/specs/2026-08-06-unstable-fall-design.md
+- 计划：docs/superpowers/plans/2026-08-06-unstable-fall.md
+- **背景**：DoUnstableCheck（原版 05_liquid_flow.c L1841-2210+）此前是空桩
+  （do_unstable_check_stub）——沙子/碎石/污染土被挖空下方后不塌方。
+- **已实现（严格对照原版，未抄任何项目版本）**：
+  1. `SetSavedOptions` handler（02_save_load.c L466-484）：2B {clearBits,setBits}
+     → `saved_options = (saved_options & ~clearBits) | setBits`；bit0=
+     ENABLE_DIAGONAL_FALLING_SAND（C# 无调用方，恒 0，休眠）。
+  2. `GetStableTicksRemaining`（L123214）：timers 低 5 位——0x1F 重掷 3-5 /
+     递减 / 0 保持（塌方稳定期延迟）。
+  3. `DoUnstableCheckBasic`（L1841-1937）：下方 gas/liquid/vacuum 且非 void 且
+     props&4==0（非 SolidImpermeable）且稳定 tick 耗尽 → 推 UnstableCellInfo
+     （20B，fallingInfo=0，C# UnstableGroundManager.Spawn 下落实体，落地
+     AddRemoveSubstance 回注）+ Evaporate；否则 timers|=0x1F。
+  4. `HeadlessUnstableFallSimpleSwap`（L2209-2322）：headless（世界生成）逐格
+     向下交换 7 字段至固体/越界。
+  5. `DoUnstableCheckWithDiagonals`（L1937-2208，休眠变体）：三方向扫描
+     （正下 1.0 / 左下 0.5 / 右下 0.5，正交格悬空门控），注释标注方向表
+     栈布局逆向的不确定性。
+  6. post_process_cell 固体分支（state&0xb==0xb）接线：do_unstable_check_stub
+     → 按 savedOptions&1 分派。
+- **properties bit 含义确认**（C# Sim.Cell.Properties）：1=GasImpermeable、
+  2=LiquidImpermeable（兼固体标志）、4=SolidImpermeable、0x40=NotifyOnMelt。
+- **测试**：+9 条（SetSavedOptions 位掩码、stable ticks 重掷/递减/0、
+  Basic 气体下方塌方事件+清格 / 固体下方 timers / void 下方不塌 /
+  稳定期延迟 / headless 交换、WithDiagonals 正下/对角权重、post_process_cell
+  0xb 门控集成）；全量 503 lib + 53 集成测试串行全过；release 构建成功。
+- **待实测**：部署 → 挖空沙子/碎石下方 → 下落实体 + 落地回注；稳定期
+  （3-5 tick）延迟塌方；回归液体/气体流动无差异。
+

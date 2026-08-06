@@ -44,7 +44,7 @@ pub fn is_solid(cells: &CellSOA, cell_idx: usize) -> bool {
 // ===== 任务 6：UpdateLiquid + UpdateNeighbourLiquidMass =====
 // 对照源码 05_liquid_flow.c L656-1212（UpdateLiquid）+ L1213-1274（UpdateNeighbourLiquidMass）。
 
-use crate::a_framework::game_data::{SpawnFXInfo, SubstanceChangeInfo};
+use crate::a_framework::game_data::{SpawnFXInfo, SubstanceChangeInfo, UnstableCellInfo};
 
 /// UpdateLiquidData 入口 — 遍历内部格，对"液体格"（state&3==2 且 mass>0）调 update_liquid。
 /// 对照源码 11_msvcrt_ignored.c L42408-42435（遍历循环）：
@@ -1470,8 +1470,374 @@ fn do_sublimation(sim: &mut SimData, cell: usize) {
     }
 }
 
-/// DoUnstableCheck（塌方/下落检查，原版 L2537-2545）—— 留桩。
-fn do_unstable_check_stub(_sim: &mut SimData, _cell: usize) {}
+/// DoUnstableCheck 分派（原版 L2537-2545）：savedOptions&1 → WithDiagonals，
+/// 否则 Basic。当前 C# 从不设置 ENABLE_DIAGONAL_FALLING_SAND → 恒走 Basic。
+fn do_unstable_check(sim: &mut SimData, cell: usize) {
+    if (sim.saved_options & 1) != 0 {
+        do_unstable_check_with_diagonals(sim, cell);
+    } else {
+        do_unstable_check_basic(sim, cell);
+    }
+}
+
+/// SimData::GetStableTicksRemaining（SimDLL_Source.c L123214-123250）。
+///
+/// timers[cell] 低 5 位稳定 tick：
+/// - == 0x1F（"刚变化"标记）：LCG 重掷 `3 + (seed>>16 & 0x7fff)×9.155553e-05`
+///   ∈ [3,6)，写回低 5 位，返回新值（3-5 tick 稳定期，塌方延迟）；
+/// - != 0：减 1 写回，返回递减后值；
+/// - == 0：返回 0（稳定，可塌方）。
+pub(crate) fn get_stable_ticks_remaining(sim: &mut SimData, cell: usize) -> u8 {
+    if sim.timers.ptr.is_null() {
+        return 0;
+    }
+    let timers_ptr = sim.timers.ptr as *mut u8;
+    let cur = unsafe { std::ptr::read(timers_ptr.add(cell)) };
+    let low = cur & 0x1f;
+    if low == 0x1f {
+        // next_random 归一化 [0,1) ×3 → [0,3)，截断 +3 → {3,4,5}（等价原版算式）
+        let new_low = ((next_random(sim) * 3.0) as u8).saturating_add(3) & 0x1f;
+        let new_byte = (cur & !0x1f) | new_low;
+        unsafe { std::ptr::write(timers_ptr.add(cell), new_byte); }
+        return new_low;
+    }
+    if low != 0 {
+        let new_low = low - 1;
+        let new_byte = (cur & !0x1f) | new_low;
+        unsafe { std::ptr::write(timers_ptr.add(cell), new_byte); }
+        return new_low;
+    }
+    0
+}
+
+/// 推 UnstableCellInfo（20B）——塌方事件（原版 DoUnstableCheckBasic L1878-1903 /
+/// WithDiagonals L2061-2095 内联 push）。
+///
+/// src_cell：元素/质量/病菌/温度来源（塌方块）；pos_cell：事件 game 坐标格
+/// （Basic=方块自身；WithDiagonals=对角候选格）；weight：转移比例
+/// （Basic=1.0 全量后 Evaporate；对角=0.5，源格保留余量）。
+/// UnstableCellInfo 布局 {cellIdx i32, elemIdx u16, fallingInfo u8, diseaseIdx u8,
+/// mass f32, temperature f32, diseaseCount i32} = 20B（00_types_reference.c L12524）。
+fn push_unstable_cell_info(sim: &mut SimData, src_cell: usize, pos_cell: usize, weight: f32) {
+    if sim.sim_events.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim.width as i32;
+    let game_w = width - 2;
+    let internal = pos_cell as i32;
+    let game_cell = (internal % width - 1) + (internal / width - 1) * game_w;
+    if game_cell < 0 || game_cell >= sim.num_game_cells {
+        return;
+    }
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    if src_cell >= updated.element_idx.len() || src_cell >= updated.mass.len() {
+        return;
+    }
+    let events = unsafe { &mut *sim.sim_events.ptr };
+    events.unstable_cell_info.push(UnstableCellInfo {
+        cell_idx: game_cell,
+        elem_idx: updated.element_idx.get(src_cell),
+        falling_info: 0,
+        disease_idx: updated.disease_idx.get(src_cell),
+        mass: updated.mass.get(src_cell) * weight,
+        temperature: updated.temperature.get(src_cell),
+        disease_count: (updated.disease_count.get(src_cell) as f32 * weight) as i32,
+    });
+}
+
+/// DoUnstableCheckBasic（原版 05_liquid_flow.c L1841-1937）——不稳定方块塌方（基本变体）。
+///
+/// 读 updatedCells：下方格（cell−width）元素为气体/液体/真空（state&3<3）且
+/// 非 void 且 `properties&4==0`（非 SolidImpermeable）且稳定 tick 耗尽
+/// （GetStableTicksRemaining==0）→ 塌方：
+/// - 非 headless：推 UnstableCellInfo（fallingInfo=0，C# Spawn 下落实体）
+///   + Evaporate（清格 + substance 事件）；
+/// - headless：HeadlessUnstableFallSimpleSwap（逐格向下交换，世界生成用）。
+/// 否则 `timers[cell] |= 0x1F`（标记"刚变化"）。
+pub(crate) fn do_unstable_check_basic(sim: &mut SimData, cell: usize) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim.width as usize;
+    if width == 0 || cell < width {
+        return; // 下方索引下溢（原版越界断言）
+    }
+    let below = cell - width;
+    let (below_elem, below_props) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        if below >= updated.element_idx.len() {
+            return;
+        }
+        (updated.element_idx.get(below), updated.properties.get(below))
+    };
+    let below_state = match elements_table::get_element_post_process_data(below_elem) {
+        Some(p) => p.state & 3,
+        None => return,
+    };
+    // 原版 L1854-1875：下方为气体/液体/真空且非 void 且非 SolidImpermeable
+    if below_state < 3 && below_elem != sim.void_element_idx && (below_props & 4) == 0 {
+        let ticks = get_stable_ticks_remaining(sim, cell);
+        if ticks == 0 {
+            if sim.headless {
+                headless_unstable_fall_simple_swap(sim, cell);
+            } else {
+                push_unstable_cell_info(sim, cell, cell, 1.0);
+                do_evaporate(sim, cell);
+            }
+        }
+        return;
+    }
+    // 原版 L1910-1913：不塌方 → timers[cell] |= 0x1F
+    if !sim.timers.ptr.is_null() {
+        let timers_ptr = sim.timers.ptr as *mut u8;
+        let cur = unsafe { std::ptr::read(timers_ptr.add(cell)) };
+        unsafe { std::ptr::write(timers_ptr.add(cell), cur | 0x1F) };
+    }
+}
+
+/// HeadlessUnstableFallSimpleSwap（原版 L2209-2322）——headless（世界生成）下落。
+///
+/// 从方块下方第一格（cell−width）开始向下走：若当前格为固体 →
+/// ChangeSubstance(方块当前格) 返回；否则交换当前格 ↔ 方块当前格
+/// （7 字段，固体下移一格）+ substance 事件 + timers|=0x1F，继续向下。
+pub(crate) fn headless_unstable_fall_simple_swap(sim: &mut SimData, cell: usize) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim.width as isize;
+    if width <= 0 {
+        return;
+    }
+    let total = sim.width as usize * sim.height as usize;
+    let mut cur = cell as isize - width; // 方块下方第一格
+    loop {
+        if cur < 0 || cur as usize >= total {
+            return;
+        }
+        let below_cell = cur as usize;
+        let elem = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            if below_cell >= updated.element_idx.len() {
+                return;
+            }
+            updated.element_idx.get(below_cell)
+        };
+        let is_solid = match elements_table::get_element_post_process_data(elem) {
+            Some(p) => (p.state & 3) == 3,
+            None => true, // 表缺失防御：按固体处理（不再下落）
+        };
+        if is_solid {
+            // 原版 L2223-2227：ChangeSubstance(方块当前格)（iVar11 + iVar13）
+            push_substance_change(sim, (cur + width) as usize);
+            return;
+        }
+        let solid_cell = (cur + width) as usize;
+        // 交换下方格 ↔ 方块当前格（7 字段，原版 L2228-2283）
+        {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            swap_cells(updated, below_cell, solid_cell);
+        }
+        // 事件 + timers（原版 L2284-2315）
+        push_substance_change(sim, solid_cell);
+        cur -= width;
+    }
+}
+
+/// DoUnstableCheckWithDiagonals（原版 L1937-2208）——斜向塌方变体。
+///
+/// 休眠选项：由 `savedOptions & 1`（ENABLE_DIAGONAL_FALLING_SAND）门控，
+/// 当前 C# 从不调用 SetSavedOptionValue → 实际恒走 DoUnstableCheckBasic。
+/// 按原版结构实现三方向扫描：
+/// - 正下（offset=−width、权重 1.0、阈值 0、正交 false）；
+/// - 左下（offset=−width−1、权重 0.5、阈值 1.0×minHorizontalFlow、正交 true）；
+/// - 右下（offset=1−width、权重 0.5、阈值 1.0×minHorizontalFlow、正交 true）。
+/// 门控 `(mass − 阈值×minHorizontalFlow)×权重 > 0`；候选格须 gas/liquid/vacuum、
+/// 非 void、props&4==0；正交标志时额外要求候选下方格（candidate+width）非固体
+/// 且 props&4==0。稳定 tick 耗尽 → 推事件（坐标=候选格、mass/disease×权重）+
+/// 源格扣减（headless 走搬移+继续下落）。
+/// 注：原版栈布局逆向的方向表存在少量不确定性（休眠路径，不影响当前游戏行为）。
+pub(crate) fn do_unstable_check_with_diagonals(sim: &mut SimData, cell: usize) {
+    if sim.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim.width as i32;
+    if width <= 0 || (cell as i32) < width {
+        return;
+    }
+    let directions: [(i32, f32, f32, bool); 3] = [
+        (-width, 1.0, 0.0, false),
+        (-width - 1, 0.5, 1.0, true),
+        (1 - width, 0.5, 1.0, true),
+    ];
+    // 源格快照（原版 L2005-2012：fVar4=mass、iVar7=diseaseCount）
+    let (src_mass, src_count, src_elem) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        if cell >= updated.mass.len() || cell >= updated.disease_count.len() {
+            return;
+        }
+        (
+            updated.mass.get(cell),
+            updated.disease_count.get(cell),
+            updated.element_idx.get(cell),
+        )
+    };
+    let min_horizontal_flow = match elements_table::get_element_post_process_data(src_elem) {
+        Some(p) => p.min_horizontal_flow,
+        None => return,
+    };
+    let mut bvar15 = false;
+    let mut bvar14 = false;
+    let mut uvar16: u8 = 0xff;
+    for &(offset, weight, threshold, orthogonal) in &directions {
+        let candidate = (cell as i32 + offset) as usize;
+        // 门控（原版 L2013-2016）：(mass − threshold×minHorizontalFlow)×weight > 0
+        if (src_mass - threshold * min_horizontal_flow) * weight <= 0.0 {
+            continue;
+        }
+        // 候选格数据（updatedCells，原版 L2018-2045）
+        let (below_cand_state, below_cand_props) = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
+            if candidate >= updated.element_idx.len() || candidate >= updated.properties.len() {
+                continue;
+            }
+            let cand_elem = updated.element_idx.get(candidate);
+            let cand_state = match elements_table::get_element_post_process_data(cand_elem) {
+                Some(p) => p.state & 3,
+                None => continue,
+            };
+            let cand_props = updated.properties.get(candidate);
+            let below_cand = (candidate as i32 + width) as usize;
+            if below_cand >= updated.element_idx.len() || below_cand >= updated.properties.len() {
+                continue;
+            }
+            let below_cand_elem = updated.element_idx.get(below_cand);
+            let below_cand_state =
+                match elements_table::get_element_post_process_data(below_cand_elem) {
+                    Some(p) => p.state & 3,
+                    None => continue,
+                };
+            let below_cand_props = updated.properties.get(below_cand);
+            if cand_state >= 3 || cand_elem == sim.void_element_idx || (cand_props & 4) != 0 {
+                continue;
+            }
+            (below_cand_state, below_cand_props)
+        };
+        // 正交标志：候选下方格非固体且 props&4==0（原版 L2167-2170）
+        if orthogonal && (below_cand_state == 3 || (below_cand_props & 4) != 0) {
+            continue;
+        }
+        // 塌方（原版 LAB_18004d432）：稳定 tick 每调用只掷一次
+        bvar15 = true;
+        if !bvar14 {
+            bvar14 = true;
+            uvar16 = get_stable_ticks_remaining(sim, cell);
+        }
+        if uvar16 != 0 {
+            continue;
+        }
+        // timers[cell] |= 0x1F（原版 L2057-2059）
+        if !sim.timers.ptr.is_null() {
+            let timers_ptr = sim.timers.ptr as *mut u8;
+            let cur = unsafe { std::ptr::read(timers_ptr.add(cell)) };
+            unsafe { std::ptr::write(timers_ptr.add(cell), cur | 0x1F) };
+        }
+        if !sim.headless {
+            // 非 headless：推事件（坐标=候选格、mass/disease×**原始**质量）+ 源格扣减
+            push_unstable_cell_info(sim, cell, candidate, weight);
+            {
+                let updated = unsafe { &mut *sim.updated_cells.ptr };
+                let mass_new = (updated.mass.get(cell) - src_mass * weight).max(0.0);
+                updated.mass.set(cell, mass_new);
+                let remain = updated.disease_count.get(cell) - (src_count as f32 * weight) as i32;
+                if remain < 1 {
+                    clear_disease(updated, cell);
+                } else {
+                    updated.disease_count.set(cell, remain);
+                }
+            }
+            push_substance_change(sim, cell);
+            let mass_now = {
+                let updated = unsafe { &*sim.updated_cells.ptr };
+                updated.mass.get(cell)
+            };
+            if mass_now <= 0.0 {
+                do_evaporate(sim, cell);
+            }
+        } else {
+            // headless：候选格置换后搬入 + 源格按**当前**质量扣减 + 继续下落
+            headless_diagonal_fall(sim, cell, candidate, weight);
+        }
+    }
+    if !bvar15 {
+        // 原版 L2187-2191：无方向通过 → timers[cell] |= 0x1F
+        if !sim.timers.ptr.is_null() {
+            let timers_ptr = sim.timers.ptr as *mut u8;
+            let cur = unsafe { std::ptr::read(timers_ptr.add(cell)) };
+            unsafe { std::ptr::write(timers_ptr.add(cell), cur | 0x1F) };
+        }
+    }
+}
+
+/// WithDiagonals headless 分支（原版 L2103-2180）：候选格
+/// DisplaceGas/DisplaceLiquid 腾位后，把源格元素/质量/温度/病菌搬入候选格，
+/// 源格按权重扣减，再 HeadlessUnstableFallSimpleSwap(candidate)。
+fn headless_diagonal_fall(sim: &mut SimData, cell: usize, candidate: usize, weight: f32) {
+    let cand_state = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        let e = updated.element_idx.get(candidate);
+        match elements_table::get_element_post_process_data(e) {
+            Some(p) => p.state & 3,
+            None => return,
+        }
+    };
+    let cand_elem = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        updated.element_idx.get(candidate)
+    };
+    if cand_state == 1 {
+        displace_gas(sim, candidate, cand_elem);
+    } else if cand_state == 2 {
+        displace_liquid(sim, candidate, cand_elem);
+    }
+    let (cur_mass, cur_count, cur_elem, cur_temp, cur_d_idx) = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        (
+            updated.mass.get(cell),
+            updated.disease_count.get(cell),
+            updated.element_idx.get(cell),
+            updated.temperature.get(cell),
+            updated.disease_idx.get(cell),
+        )
+    };
+    let move_mass = cur_mass * weight;
+    let move_count = (cur_count as f32 * weight) as i32;
+    {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(candidate, cur_elem);
+        updated.mass.set(candidate, move_mass);
+        updated.temperature.set(candidate, cur_temp);
+        updated.disease_idx.set(candidate, cur_d_idx);
+        updated.disease_count.set(candidate, move_count);
+        let src_new = (updated.mass.get(cell) - move_mass).max(0.0);
+        updated.mass.set(cell, src_new);
+        let remain = updated.disease_count.get(cell) - move_count;
+        if remain < 1 {
+            clear_disease(updated, cell);
+        } else {
+            updated.disease_count.set(cell, remain);
+        }
+    }
+    push_substance_change(sim, candidate);
+    push_substance_change(sim, cell);
+    let mass_now = {
+        let updated = unsafe { &*sim.updated_cells.ptr };
+        updated.mass.get(cell)
+    };
+    if mass_now <= 1.1754944e-38 {
+        do_evaporate(sim, cell);
+    }
+    headless_unstable_fall_simple_swap(sim, candidate);
+}
 
 /// DoDensityDisplacement — 密度分层（原版 05_liquid_flow.c L1755-1840）。
 ///
@@ -2438,7 +2804,7 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
         if (ppd.state & 0xb) != 0xb {
             return;
         }
-        do_unstable_check_stub(sim, cell);
+        do_unstable_check(sim, cell);
         return;
     }
 
@@ -6132,5 +6498,316 @@ mod tests {
             assert_eq!(cells.disease_count.get(0), 100);
         }
         uninstall_disease_table();
+    }
+
+    /// 塌方测试表：0=真空(state0)、1=气体(state1)、2=不稳定固体(state 0x0b=11)。
+    /// 固体 state 含 bit3（不稳定标记），供 post_process_loop 的 0xb 门控使用。
+    fn create_unstable_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(3);
+        for (id, state) in [(0i32, 0u8), (1i32, 1u8), (2i32, 0x0bu8)] {
+            let mut elem = Element::default();
+            elem.id = id;
+            elem.state = state;
+            elem.number_of_gradient_colors = 1;
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(&elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..3 {
+            w.write_int(0);
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    #[test]
+    fn stable_ticks_reroll_decrement_and_zero() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            // 0x1F：重掷 3-5（原版 L123220-123233）
+            std::ptr::write(timers_ptr.add(3), 0x1F);
+            let v = get_stable_ticks_remaining(&mut sd, 3);
+            assert!((3..=5).contains(&v), "0x1F 应重掷 3-5，got {}", v);
+            let stored = std::ptr::read(timers_ptr.add(3)) & 0x1f;
+            assert_eq!(stored, v, "重掷值应写回低 5 位");
+            // 非 0：递减
+            std::ptr::write(timers_ptr.add(4), 5);
+            assert_eq!(get_stable_ticks_remaining(&mut sd, 4), 4);
+            assert_eq!(std::ptr::read(timers_ptr.add(4)) & 0x1f, 4);
+            // 0：保持
+            std::ptr::write(timers_ptr.add(5), 0);
+            assert_eq!(get_stable_ticks_remaining(&mut sd, 5), 0);
+        }
+    }
+
+    #[test]
+    fn unstable_check_gas_below_falls_and_pushes_event() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(19, 2); // 不稳定固体
+                buf.mass.set(19, 100.0);
+                buf.temperature.set(19, 300.0);
+                buf.disease_idx.set(19, 3);
+                buf.disease_count.set(19, 42);
+                buf.element_idx.set(13, 1); // 下方气体
+                buf.mass.set(13, 1.0);
+                buf.temperature.set(13, 300.0);
+            }
+            // 稳定 tick = 0 → 立即塌方
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(19), 0);
+        }
+        do_unstable_check_basic(&mut sd, 19);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.unstable_cell_info.len(), 1, "应推 1 条塌方事件");
+            let info = events.unstable_cell_info.get(0);
+            assert_eq!(info.elem_idx, 2);
+            assert_eq!(info.cell_idx, 8, "game(19) = (19%6-1) + 4×(19/6-1) = 8");
+            assert_eq!(info.falling_info, 0);
+            assert_eq!(info.disease_idx, 3);
+            assert!((info.mass - 100.0).abs() < 1e-3, "全量质量");
+            assert_eq!(info.disease_count, 42);
+            // 源格 Evaporate：元素→真空、质量/温度清零、病菌清除
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(19), 0);
+            assert_eq!(updated.mass.get(19), 0.0);
+            assert_eq!(updated.temperature.get(19), 0.0);
+            assert_eq!(updated.disease_idx.get(19), 0xff);
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn unstable_check_solid_below_no_fall_sets_timer() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(19, 2);
+                buf.mass.set(19, 100.0);
+                buf.temperature.set(19, 300.0);
+                buf.element_idx.set(13, 2); // 下方固体
+                buf.mass.set(13, 100.0);
+            }
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(19), 5);
+        }
+        do_unstable_check_basic(&mut sd, 19);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.unstable_cell_info.len(), 0, "固体下方不塌方");
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(19), 2, "源格保留");
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            let t = std::ptr::read(timers_ptr.add(19));
+            assert_eq!(t & 0x1f, 0x1f, "不塌方 → timers |= 0x1F");
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn unstable_check_void_below_no_fall() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 1; // 显式：下方=void 元素
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(19, 2);
+                buf.mass.set(19, 100.0);
+                buf.temperature.set(19, 300.0);
+                buf.element_idx.set(13, 1); // void 元素（气体态但 hash=void）
+            }
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(19), 0);
+        }
+        do_unstable_check_basic(&mut sd, 19);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.unstable_cell_info.len(), 0, "void 下方不塌方");
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn unstable_check_stable_ticks_delay_blocks_fall() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(19, 2);
+                buf.mass.set(19, 100.0);
+                buf.temperature.set(19, 300.0);
+                buf.element_idx.set(13, 1);
+                buf.mass.set(13, 1.0);
+            }
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(19), 5); // 稳定期未耗尽
+        }
+        do_unstable_check_basic(&mut sd, 19);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.unstable_cell_info.len(), 0, "稳定期未耗尽不塌方");
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            let t = std::ptr::read(timers_ptr.add(19)) & 0x1f;
+            assert_eq!(t, 4, "稳定 tick 递减 5→4");
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn unstable_check_headless_swaps_down() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(8, 8, 1, false, true); // headless
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(27, 2); // (3,3) 不稳定固体 100kg
+                buf.mass.set(27, 100.0);
+                buf.temperature.set(27, 300.0);
+                buf.element_idx.set(19, 1); // (2,3) 气体
+                buf.element_idx.set(11, 1); // (1,3) 气体
+                buf.element_idx.set(3, 2); // (0,3) 固体 → 停住
+                buf.mass.set(3, 100.0);
+            }
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(27), 0);
+        }
+        do_unstable_check_basic(&mut sd, 27);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(11), 2, "固体应落到 (1,3)");
+            assert_eq!(updated.mass.get(11), 100.0, "质量守恒");
+            assert_eq!(updated.element_idx.get(19), 1, "气体被顶到 (2,3)");
+            assert_eq!(updated.element_idx.get(27), 1, "气体被顶到 (3,3)");
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn unstable_check_with_diagonals_below_empty_falls_full() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        sd.saved_options = 1; // ENABLE_DIAGONAL_FALLING_SAND（休眠选项测试）
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(27, 2); // (3,3) 不稳定固体
+                buf.mass.set(27, 100.0);
+                buf.temperature.set(27, 300.0);
+                buf.element_idx.set(19, 1); // (2,3) 下方气体 → 正下分支
+                buf.mass.set(19, 1.0);
+                // 挡住对角分支：左下(18)/右下(20) 候选格设固体
+                buf.element_idx.set(18, 2);
+                buf.mass.set(18, 100.0);
+                buf.element_idx.set(20, 2);
+                buf.mass.set(20, 100.0);
+            }
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(27), 0);
+        }
+        do_unstable_check_with_diagonals(&mut sd, 27);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.unstable_cell_info.len(), 1, "正下分支应塌方");
+            let info = events.unstable_cell_info.get(0);
+            assert_eq!(info.cell_idx, 8, "事件坐标 = game(下方 19)");
+            assert!((info.mass - 100.0).abs() < 1e-3, "权重 1.0 全量");
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.mass.get(27), 0.0, "全量转移后源格清空");
+            assert_eq!(updated.element_idx.get(27), 0, "Evaporate");
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn unstable_check_with_diagonals_side_empty_half_falls() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        sd.saved_options = 1;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(27, 2); // (3,3) 不稳定固体 100kg
+                buf.mass.set(27, 100.0);
+                buf.temperature.set(27, 300.0);
+                buf.element_idx.set(19, 2); // (3,2) 下方固体 → 挡住正下
+                buf.mass.set(19, 100.0);
+                buf.element_idx.set(18, 1); // (2,2) 左下气体 → 对角分支
+                buf.mass.set(18, 1.0);
+                buf.element_idx.set(26, 1); // (2,3) 左邻气体（对角正交检查格）
+                buf.mass.set(26, 1.0);
+                buf.element_idx.set(28, 2); // (4,3) 右下正交格固体 → 挡住右下分支
+                buf.mass.set(28, 100.0);
+            }
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(27), 0);
+        }
+        do_unstable_check_with_diagonals(&mut sd, 27);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.unstable_cell_info.len(), 1, "仅左下分支应塌方");
+            let info = events.unstable_cell_info.get(0);
+            assert_eq!(info.cell_idx, 7, "事件坐标 = game(左下 18)");
+            assert!((info.mass - 50.0).abs() < 1e-3, "对角权重 0.5");
+            let updated = &*sd.updated_cells.ptr;
+            assert!((updated.mass.get(27) - 50.0).abs() < 1e-3, "源格保留 50%");
+            assert_eq!(updated.element_idx.get(27), 2, "源格仍是固体（未清空）");
+        }
+        DestroyElementsTable();
+    }
+
+    #[test]
+    fn post_process_cell_unstable_solid_falls_via_gate() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_unstable_table();
+        let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(27, 2); // 不稳定固体（state 0x0b 过 0xb 门控）
+                buf.mass.set(27, 100.0);
+                buf.temperature.set(27, 300.0);
+                buf.element_idx.set(19, 1); // 下方气体
+                buf.mass.set(19, 1.0);
+                buf.temperature.set(19, 300.0);
+            }
+            let timers_ptr = sd.timers.ptr as *mut u8;
+            std::ptr::write(timers_ptr.add(27), 0);
+        }
+        post_process_cell(&mut sd, 27);
+        unsafe {
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.unstable_cell_info.len(), 1, "0xb 门控后应塌方");
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(27), 0, "塌方后清格");
+        }
+        DestroyElementsTable();
     }
 }

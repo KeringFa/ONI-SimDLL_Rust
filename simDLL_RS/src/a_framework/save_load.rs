@@ -1147,11 +1147,27 @@ pub fn handle_clear_unoccupied_cells(_reader: &mut BinaryBufferReader) -> *mut c
     std::ptr::null_mut()
 }
 
-/// SetSavedOptions handler 桩。
-/// 对照源码 02_save_load.c L466-484。
-/// 任务 4 实现真实逻辑。
-pub fn handle_set_saved_options(_reader: &mut BinaryBufferReader) -> *mut c_void {
-    tracing::warn!("SetSavedOptions handler stub (task 4 will implement)");
+/// SetSavedOptions handler（原版 02_save_load.c L466-484 + C# SimMessages L366-374）。
+///
+/// 消息 2B：{clearBits u8, setBits u8} →
+/// `saved_options = (saved_options & ~clear_bits) | set_bits`。
+/// 位定义（C# SimSavedOptions）：bit0 = ENABLE_DIAGONAL_FALLING_SAND（斜向塌方），
+/// 门控 DoUnstableCheckBasic/WithDiagonals 分派；当前 C# 无调用方 → 恒 0。
+pub fn handle_set_saved_options(reader: &mut BinaryBufferReader) -> *mut c_void {
+    let sim_data_ptr = globals::G_SIM_DATA.lock().0;
+    if sim_data_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let clear_bits = match reader.read_byte() {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let set_bits = match reader.read_byte() {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let sim = unsafe { &mut *sim_data_ptr };
+    sim.saved_options = (sim.saved_options & !clear_bits) | set_bits;
     std::ptr::null_mut()
 }
 
@@ -2886,5 +2902,46 @@ mod tests {
         clean_up(); // 替换后 clean_up 释放 Box，不应崩溃
         clean_up(); // 幂等
         assert!(globals::G_DISEASE.lock().0.is_null());
+    }
+
+    #[test]
+    fn handle_set_saved_options_clear_and_set_bits() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        // 先经 AllocateCells 建 SimData
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(4);
+        w.write_int(4);
+        w.write_bool(true);
+        w.write_bool(true);
+        let alloc_data = w.into_bytes();
+        let mut alloc_reader = BinaryBufferReader::new(&alloc_data);
+        handle_allocate_cells(&mut alloc_reader);
+        unsafe {
+            let sd = &mut *globals::G_SIM_DATA.lock().0;
+            sd.saved_options = 0x03;
+        }
+
+        // 2B 消息 {clearBits=0x01, setBits=0x02} → (0x03 & ~0x01) | 0x02 = 0x02
+        let data = [0x01u8, 0x02u8];
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = handle_set_saved_options(&mut reader);
+        assert!(result.is_null());
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            assert_eq!(sd.saved_options, 0x02, "clear bit0 + set bit1");
+        }
+
+        // 再清 bit1 + 置 bit0 → (0x02 & ~0x02) | 0x01 = 0x01
+        let data2 = [0x02u8, 0x01u8];
+        let mut reader2 = BinaryBufferReader::new(&data2);
+        handle_set_saved_options(&mut reader2);
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            assert_eq!(sd.saved_options, 0x01);
+        }
+
+        clean_up();
     }
 }
