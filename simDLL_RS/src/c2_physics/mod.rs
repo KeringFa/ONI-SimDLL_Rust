@@ -255,7 +255,7 @@ pub fn update_data(sim_data: &mut SimData) {
         crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
         crate::c2_physics::disease::run_disease_diffusion_task(sim_data, bounds);
         // 原版 L145106-145464：辐射病菌贡献（RadiationSickness，hash 0xd49f77d6，
-        // +count×0.001）→ 病菌阶段 4 预留位（当前未实现，位置保留）。
+        // +count×0.001）已实现（radiation.rs run_radiation_task 内，2026-08-05 c04664b）。
         // 太空真空特判（原版 L145466-145520：worldZones==-1 且背墙真空 → 液体/气体
         // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
         // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
