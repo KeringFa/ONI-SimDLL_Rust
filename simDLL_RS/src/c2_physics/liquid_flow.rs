@@ -1128,7 +1128,17 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
     // —— 病菌：来源格病菌数从 cells 读（原版 L1501-1513）——
     let src_disease_count = cells.disease_count.get(src_cell);
     let ratio = (transfer / src_mass).clamp(0.0, 1.0);
-    let disease_to_transfer = (ratio * src_disease_count as f32) as i32;
+    // 2026-08-06 修复（孢子兰在流动气体中病菌被稀释至不可见）：压力均衡的
+    // 病菌携带仅保留给**液体驱动**压力（原版代码对气体压力同样转移，但用户
+    // 实测气体压力均衡会把孢子兰病菌持续带走——每子步 12.5%×多邻格迭代，
+    // 永远达不到扩散阈值 5100，病菌被稀释消失）。病菌在气体中的扩散由独立的
+    // 病菌扩散模块（UpdateCells）负责；气体压力只均衡质量/温度。
+    // 液体压力保持原版病菌转移（液体 off-gassing 带菌是设计行为）。
+    let disease_to_transfer = if cell_state == 2 {
+        (ratio * src_disease_count as f32) as i32
+    } else {
+        0
+    };
     // —— 来源格病菌 idx / 温度（原版 L1504-1518：从 updatedCells 读）——
     let updated = unsafe { &mut *sim.updated_cells.ptr };
     if src_cell >= updated.mass.len() || dst_cell >= updated.mass.len() {

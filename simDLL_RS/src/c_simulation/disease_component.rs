@@ -1201,7 +1201,7 @@ mod tests {
 
     // ===== 2026-08-06：气体流动病菌过扣修复 =====
 
-    /// 4 元素表：0=真空、1=氧气(气体,flow=1.0)、2=CO2(气体,flow=1.0)、3=固体。
+    /// 5 元素表：0=真空、1=氧气(气体,flow=1.0)、2=CO2(气体,flow=1.0)、3=固体、4=液体。
     fn create_gas_table() {
         use crate::b_elements::element::{
             ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData,
@@ -1216,7 +1216,13 @@ mod tests {
         table.temperature_data.clear();
         table.radiation_data.clear();
         table.property_texture_data.clear();
-        for (id, state, flow) in [(0i32, 0u8, 1.0f32), (1, 1, 1.0), (2, 1, 1.0), (3, 3, 0.0)] {
+        for (id, state, flow) in [
+            (0i32, 0u8, 1.0f32),
+            (1, 1, 1.0),
+            (2, 1, 1.0),
+            (3, 3, 0.0),
+            (4, 2, 1.0),
+        ] {
             let mut e = Element::default();
             e.id = id;
             e.state = state;
@@ -1235,6 +1241,7 @@ mod tests {
         table.element_indices.insert(1, 1);
         table.element_indices.insert(2, 2);
         table.element_indices.insert(3, 3);
+        table.element_indices.insert(4, 4);
     }
 
     /// ZombieSpores 式病菌表：idx0（ZombieSpores），CO2 生长恒 0、minDiffusionCount=5100。
@@ -1288,23 +1295,23 @@ mod tests {
         sd.vacuum_element_idx = 0;
         sd.void_element_idx = 0xFFFF;
         unsafe {
-            // cells（稳定）：源格 36 质量 1.0、病菌 1000；目标 35 质量 0.5、无菌
+            // cells（稳定）：源格 36 = 液体(state 2)、质量 1.0、病菌 1000；目标 35 质量 0.5、无菌
             let c = &mut *sd.cells.ptr;
-            c.element_idx.set(36, 2);
+            c.element_idx.set(36, 4);
             c.mass.set(36, 1.0);
             c.disease_idx.set(36, 0);
             c.disease_count.set(36, 1000);
-            c.element_idx.set(35, 2);
+            c.element_idx.set(35, 4);
             c.mass.set(35, 0.5);
             c.disease_idx.set(35, 0xff);
             c.disease_count.set(35, 0);
             // updated（运行中）：源格质量/病菌已被之前转移抽走（100 剩余）
             let u = &mut *sd.updated_cells.ptr;
-            u.element_idx.set(36, 2);
+            u.element_idx.set(36, 4);
             u.mass.set(36, 0.2);
             u.disease_idx.set(36, 0);
             u.disease_count.set(36, 100);
-            u.element_idx.set(35, 2);
+            u.element_idx.set(35, 4);
             u.mass.set(35, 0.5);
             u.disease_idx.set(35, 0xff);
             u.disease_count.set(35, 0);
@@ -1326,6 +1333,53 @@ mod tests {
                 "源格扣减到 0（未钳制会 -25 负数 → 销毁）"
             );
             assert_eq!(u.disease_idx.get(36), 0xff, "源格清零后 idx 清除");
+        }
+        uninstall_disease_table();
+        DestroyElementsTable();
+    }
+
+    /// 2026-08-06 回归：气体压力均衡不携带病菌（孢子兰在流动气体中病菌被稀释）。
+    /// 液体压力仍携带（原版病菌转移保留给液体）。
+    #[test]
+    fn gas_pressure_does_not_transfer_disease() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_gas_table();
+        install_zombie_table();
+        let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            // 源格 36 = CO2 气体(state 1)、质量 1.0、病菌 1000；目标 35 真空
+            let c = &mut *sd.cells.ptr;
+            c.element_idx.set(36, 2);
+            c.mass.set(36, 1.0);
+            c.disease_idx.set(36, 0);
+            c.disease_count.set(36, 1000);
+            c.element_idx.set(35, 0);
+            c.mass.set(35, 0.0);
+            c.disease_idx.set(35, 0xff);
+            c.disease_count.set(35, 0);
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(36, 2);
+            u.mass.set(36, 1.0);
+            u.disease_idx.set(36, 0);
+            u.disease_count.set(36, 1000);
+            u.element_idx.set(35, 0);
+            u.mass.set(35, 0.0);
+            u.disease_idx.set(35, 0xff);
+            u.disease_count.set(35, 0);
+        }
+        crate::c2_physics::liquid_flow::update_pressure(&mut sd, 36, 35);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(
+                u.disease_count.get(36),
+                1000,
+                "气体压力均衡不携带病菌（源格病菌保留）"
+            );
+            assert_eq!(u.disease_idx.get(36), 0);
+            assert_eq!(u.disease_count.get(35), 0, "目标格不收到病菌");
+            assert!(u.mass.get(35) > 0.0, "质量仍正常流动（仅病菌不携带）");
         }
         uninstall_disease_table();
         DestroyElementsTable();
