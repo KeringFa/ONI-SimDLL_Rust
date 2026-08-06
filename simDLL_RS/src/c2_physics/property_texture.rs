@@ -202,15 +202,16 @@ pub fn update_flow_texture(sim: &SimData, game: &mut GameData) {
     }
 }
 
-/// 原版 powf() 的衰减因子占位。
+/// 液面 alpha / 梯度深度因子 = `mass / 1000`（满格质量比，clamp 0..1）。
 ///
-/// ⚠️ **已知偏差**：原版 05_liquid_flow.c L397 与 11_msvcrt_ignored.c L43123
-/// 各有一处 `powf()` 调用，参数经浮点寄存器（XMM0/XMM1）传入，Ghidra 反编译
-/// 无法恢复参数值。本实现取常数 `1.0`（无衰减），对液体颜色本身无影响
-/// （颜色来自元素表 colour/gradient），仅影响 alpha 透明度与深度衰减。
-/// 待游戏内实测若液体透明度/深度表现异常，需以真实参数校准此处。
-fn liquid_powf() -> f32 {
-    1.0
+/// 原版 05_liquid_flow.c L397（UpdateLiquidPropertyTexture）与
+/// 11_msvcrt_ignored.c L43123（GetEstimatedLiquidGradientValue）各有一处
+/// `powf()` 调用，参数经浮点寄存器传入、Ghidra 无法恢复；但原版随后
+/// `GetEstimatedLiquidGradientValue(..., 1000.0, true)` 显式传入 **1000.0**
+/// （满格质量常量），且 01 版本实证液面高度 = mass/1000 语义。
+/// 本实现取 `mass/1000`（无幂），若实测高度曲线与原版有差，再校准幂指数。
+fn liquid_mass_ratio(mass: f32) -> f32 {
+    (mass / 1000.0).clamp(0.0, 1.0)
 }
 
 /// 梯度颜色插值 — 由温度梯度 t（0..1）在 gradient 数组的相邻色之间做 RGB 线性插值。
@@ -298,7 +299,7 @@ fn estimated_liquid_gradient_value(
     if state == 2 {
         // 液体（原版 L43121-43148）
         let mut f_var8 = 1.0;
-        let powf_result = liquid_powf(); // 原版 L43123（参数不可恢复）
+        let mass_ratio = liquid_mass_ratio(updated.mass.get(idx)); // 原版 L43123 powf（满格质量比）
         let mut f_var7 = if (ptd_below.state & 3) < 2 {
             // 下方是气体/真空：无支撑
             0.0
@@ -314,7 +315,7 @@ fn estimated_liquid_gradient_value(
             };
             let mut v = 1.0 - exposed.get(g).copied().unwrap_or(0) as f32 * 0.003921569;
             v = v.clamp(0.0, 1.0);
-            v * powf_result
+            v * mass_ratio
         };
         if recurse && f_var7 > 0.0 {
             f_var8 = estimated_liquid_gradient_value(
@@ -412,7 +413,8 @@ pub fn update_liquid_property_texture(sim: &SimData, game: &mut GameData) {
                                 .map(|d| d.state & 3)
                                 .unwrap_or(0);
                         let f_var35 = if below_state < 2 && (cells.properties.get(below) & 2) == 0 {
-                            liquid_powf()
+                            // 液面格（上方为气体/真空）：alpha = 质量/1000（原版 L397 powf）
+                            liquid_mass_ratio(updated.mass.get(s))
                         } else {
                             1.0
                         };
@@ -642,6 +644,159 @@ mod tests {
             let liquid = std::slice::from_raw_parts(gd.property_texture_liquid.ptr, 4 * 3);
             assert_eq!(liquid[0], 0, "空元素表下应保持 0");
         }
+    }
+
+    /// 液面高度回归：surface 格（上方为气体/真空）的 alpha = mass/1000（原版 L397
+    /// powf + GetEstimatedLiquidGradientValue 的 1000.0 常量）。
+    /// 此前 liquid_powf()=1.0 占位 → 任何质量都满格高度（用户实测）。
+    #[test]
+    fn liquid_alpha_scales_with_mass_ratio() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_test_elements_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        let mut gd = GameData::new(4, 3);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            // sim(1,1) = game(0,0) = idx 7：液体元素 1，质量 100kg
+            updated.element_idx.set(7, 1);
+            updated.mass.set(7, 100.0);
+            updated.temperature.set(7, 50.0);
+            // cell+width = idx 13：气体（上方，液面格判定）
+            updated.element_idx.set(13, 0);
+        }
+        update_liquid_property_texture(&sd, &mut gd);
+        unsafe {
+            let liquid = std::slice::from_raw_parts(gd.property_texture_liquid.ptr, 4 * 3);
+            let alpha = (liquid[0] >> 24) & 0xff;
+            assert_eq!(alpha, 25, "100kg/1000kg → alpha=0.1×255≈25");
+            assert_eq!(liquid[0] & 0xffffff, 0x00ff00, "RGB 仍为元素 colour（绿）");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 梯度深度因子回归：GetEstimatedLiquidGradientValue 乘 mass/1000
+    /// （原版 L43123 powf 对应物；01 版本实证 mass_ratio 语义）。
+    #[test]
+    fn estimated_gradient_scales_with_mass_ratio() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_test_elements_table();
+        let sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(7, 1); // 液体
+            updated.mass.set(7, 100.0);
+            updated.element_idx.set(13, 1); // cell+width 液体（支撑）
+            updated.mass.set(13, 1000.0);
+        }
+        let exposed = [0u8; 12]; // 全暗 → (1 - 0/255) = 1.0
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            let v = estimated_liquid_gradient_value(
+                6,
+                30,
+                updated,
+                &exposed,
+                4,
+                7,
+                false,
+            );
+            assert!(
+                (v - 0.1).abs() < 1e-3,
+                "梯度 = 光深(1.0) × mass_ratio(0.1) = 0.1，got {}",
+                v
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 诊断：100kg 气体单格扩散 5 子步后 flow / flow 纹理的量级。
+    /// 对照原版公式（flow 累加结构已核对），若量级异常则存在累加 bug。
+    #[test]
+    fn diagnostic_flow_texture_magnitude_gas_diffusion() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 专用表：0=真空(state0,flow 0)、1=气体(state1,flow 0.1)、2=固体(state3)
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(3);
+        for (id, state, flow) in [(0i32, 0u8, 0.0f32), (1, 1, 0.1), (2, 3, 0.0)] {
+            let mut e = Element::default();
+            e.id = id;
+            e.state = state;
+            e.flow = flow;
+            e.low_temp = -273.0;
+            e.high_temp = 2000.0;
+            e.number_of_gradient_colors = 1;
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(&e as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..3 {
+            w.write_int(0);
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null());
+
+        let mut sd = SimData::new_for_allocate(16, 8, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        let w16 = 16usize;
+        let src = 3 * w16 + 4; // (4,3) 100kg 气体
+        unsafe {
+            for buf_ptr in [sd.cells.ptr, sd.updated_cells.ptr] {
+                let c = &mut *buf_ptr;
+                for i in 0..(16 * 8usize) {
+                    let x = i % w16;
+                    let y = i / w16;
+                    if x == 0 || x == 15 || y == 0 || y == 7 {
+                        c.element_idx.set(i, 2); // 固体边界
+                        c.mass.set(i, 1000.0);
+                        c.temperature.set(i, 300.0);
+                    } else {
+                        c.element_idx.set(i, 0); // 真空
+                        c.temperature.set(i, 300.0);
+                    }
+                }
+                c.element_idx.set(src, 1);
+                c.mass.set(src, 100.0);
+                c.temperature.set(src, 300.0);
+            }
+        }
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 1,
+            min_y: 1,
+            max_x: 14,
+            max_y: 6,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        });
+        for _ in 0..5 {
+            crate::c2_physics::update_data(&mut sd);
+        }
+        unsafe {
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 16 * 8);
+            let updated = &*sd.updated_cells.ptr;
+            let mut max_tex = 0.0f32;
+            for i in 0..(16 * 8usize) {
+                let f = flow[i];
+                if updated.element_idx.get(i) == 1 {
+                    let inv = 1.0 / updated.mass.get(i).max(1.0);
+                    let tx = (f.x - f.y) * inv;
+                    let ty = (f.w - f.z) * inv;
+                    max_tex = max_tex.max(tx.abs()).max(ty.abs());
+                }
+            }
+            // 源格 mass 应下降、flow 应显著（> 10）
+            assert!(updated.mass.get(src) < 100.0, "100kg 应已扩散");
+            // 纹理值量级合理（flow 累加公式与原版一致；若出现 >100 说明累加 bug）
+            assert!(
+                max_tex < 100.0,
+                "flow 纹理量级异常大：max={}",
+                max_tex
+            );
+        }
+        DestroyElementsTable();
     }
 
     // ===== update_exposed_to_sun_property_texture（任务 4 延后，任务 8 实现）=====
