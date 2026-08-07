@@ -303,10 +303,11 @@ pub fn update_element_chunks_data_list_only() {
 }
 
 /// 每帧输出交换（原版 CopySimDataToGame elementChunkInfo 交换）。
+/// 2026-08-07 修正：不再 clear mgr.output——原版只清源 delta_kj（L31595），
+/// 温度在未活跃槽位保留上一帧值（防 C# 过期句柄读到 0K 的纵深防御）。
 pub fn swap_element_chunk_output(game_data: &mut crate::a_framework::game_data::GameData) {
     let mut mgr = ELEMENT_CHUNK_MANAGER.lock();
     std::mem::swap(&mut game_data.element_chunk_info, &mut mgr.output);
-    mgr.output.clear_keep_capacity();
 }
 
 /// 测试/诊断：当前活跃碎片数。
@@ -408,12 +409,10 @@ pub(crate) fn update_element_chunks_inner(
     dt: f32,
     width: i32,
 ) {
-    // 输出按 handle index 索引（原版 Update 首行 _Resize 到 items 数，写 output[handleIndex]）
+    // 输出按 handle index 索引（原版 Update 首行 _Resize 到 items 数，写 output[handleIndex]）。
+    // 2026-08-07 修正：resize 保留旧值（新槽位默认 0），不再全槽清零——
+    // 已释放槽位保留上一帧温度（原版 L38306-38310 只写活跃、L31592-31596 只清 delta）。
     mgr.output.resize(mgr.items.len(), ElementChunkInfo::default());
-    // resize 现为容量感知（保留旧值）→ 未活跃槽位须显式清零，防 C# 读到残留
-    for idx in 0..mgr.items.len() {
-        mgr.output.set(idx, ElementChunkInfo::default());
-    }
     if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
         return;
     }
@@ -426,63 +425,67 @@ pub(crate) fn update_element_chunks_inner(
         let handle_index = index as i32 & 0xffffff;
         let handle = ((mgr.versions[index] as i32) << 24) | handle_index;
         let chunk = &mut mgr.records[ri as usize];
-        if chunk.heat_capacity <= 0.0 {
-            continue;
-        }
         let mut delta = 0.0f32;
-        if chunk.adjuster.heat_capacity > 0.0 {
-            // adjuster 分支（原版 L140114-140120）：rate 1.0，不写格子；
-            // 原版走 CalculateTemperatureExchange wrapper（冷侧在前），负温差下 min 取负会过冲。
-            let nc = if chunk.temperature <= chunk.adjuster.temperature {
-                let (nc, _na) =
-                    crate::c2_physics::temperature::calculate_temperature_exchange_precise(
-                        1.0,
-                        chunk.adjuster.thermal_conductivity,
-                        dt,
-                        chunk.temperature,
-                        chunk.heat_capacity,
-                        chunk.adjuster.temperature,
-                        chunk.adjuster.heat_capacity,
-                    );
-                nc
-            } else {
-                let (_na, nc) =
-                    crate::c2_physics::temperature::calculate_temperature_exchange_precise(
-                        1.0,
-                        chunk.adjuster.thermal_conductivity,
-                        dt,
-                        chunk.adjuster.temperature,
-                        chunk.adjuster.heat_capacity,
-                        chunk.temperature,
-                        chunk.heat_capacity,
-                    );
-                nc
-            };
-            chunk.temperature = nc;
-        } else {
-            let cell = chunk.cell as usize;
-            let h1 = exchange_heat_energy_with_world(sim, chunk, cell, 1.0, dt);
-            delta += h1;
-            // 下方格为固体 → groundTransferScale 换热（原版 L140159-140167）
-            if cell >= w {
-                let below = cell - w;
-                let below_elem = unsafe { (*sim.updated_cells.ptr).element_idx.get(below) };
-                if let Some(etd) =
-                    crate::b_elements::elements_table::get_element_temperature_data(below_elem)
-                {
-                    if etd.state & 3 == 3 {
-                        let h2 = exchange_heat_energy_with_world(
-                            sim,
-                            chunk,
-                            below,
-                            chunk.ground_transfer_scale,
+        if chunk.heat_capacity > 0.0 {
+            if chunk.adjuster.heat_capacity > 0.0 {
+                // adjuster 分支（原版 L140114-140120）：rate 1.0，不写格子；
+                // 原版走 CalculateTemperatureExchange wrapper（冷侧在前），负温差下 min 取负会过冲。
+                let nc = if chunk.temperature <= chunk.adjuster.temperature {
+                    let (nc, _na) =
+                        crate::c2_physics::temperature::calculate_temperature_exchange_precise(
+                            1.0,
+                            chunk.adjuster.thermal_conductivity,
                             dt,
+                            chunk.temperature,
+                            chunk.heat_capacity,
+                            chunk.adjuster.temperature,
+                            chunk.adjuster.heat_capacity,
                         );
-                        delta += h2;
+                    nc
+                } else {
+                    let (_na, nc) =
+                        crate::c2_physics::temperature::calculate_temperature_exchange_precise(
+                            1.0,
+                            chunk.adjuster.thermal_conductivity,
+                            dt,
+                            chunk.adjuster.temperature,
+                            chunk.adjuster.heat_capacity,
+                            chunk.temperature,
+                            chunk.heat_capacity,
+                        );
+                    nc
+                };
+                chunk.temperature = nc;
+            } else {
+                let cell = chunk.cell as usize;
+                let h1 = exchange_heat_energy_with_world(sim, chunk, cell, 1.0, dt);
+                delta += h1;
+                // 下方格为固体 → groundTransferScale 换热（原版 L140159-140167）
+                if cell >= w {
+                    let below = cell - w;
+                    let below_elem = unsafe { (*sim.updated_cells.ptr).element_idx.get(below) };
+                    if let Some(etd) =
+                        crate::b_elements::elements_table::get_element_temperature_data(below_elem)
+                    {
+                        if etd.state & 3 == 3 {
+                            let h2 = exchange_heat_energy_with_world(
+                                sim,
+                                chunk,
+                                below,
+                                chunk.ground_transfer_scale,
+                                dt,
+                            );
+                            delta += h2;
+                        }
                     }
                 }
             }
         }
+        // ★ 原版 L38306-38310：输出写入在换热 if 块**之外**——无论 heatCapacity/区域，
+        // 活跃碎片都上报真实温度（delta 在跳过换热时为 0）。
+        // 2026-08-07 根因修复：此前 `heat_capacity <= 0` 直接 continue → 槽位保持清零后的 0
+        // → C# SimTemperatureTransfer 读到 0K → 泵存储水块（被抽空、mass=0）显示 0K →
+        // 冻结成冰 + 排水口 T(0) 液滴（用户实测冰方块 + FallingWater 崩溃）。
         let t = chunk.temperature;
         mgr.output.set(handle_index as usize, ElementChunkInfo {
             temperature: t,
@@ -824,6 +827,56 @@ mod tests {
         let events = unsafe { &*sd.sim_events.ptr };
         assert_eq!(events.element_chunk_melted_info.len(), 1);
         assert_eq!(events.element_chunk_melted_info.get(0).handle.value, h);
+    }
+
+    /// 2026-08-07 水泵冰水根因回归：零热容（mass=0，泵存储被抽空）的活跃碎片
+    /// 仍必须输出**真实温度**（原版 L38306-38310 输出写在换热 if 块之外，无条件执行）。
+    /// 此前 `heat_capacity <= 0` 直接 continue → 输出槽位保持清零后的 0 →
+    /// C# 读到 0K → 存储水块冻结成冰 + T(0) 液滴崩溃（用户实测）。
+    #[test]
+    fn update_reports_temperature_even_with_zero_heat_capacity() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        let h = mgr.add(6, &add_msg(5, 300.0)); // index 0，初始 HC=200
+        // 模拟泵存储水被抽空：HC→0（mass=0），温度保持 300K
+        assert!(mgr.modify(h, 300.0, 0.0));
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let out = mgr.output_snapshot();
+        let idx = (h & 0xffffff) as usize;
+        assert!(
+            (out[idx].temperature - 300.0).abs() < 1e-3,
+            "零 HC 碎片应上报真实温度 300，got {}",
+            out[idx].temperature
+        );
+        assert_eq!(out[idx].delta_kj, 0.0, "跳过换热时 delta=0");
+        // 300K 在水范围 [200,5000] 内 → 不触发相变
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.element_chunk_melted_info.len(), 0);
+    }
+
+    /// 2026-08-07：已释放槽位保留上一帧温度（原版 L31592-31596 只清 delta_kj），
+    /// 不再清零——防止 C# 过期句柄读到 0K。
+    #[test]
+    fn update_preserves_released_slot_temperature() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        let h = mgr.add(6, &add_msg(5, 300.0)); // index 0
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let idx = (h & 0xffffff) as usize;
+        assert!((mgr.output_snapshot()[idx].temperature - 300.0).abs() < 1e-3);
+        // 移除后：槽位应保留温度，而非清零为 0
+        assert!(mgr.remove(h));
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let out = mgr.output_snapshot();
+        assert!(
+            (out[idx].temperature - 300.0).abs() < 1e-3,
+            "释放槽位应保留上一帧温度 300，got {}",
+            out[idx].temperature
+        );
     }
 
     #[test]

@@ -488,7 +488,11 @@ pub fn update_building_heat_exchange(sim_data: &mut SimData) {
                     k = (balanced - bldg_t) * per_cell_hc;
                     new_cell_t = balanced;
                 }
-                if !(low <= new_cell_t && new_cell_t <= high) {
+                // 原版 L35649-35655：`fVar25 < fVar9 || fVar24 < fVar25` 严格越界 →
+                // 仅上报并**跳过写入 / DoStateTransition / sum_k**（写与累加在 else 分支内）。
+                // 注意：NaN 时两个严格比较均为 false → 走 else 照写（与原版一致，
+                // 不能用 `!(low <= x && x <= high)`——那会把 NaN 判为越界而跳过，产生分歧）。
+                if new_cell_t < low || high < new_cell_t {
                     tracing::error!(
                         cell,
                         new_cell_t,
@@ -496,6 +500,7 @@ pub fn update_building_heat_exchange(sim_data: &mut SimData) {
                         high,
                         "BuildingHeatExchange has invalid values"
                     );
+                    continue;
                 }
                 if !(0.0 <= new_cell_t && new_cell_t <= 10000.0) {
                     tracing::error!(

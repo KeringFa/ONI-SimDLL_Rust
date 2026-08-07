@@ -207,8 +207,11 @@ mod tests {
 
     #[test]
     fn mass_consumption_size_is_16() { assert_eq!(size_of::<MassConsumption>(), 16); }
+    #[test]
     fn add_element_consumer_size_is_12() { assert_eq!(size_of::<AddElementConsumerMsg>(), 12); }
+    #[test]
     fn set_element_consumer_data_size_is_12() { assert_eq!(size_of::<SetElementConsumerDataMsg>(), 12); }
+    #[test]
     fn remove_element_consumer_size_is_8() { assert_eq!(size_of::<RemoveElementConsumerMsg>(), 8); }
 
     #[test]

@@ -327,7 +327,6 @@ fn process_cell_properties(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     }
     let slice = frame.set_cell_properties.as_slice();
     let count = slice.len();
-    let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
     for i in 0..count {
         let entry = slice[i];
         let internal_cell = ((entry.game_cell % game_w + 1) as i32)
@@ -336,13 +335,40 @@ fn process_cell_properties(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
         // entry.property_flags = mask, entry.set_or_clear = set(1)/clear(0) flag
         let mask = entry.property_flags;
         let set_flag = entry.set_or_clear;
-        let current = updated_cells.properties.get(idx);
-        let new_val = if set_flag == 0 {
-            current & !mask
-        } else {
-            current | mask
+        let (props, mass, elem) = {
+            let updated_cells = unsafe { &mut *sim_data.updated_cells.ptr };
+            let current = updated_cells.properties.get(idx);
+            let new_val = if set_flag == 0 {
+                current & !mask
+            } else {
+                current | mask
+            };
+            updated_cells.properties.set(idx, new_val);
+            (
+                new_val,
+                updated_cells.mass.get(idx),
+                updated_cells.element_idx.get(idx),
+            )
         };
-        updated_cells.properties.set(idx, new_val);
+        // 原版 06_process_messages.c L270-297：属性变更后，若格有质量且新属性命中位移标志，
+        // 触发 DisplaceLiquid / DisplaceGas 挤压（bit0==0 && bit1!=0 → 液体；bit0!=0 → 气体）。
+        // 2026-08-07 补齐：此前只写 properties 字节，建筑放置/属性驱动位移链路缺失。
+        if props != 0 && mass > 0.0 {
+            if props & 1 == 0 {
+                if props & 2 != 0 {
+                    crate::c2_physics::liquid_flow::displace_liquid(sim_data, idx, elem);
+                }
+            } else {
+                crate::c2_physics::liquid_flow::displace_gas(sim_data, idx, elem);
+            }
+        }
+        // 原版 L298-311：callback_idx != -1 → 推 callback_info（C# 协程等待该回调）
+        if entry.callback_idx != -1 {
+            let events = unsafe { &mut *sim_data.sim_events.ptr };
+            events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
+                callback_idx: entry.callback_idx,
+            });
+        }
     }
     frame.set_cell_properties.clear_keep_capacity();
 }
@@ -1337,8 +1363,21 @@ fn process_building_to_building_messages(frame: &mut SimFrameInfo, sim_data: &mu
     }
 }
 
-/// BFS 找 radius 内第一个 state==target 的格元素（原版 GetReachableCells + AnyInputCellHasState）。
-fn find_reachable_state(sim: &SimData, x: usize, y: usize, radius: usize, target: u8) -> Option<u16> {
+/// BFS 构建 radius 内可达格列表，从 `offset`（offset_idx 轮转）起循环扫描，
+/// 返回首个 state==target 的格元素（原版 GetReachableCells + AnyInputCellHasState）。
+///
+/// 原版 AnyInputCellHasState（11_msvcrt_ignored.c L38623-38648）：
+/// `uVar3 = (offset + i) % 列表长度` —— 消费者（水泵等）以 offset_idx 为起点
+/// 轮转遍历可达格，"轮流吸取"不同元素/格子；此前 Rust 恒从 BFS 首个匹配格
+/// 开始（等效 offset=0），轮换消费逻辑未生效（offset_idx 递增但未被使用）。
+fn find_reachable_state(
+    sim: &SimData,
+    x: usize,
+    y: usize,
+    radius: usize,
+    target: u8,
+    offset: usize,
+) -> Option<u16> {
     if sim.updated_cells.ptr.is_null() {
         return None;
     }
@@ -1346,6 +1385,7 @@ fn find_reachable_state(sim: &SimData, x: usize, y: usize, radius: usize, target
     let h = sim.height as usize;
     let total = w * h;
     let mut visited = vec![false; total];
+    let mut reachable: Vec<usize> = Vec::new();
     let mut queue = std::collections::VecDeque::new();
     queue.push_back((x, y, 0usize));
     if x < w && y < h {
@@ -1356,16 +1396,7 @@ fn find_reachable_state(sim: &SimData, x: usize, y: usize, radius: usize, target
             continue;
         }
         let cell = cy * w + cx;
-        let updated = unsafe { &*sim.updated_cells.ptr };
-        if cell < updated.element_idx.len() {
-            let elem = updated.element_idx.get(cell);
-            let state = elements_table::get_element_post_process_data(elem)
-                .map(|p| p.state & 3)
-                .unwrap_or(0xFF);
-            if state == target {
-                return Some(elem);
-            }
-        }
+        reachable.push(cell);
         for (nx, ny) in [
             (cx + 1, cy),
             (cx.wrapping_sub(1), cy),
@@ -1378,6 +1409,24 @@ fn find_reachable_state(sim: &SimData, x: usize, y: usize, radius: usize, target
                     visited[n] = true;
                     queue.push_back((nx, ny, depth + 1));
                 }
+            }
+        }
+    }
+    let n = reachable.len();
+    if n == 0 {
+        return None;
+    }
+    let updated = unsafe { &*sim.updated_cells.ptr };
+    let start = offset % n;
+    for i in 0..n {
+        let cell = reachable[(start + i) % n];
+        if cell < updated.element_idx.len() {
+            let elem = updated.element_idx.get(cell);
+            let state = elements_table::get_element_post_process_data(elem)
+                .map(|p| p.state & 3)
+                .unwrap_or(0xFF);
+            if state == target {
+                return Some(elem);
             }
         }
     }
@@ -1631,8 +1680,10 @@ pub(crate) fn process_element_consumers(sim: &mut SimData) {
         let radius = e.max_depth as usize;
         let elem = match e.configuration {
             0 => Some(e.element_idx),
-            1 => find_reachable_state(sim, x, y, radius, 2),
-            2 => find_reachable_state(sim, x, y, radius, 1),
+            // offset_idx 轮转：原版 AnyInputCellHasState 从 offset 起循环扫描可达格
+            // （L38627 `(offset + i) % 列表长度`），实现水泵"轮流吸取"。
+            1 => find_reachable_state(sim, x, y, radius, 2, e.offset_idx as usize),
+            2 => find_reachable_state(sim, x, y, radius, 1, e.offset_idx as usize),
             _ => None,
         };
         if let Some(elem) = elem {
@@ -1674,12 +1725,12 @@ pub(crate) fn process_element_consumers(sim: &mut SimData) {
     }
 }
 
-fn process_mass_emission(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
-    if _sim_data.updated_cells.ptr.is_null() {
+fn process_mass_emission(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
+    if sim_data.updated_cells.ptr.is_null() {
         frame.mass_emission_messages.clear_keep_capacity();
         return;
     }
-    let game_w = _sim_data.width - 2;
+    let game_w = sim_data.width - 2;
     if game_w <= 0 {
         frame.mass_emission_messages.clear_keep_capacity();
         return;
@@ -1689,18 +1740,55 @@ fn process_mass_emission(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
     for i in 0..count {
         let msg = messages[i];
         let internal = ((msg.game_cell % game_w + 1) as i32)
-            + ((msg.game_cell / game_w + 1) as i32) * _sim_data.width;
+            + ((msg.game_cell / game_w + 1) as i32) * sim_data.width;
         if internal < 0 {
             continue;
         }
         let cell = internal as usize;
-        let updated = unsafe { &mut *_sim_data.updated_cells.ptr };
-        if cell >= updated.element_idx.len() {
+        if cell >= unsafe { (*sim_data.updated_cells.ptr).element_idx.len() } {
             continue;
         }
-        let cur_elem = updated.element_idx.get(cell);
-        let emitted = cur_elem == msg.element_idx || cur_elem == _sim_data.vacuum_element_idx;
-        // 温度质量混合 + 加质量（原版 L117210-117245）
+        let callback_idx = msg.callback_idx_or_temp.to_bits() as i32;
+        let cur_elem = unsafe { (*sim_data.updated_cells.ptr).element_idx.get(cell) };
+        let same_or_vacuum =
+            cur_elem == msg.element_idx || cur_elem == sim_data.vacuum_element_idx;
+        if !same_or_vacuum {
+            // 原版 SimDLL_Source.c L117328-117342：目标格为异元素 → 按 msg 元素形态
+            // DisplaceGas / DisplaceLiquid 挤压腾位；失败 → 不加质量。
+            // 2026-08-07 补齐：此前无条件加质量并直接改元素（重复计入 + 丢失原元素）。
+            let state = crate::b_elements::elements_table::get_element_post_process_data(
+                msg.element_idx,
+            )
+            .map(|p| p.state & 3)
+            .unwrap_or(0xFF);
+            let displaced = if state == 1 {
+                crate::c2_physics::liquid_flow::displace_gas(sim_data, cell, cur_elem)
+            } else if state == 2 {
+                crate::c2_physics::liquid_flow::displace_liquid(sim_data, cell, cur_elem)
+            } else {
+                false
+            };
+            if !displaced {
+                // 原版 L117343-117370：位移失败 → 失败回调（emitted=0、全零、elem 0xffff）
+                if callback_idx != -1 {
+                    let events = unsafe { &mut *sim_data.sim_events.ptr };
+                    events
+                        .mass_emitted_callbacks
+                        .push(crate::a_framework::game_data::MassEmittedCallback {
+                            callback_idx,
+                            elem_idx: 0xFFFF,
+                            emitted: 0,
+                            disease_idx: 0xFF,
+                            mass: 0.0,
+                            temperature: 0.0,
+                            disease_count: 0,
+                        });
+                }
+                continue;
+            }
+        }
+        // 加质量路径（原版 LAB_180020a38，L117223-117298）
+        let updated = unsafe { &mut *sim_data.updated_cells.ptr };
         let cur_mass = updated.mass.get(cell);
         let new_mass = cur_mass + msg.mass;
         if new_mass > 0.0 {
@@ -1726,17 +1814,16 @@ fn process_mass_emission(frame: &mut SimFrameInfo, _sim_data: &mut SimData) {
         }
         if cur_elem != msg.element_idx {
             updated.element_idx.set(cell, msg.element_idx);
-            change_substance(_sim_data, cell);
+            change_substance(sim_data, cell);
         }
-        let callback_idx = msg.callback_idx_or_temp.to_bits() as i32;
         if callback_idx != -1 {
-            let events = unsafe { &mut *_sim_data.sim_events.ptr };
+            let events = unsafe { &mut *sim_data.sim_events.ptr };
             events
                 .mass_emitted_callbacks
                 .push(crate::a_framework::game_data::MassEmittedCallback {
                     callback_idx,
                     elem_idx: msg.element_idx,
-                    emitted: if emitted { 1 } else { 0 },
+                    emitted: 1,
                     disease_idx: msg.disease_idx,
                     mass: msg.mass,
                     temperature: msg.temperature,
@@ -2643,6 +2730,79 @@ mod tests {
         assert_eq!(c.sim_handle.value, 0);
         assert_eq!(c.removed_elem_idx, 1);
         assert!((c.mass - 2.0).abs() < 1e-3, "consumed mass 应 2，got {}", c.mass);
+        // 2026-08-06 水泵回归：consumedMassInfo 温度必须为源格温度（300K），
+        // 否则 C# 泵把 T=0 的水送进 storage → "Invalid cell modification (zero temp)"
+        // 警告 + 水泵格水被判定为冰（用户实测崩溃前症状）。
+        assert!(
+            (c.temperature - 300.0).abs() < 1e-3,
+            "consumed temperature 应为源格 300K，got {}",
+            c.temperature
+        );
+        DestroyElementsTable();
+    }
+
+    /// find_reachable_state offset 轮转（原版 AnyInputCellHasState L38627）：
+    /// 消费者以 offset_idx 为起点循环扫描可达格，实现水泵"轮流吸取"。
+    /// 可达列表 BFS 序：[7, 8, 6, 13, 1, ...]（消费者内部格 7=(row1,col1)，radius 2）。
+    /// cell8=液体1（列表 idx1）、cell6=液体2（idx2）：
+    /// offset=0 → 从 idx0 扫 → cell8 命中液体1；offset=2 → 从 idx2 扫 → cell6 命中液体2。
+    #[test]
+    fn find_reachable_state_rotates_by_offset() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        // 自定义 4 元素表：0=真空(state0)、1=液体(state2)、2=液体(state2)、3=固体(state3)
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.element_names.clear();
+            table.state_data.clear();
+            table.liquid_data.clear();
+            table.pressure_data.clear();
+            table.post_process_data.clear();
+            table.temperature_data.clear();
+            for (id, state) in [(0i32, 0u8), (1i32, 2u8), (2i32, 2u8), (3i32, 3u8)] {
+                let mut elem = Element::default();
+                elem.id = id;
+                elem.state = state;
+                table.elements.push(elem);
+                table.state_data.push(ElementStateData { state });
+                table
+                    .liquid_data
+                    .push(ElementLiquidData { state, flow: 0.0, ..Default::default() });
+                table
+                    .pressure_data
+                    .push(ElementPressureData { state, flow: 0.0 });
+                table
+                    .post_process_data
+                    .push(ElementPostProcessData { state, ..Default::default() });
+            }
+        }
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(8, 1); // 液体1 @ 可达列表 idx1
+            updated.mass.set(8, 100.0);
+            updated.temperature.set(8, 300.0);
+            updated.element_idx.set(6, 2); // 液体2 @ 可达列表 idx2
+            updated.mass.set(6, 100.0);
+            updated.temperature.set(6, 300.0);
+        }
+        // 消费者内部格 7 = (row1,col1)，radius 2，target=液体(state2)
+        assert_eq!(
+            find_reachable_state(&sd, 1, 1, 2, 2, 0),
+            Some(1),
+            "offset=0 → 从 idx0 扫 → 液体1"
+        );
+        assert_eq!(
+            find_reachable_state(&sd, 1, 1, 2, 2, 1),
+            Some(1),
+            "offset=1 → 从 idx1 扫 → 液体1"
+        );
+        assert_eq!(
+            find_reachable_state(&sd, 1, 1, 2, 2, 2),
+            Some(2),
+            "offset=2 → 从 idx2 扫 → 液体2"
+        );
         DestroyElementsTable();
     }
 
@@ -2678,6 +2838,53 @@ mod tests {
             assert_eq!(cb.elem_idx, 1);
             assert_eq!(cb.emitted, 1, "真空目标 → emitted=1");
             assert!((cb.mass - 5.0).abs() < 1e-3);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 2026-08-07 MassEmission 位移/失败回调回归：目标格为异元素（固体）且位移失败时，
+    /// 原版不加质量、推失败回调（emitted=0、elem=0xffff、全零）——此前无条件加质量。
+    #[test]
+    fn mass_emission_failure_pushes_failure_callback_without_adding() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_displace_table();
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        // 格 7 放固体（elem 2）
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(7, 2);
+            updated.mass.set(7, 100.0);
+            updated.temperature.set(7, 300.0);
+        }
+        let mut frame = SimFrameInfo::default();
+        frame.mass_emission_messages.push(crate::a_framework::sim_events::MassEmission {
+            game_cell: 0, // → 内部 (row1,col1)=7
+            callback_idx_or_temp: f32::from_bits(42),
+            mass: 5.0,
+            temperature: 300.0,
+            disease_count: 0,
+            element_idx: 1, // 液体 → 目标固体位移失败
+            disease_idx: 0xFF,
+            emitted: 0,
+        });
+        process_mass_emission(&mut frame, &mut sd);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(7), 2, "原格保持固体");
+            assert!(
+                (updated.mass.get(7) - 100.0).abs() < 1e-3,
+                "位移失败不应加质量，got {}",
+                updated.mass.get(7)
+            );
+            let events = &*sd.sim_events.ptr;
+            assert_eq!(events.mass_emitted_callbacks.len(), 1, "应推失败回调");
+            let cb = events.mass_emitted_callbacks.get(0);
+            assert_eq!(cb.callback_idx, 42);
+            assert_eq!(cb.elem_idx, 0xFFFF);
+            assert_eq!(cb.emitted, 0);
+            assert_eq!(cb.mass, 0.0);
+            assert_eq!(cb.disease_idx, 0xFF);
         }
         DestroyElementsTable();
     }

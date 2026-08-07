@@ -154,9 +154,9 @@ fn cell_read(
 
     // L542: 读取 temperature
     let mut temperature = reader.read_float()?;
-    // L545-551: if !_finite(temperature) → 300.0 (0x43928000)
+    // L545-551: if !_finite(temperature) → 293.0 (0x43928000，2026-08-07 修正：此前误译成 300.0)
     if !temperature.is_finite() {
-        temperature = 300.0f32;
+        temperature = 293.0f32;
     }
     cells.temperature.set(cell_idx, temperature);
 
@@ -280,10 +280,10 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
                     return std::ptr::null_mut();
                 }
 
-                // L62-68: if temperature <= 0 → 300.0
+                // L62-68: if temperature <= 0 → 293.0（0x43928000，2026-08-07 修正）
                 let temp = cells.temperature.get(cell_idx);
                 if temp <= 0.0 {
-                    cells.temperature.set(cell_idx, 300.0);
+                    cells.temperature.set(cell_idx, 293.0);
                 }
 
                 // L69-75: if radiation <= 0 → 0
@@ -1084,11 +1084,42 @@ pub fn handle_define_world_offsets(reader: &mut BinaryBufferReader) -> *mut c_vo
 ///
 /// **注意**：game_sync 会阻塞等待 sim 线程的 SimSync。
 /// 如果 sim 线程未启动（m_initialized=false），跳过 game_sync 直接读取 m_game_data。
-pub fn handle_prepare_game_data(_reader: &mut BinaryBufferReader) -> *mut c_void {
+pub fn handle_prepare_game_data(reader: &mut BinaryBufferReader) -> *mut c_void {
     let fs_ptr = crate::a_framework::frame_sync::FrameSync::get_ptr();
     if fs_ptr.is_null() {
         tracing::error!("PrepareGameData: G_FRAME_SYNC not initialized");
         return std::ptr::null_mut();
+    }
+
+    // 0. 摄取 C# 每帧上传的 Grid.Visible 载荷（Game.cs L1060：PrepareGameData 消息载荷，
+    // 原版 GameSyncFunction 02_save_load.c L666-684 断言剩余 == width×height 后 memcpy 到
+    // mGameData.visibleGrid，交换后成为 sim 下一帧的可见性缓冲）。
+    // 2026-08-07 补齐：此前载荷被直接丢弃 → visible_grid 恒 0xFF → 未探索区域也持续生成
+    // 液滴/矿石/碎片回调（与原版行为不符 + 无谓开销；原版特性.txt §2 结论已订正）。
+    unsafe {
+        let gd_ptr = (*fs_ptr).m_game_data.ptr;
+        if !gd_ptr.is_null() {
+            let gd = &mut *gd_ptr;
+            let total = (gd.width as usize).saturating_mul(gd.height as usize);
+            let remaining = reader.remaining() as usize;
+            if !gd.visible_grid.ptr.is_null() && total > 0 {
+                if remaining >= total {
+                    let dst = std::slice::from_raw_parts_mut(gd.visible_grid.ptr, total);
+                    for i in 0..total {
+                        match reader.read_byte() {
+                            Ok(b) => dst[i] = b,
+                            Err(_) => break,
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "PrepareGameData: payload {}B < game cells {}B",
+                        remaining,
+                        total
+                    );
+                }
+            }
+        }
     }
 
     // 1. game_sync：等待 sim 线程数据就绪，交换双缓冲

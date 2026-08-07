@@ -304,12 +304,13 @@ pub extern "C" fn SYSINFO_Acquire() -> *mut c_char {
 
 /// SYSINFO_Release：释放系统信息字符串。
 ///
-/// 对照源码 01_sim_api.c。
+/// 对照源码 01_sim_api.c：`void SYSINFO_Release(void)`——无参，从全局指针释放
+/// （2026-08-07 修正：此前多一个 ptr 形参，与 C# DllImport 声明不符）。
 #[no_mangle]
-pub extern "C" fn SYSINFO_Release(ptr: *mut c_char) {
+pub extern "C" fn SYSINFO_Release() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         tracing::trace!("SYSINFO_Release called");
-        unsafe { sysinfo::release(ptr); }
+        unsafe { sysinfo::release(); }
     }));
 }
 
@@ -452,13 +453,13 @@ mod tests {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let ptr = SYSINFO_Acquire();
         assert!(!ptr.is_null());
-        SYSINFO_Release(ptr);
+        SYSINFO_Release();
     }
 
     #[test]
-    fn sysinfo_release_null_is_safe() {
+    fn sysinfo_release_no_arg_is_safe() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
-        SYSINFO_Release(std::ptr::null_mut());
+        SYSINFO_Release();
     }
 
     #[test]

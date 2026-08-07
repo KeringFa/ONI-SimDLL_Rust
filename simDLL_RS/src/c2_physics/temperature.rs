@@ -533,7 +533,12 @@ pub(crate) fn do_state_transition(
                 || sim.debug_properties.is_debug_editing;
             if visible {
                 if let Some(elem) = get_element_by_idx(etd.low_temp_transition_idx) {
-                    if elem.low_temp - 3.0 <= t && t <= elem.high_temp + 3.0 {
+                    // 原版 L345-349：范围检查用**已写入的新温度**（max(0, t+1.5)），
+                    // 不是原始 t——此前用旧温度导致低温相变窗口判断偏严：
+                    // t < 目标低变下限-3 但新温度落在窗口内时，原版会 push 液滴，
+                    // Rust 却保格换元素（质量不清、无液滴）。2026-08-07 CRITICAL-2 修复。
+                    let new_t = updated.temperature.get(cell);
+                    if elem.low_temp - 3.0 <= new_t && new_t <= elem.high_temp + 3.0 {
                         let events = unsafe { &mut *sim.sim_events.ptr };
                         events.spawn_liquid_info.push(SpawnFallingLiquidInfo {
                             cell_idx: gc,
@@ -746,9 +751,13 @@ pub(crate) fn update_temperature_for_backwall(sim: &mut SimData, cell: usize) {
             k * mult_cell * mult_back,
         )
     };
-    // 原版 wrapper CalculateTemperatureExchange（L133079）自动按温度排序，返回 (new_back, new_cell)
+    // 原版 L134079-134099：实参 (cell, back) 调用，A 侧（偏移4）更新格子、B 侧（偏移0）写背墙。
+    // calculate_temperature_exchange_precise 返回逻辑序 (new_a, new_b)（第一实参侧, 第二实参侧）。
+    // 2026-08-07 修复：此前两个分支都对调返回值 → 格子拿到背墙温度、背墙拿到格子温度
+    // （全图背墙换热方向性错乱；测试仅不等式断言未能捕获）。
     let (new_back, new_cell) = if t_cell <= t_back {
-        let (nb, nc) = calculate_temperature_exchange_precise(
+        // a=cell, b=back → (new_cell, new_back)；映射回 (new_back, new_cell)
+        let (nc, nb) = calculate_temperature_exchange_precise(
             0.01,
             k_total,
             0.2,
@@ -759,7 +768,8 @@ pub(crate) fn update_temperature_for_backwall(sim: &mut SimData, cell: usize) {
         );
         (nb, nc)
     } else {
-        let (nc, nb) = calculate_temperature_exchange_precise(
+        // a=back, b=cell → (new_back, new_cell)
+        let (nb, nc) = calculate_temperature_exchange_precise(
             0.01,
             k_total,
             0.2,
@@ -1004,6 +1014,32 @@ mod tests {
         assert_eq!(events.spawn_liquid_info.len(), 1, "可见且上格非固态 → 液滴");
         let u = unsafe { &*sd.updated_cells.ptr };
         assert_eq!(u.element_idx.get(20), sd.vacuum_element_idx);
+    }
+
+    /// CRITICAL-2 回归（2026-08-07）：低温相变液滴的范围检查必须用**新温度**
+    /// max(0, t+1.5)（原版 L345-349），不是原始 t。
+    /// 蒸汽 t=-4℃：旧温度 -4 < 水低变窗口下界 -3 → 检查失败（旧实现保格换元素）；
+    /// 新温度 max(0, -4+1.5)=0 ∈ [-3, 103] → 原版 push 液滴（T=0、整格质量、清格）。
+    #[test]
+    fn low_transition_range_check_uses_new_temperature() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_phase_table();
+        let mut sd = make_sim();
+        fill(&mut sd, 20, 3, 5.0, -4.0); // 蒸汽 → 低变=水（非固态）
+        let etd = get_element_temperature_data(3).unwrap();
+        assert!(do_state_transition(&mut sd, 20, &etd));
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.spawn_liquid_info.len(), 1, "新温度通过窗口 → 液滴");
+        let drop = events.spawn_liquid_info.get(0);
+        assert_eq!(drop.element_idx, 1, "目标=水");
+        assert!((drop.mass - 5.0).abs() < 1e-4, "液滴质量=整格质量");
+        assert!(
+            (drop.temperature - 0.0).abs() < 1e-4,
+            "push 温度 = max(0, t+1.5) = 0，got {}",
+            drop.temperature
+        );
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(20), sd.vacuum_element_idx, "push 后清格");
     }
 
     #[test]
@@ -1547,6 +1583,52 @@ mod tests {
             // 背墙 500°C > 0+3 → 相变事件
             let events = &*sd.sim_events.ptr;
             assert_eq!(events.backwall_should_transition_info.len(), 1);
+        }
+    }
+
+    /// 2026-08-07 背墙换热对调回归：格子与背墙热容悬殊时，交换方向可精确区分。
+    /// 格 14：水 300℃（mass=100 → HC=417.9）；背墙：砖 500℃（mass=100 → HC=80）。
+    /// 修复前两个分支对调返回值 → 格子拿到背墙温度（~499）、背墙拿到格子温度（~300）。
+    /// 修复后：格子微升（<310）、背墙微降（>490）。
+    #[test]
+    fn backwall_exchange_cell_gets_cell_temp_not_backwall() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_pair_table();
+        let mut sd = make_sim();
+        unsafe {
+            let c = &mut *sd.cells.ptr;
+            let u = &mut *sd.updated_cells.ptr;
+            let bw = &mut *sd.backwall.ptr;
+            // 格 14：水 300℃；背墙：砖 500℃
+            for buf in [&mut *c, &mut *u] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 100.0);
+                buf.temperature.set(14, 300.0);
+                buf.insulation.set(14, 255);
+            }
+            bw.element_idx.set(14, 2);
+            bw.mass.set(14, 100.0);
+            bw.temperature.set(14, 500.0);
+        }
+        update_temperature_for_backwall(&mut sd, 14);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            let bw = &*sd.backwall.ptr;
+            let new_cell = u.temperature.get(14);
+            let new_back = bw.temperature.get(14);
+            assert!(
+                new_cell < 310.0,
+                "格子只应微升（水 HC 大），got {new_cell}（若≈499 说明拿到背墙温度=写反）"
+            );
+            assert!(
+                new_cell > 300.0,
+                "格子应从 300 微升，got {new_cell}"
+            );
+            assert!(
+                new_back > 490.0,
+                "背墙只应微降（砖 HC 小），got {new_back}（若≈300 说明拿到格子温度=写反）"
+            );
+            assert!(new_back < 500.0, "背墙应从 500 微降，got {new_back}");
         }
     }
 

@@ -219,6 +219,9 @@ pub fn copy_sim_data_to_game(
         );
     }
 
+    // 病菌发射信息交付（2026-08-07 补齐：此前缺失 → C# diseaseEmittedInfos 恒空）
+    crate::c_simulation::disease_component::swap_disease_emitted_output(game_data);
+
     // ElementChunk 每帧输出（原版 CopySimDataToGame elementChunkInfo 交换）
     crate::c_simulation::element_chunk::swap_element_chunk_output(game_data);
 

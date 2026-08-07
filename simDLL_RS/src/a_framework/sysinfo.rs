@@ -5,6 +5,10 @@
 
 use std::os::raw::c_char;
 use super::abi::SYSINFO_STUB_JSON;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+/// 全局持有 acquire 分配的指针（原版 SYSINFO_Release 无参，从全局取）。
+static SYSINFO_PTR: AtomicPtr<c_char> = AtomicPtr::new(std::ptr::null_mut());
 
 /// 获取系统信息 JSON 字符串。
 ///
@@ -20,6 +24,7 @@ pub fn acquire() -> *mut c_char {
             return std::ptr::null_mut();
         }
         std::ptr::copy_nonoverlapping(json.as_ptr() as *const c_char, ptr, json.len());
+        SYSINFO_PTR.store(ptr, Ordering::SeqCst);
         ptr
     }
 }
@@ -28,9 +33,12 @@ pub fn acquire() -> *mut c_char {
 ///
 /// 对照源码 SYSINFO_Release，A1 阶段释放 acquire 分配的内存。
 ///
+/// 释放系统信息字符串（原版签名无参：从全局指针取，2026-08-07 修正）。
+///
 /// # Safety
-/// ptr 必须是 acquire 返回的指针。
-pub unsafe fn release(ptr: *mut c_char) {
+/// 必须与 acquire 配对调用。
+pub unsafe fn release() {
+    let ptr = SYSINFO_PTR.swap(std::ptr::null_mut(), Ordering::SeqCst);
     if ptr.is_null() {
         return;
     }
@@ -47,11 +55,14 @@ mod tests {
     fn acquire_returns_non_null() {
         let ptr = acquire();
         assert!(!ptr.is_null());
-        unsafe { release(ptr); }
+        unsafe { release(); }
     }
 
     #[test]
-    fn release_null_is_safe_no_op() {
-        unsafe { release(std::ptr::null_mut()); }
+    fn release_clears_global() {
+        let ptr = acquire();
+        unsafe { release(); }
+        assert_eq!(SYSINFO_PTR.load(Ordering::SeqCst), std::ptr::null_mut());
+        let _ = ptr;
     }
 }

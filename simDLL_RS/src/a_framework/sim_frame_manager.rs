@@ -623,16 +623,19 @@ impl SimFrameManager {
         // 源码取第一个的 elapsedSeconds 作为帧时间。
         // 每个结构体：elapsedSeconds(4) + minX(4) + minY(4) + maxX(4) + maxY(4) + sunlight(4) + cosmicRad(4) = 28B
 
-        let frame_count = (reader.buffer_size as usize) / 28;
+        // 2026-08-07 修正：用剩余字节数而非 buffer_size（批量/多消息场景更稳妥；
+        // 单消息时二者等价）。
+        let frame_count = (reader.remaining() as usize) / 28;
         if frame_count == 0 {
-            tracing::warn!("NewGameFrame: buffer too small (size={})", reader.buffer_size);
+            tracing::warn!(
+                "NewGameFrame: buffer too small (remaining={})",
+                reader.remaining()
+            );
             return;
         }
 
         // 读取所有 NewGameFrame 结构体
         let mut regions: Vec<ActiveRegion> = Vec::with_capacity(frame_count);
-        // 2026-08-04 D1 探针（临时）：记录首帧原始坐标（未 +1 边界偏移）。
-        let mut diag_raw: Vec<(i32, i32, i32, i32)> = Vec::new();
         let mut elapsed_seconds = 0.0f32;
 
         for i in 0..frame_count {
@@ -652,9 +655,6 @@ impl SimFrameManager {
             let max_y = i32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
             let sunlight = f32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
             let cosmic_rad = f32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
-            if diag_raw.len() < 16 {
-                diag_raw.push((min_x, min_y, max_x, max_y));
-            }
 
             if i == 0 {
                 elapsed_seconds = elapsed;
@@ -669,19 +669,6 @@ impl SimFrameManager {
                 current_sunlight_intensity: sunlight,
                 current_cosmic_radiation_intensity: cosmic_rad,
             });
-        }
-
-        // 2026-08-04 D1 探针（临时）：首帧打印活动区域数量与原始坐标（未 +1），
-        // 确认 C# 下发的是"已发现世界整块矩形"（对照 DefineWorldOffsets 的世界偏移）。
-        static NEW_GAME_FRAME_DIAG: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !NEW_GAME_FRAME_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!(
-                frame_count,
-                elapsed_seconds,
-                ?diag_raw,
-                "NewGameFrame: first-frame diag (raw coords, no +1)"
-            );
         }
 
         // 写入 currentFrame.elapsedSeconds

@@ -2954,8 +2954,12 @@ fn do_pressure_break(sim: &mut SimData, cell: usize, ratio: f32, offset: isize) 
         }
         iter += 1;
     }
-    // 原版 L2716：穿过固体少于 3 格且阻力 < 压强 → 突破
-    if (solid_count as i32 - 1) < 2 && resistance < ratio {
+    // 原版 L2716：`(uVar9 - 1 < 2)`，uVar9 为 uint —— 0 格固体时 0u32-1 回绕为
+    // 0xFFFFFFFF，判断为 false（不突破），仅 1~2 格固体可突破。
+    // 修复：此前 `(solid_count as i32 - 1) < 2` 在 0 时得 -1<2=true，超压液体
+    // 遇开放方向（真空/气体）会误报“突破成功”提前返回，跳过其余方向的墙壁
+    // 破坏与下方倾倒（原版会继续尝试 → 与用户实测液体行为不符）。
+    if (solid_count == 1 || solid_count == 2) && resistance < ratio {
         let c = cur as usize;
         if c < total {
             let updated = unsafe { &*sim.updated_cells.ptr };
@@ -5579,7 +5583,8 @@ mod tests {
     }
 
     /// 超压释放·开放方向（原版 DoPressureBreak L2663-2792）：cell 上方（cell-6）真空 →
-    /// 第一方向突破成功（无 damage，0 格固体）→ 不再向下倾倒。下方格（cell+6）保持原样。
+    /// **0 格固体不突破**（原版 uVar9 为 uint，0-1 回绕 → 判断 false，液体边界调整
+    /// 也在该守卫内，同样不生效）→ 4 方向全失败 → 进入下方倾倒。
     #[test]
     fn post_process_overpressure_releases_through_open_direction() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
@@ -5600,18 +5605,71 @@ mod tests {
         post_process_cell(&mut sd, 14);
         unsafe {
             let updated = &*sd.updated_cells.ptr;
+            // DisplaceLiquid(20)：100 均分给 19/21/14/26（各 25）→ 20 清空；
+            // 随后转移 2025×0.49751243 ≈ 1007.46 到 20
+            let expect_dump = 2025.0 * 0.49751243;
             assert!(
-                (updated.mass.get(14) - 2000.0).abs() < 1e-3,
-                "开放方向释放 → 源格质量不变，got {}",
+                (updated.mass.get(14) - (2025.0 - expect_dump)).abs() < 1.0,
+                "0 格固体不突破 → 源格下方倾倒剩 ~1017.5，got {}",
                 updated.mass.get(14)
             );
             assert!(
-                (updated.mass.get(20) - 100.0).abs() < 1e-3,
-                "开放方向释放 → 不倒向 cell20，got {}",
+                (updated.mass.get(20) - expect_dump).abs() < 1.0,
+                "0 格固体不突破 → cell20 应得 ~1007.5，got {}",
                 updated.mass.get(20)
             );
+            assert_eq!(updated.element_idx.get(20), 1);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 超压开放方向不得误报突破（回归 2026-08-06）：cell 上/左/右均为真空（0 格固体），
+    /// 下方 1100kg 重液（ratio_after=2.0-1.1=0.9 < resistance=1.0，向下也挡）。
+    /// 原版 4 方向全失败 → 进入下方倾倒（DisplaceLiquid + 转移 ×0.49751243）。
+    /// 此前 `(solid_count as i32 - 1) < 2` 使 0 格固体时在“上”方向误报突破成功，
+    /// 提前 return，水既不突破也不倾倒（与用户实测液体行为不符）。
+    #[test]
+    fn post_process_overpressure_open_direction_falls_through_to_dump() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 2000.0); // > maxMass(1000)×1.5
+                buf.temperature.set(14, 300.0);
+                // 下方（cell+6=20）液体 1100：向下突破 ratio_after=0.9 < 1.0 → 挡
+                buf.element_idx.set(20, 1);
+                buf.mass.set(20, 1100.0);
+                buf.temperature.set(20, 300.0);
+                // 上（8）/左（13）/右（15）= 真空（0 格固体，不突破）
+            }
+        }
+        post_process_cell(&mut sd, 14);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            // DisplaceLiquid(20)：1100 均分给 19/21/14/26（各 275）→ 20 清空；
+            // 随后转移 2275×0.49751243 ≈ 1131.84 到 20
+            let expect_dump = 2275.0 * 0.49751243;
+            assert!(
+                (updated.mass.get(20) - expect_dump).abs() < 1.0,
+                "cell20 应得 ~1131.8（下方倾倒），got {}",
+                updated.mass.get(20)
+            );
+            assert_eq!(updated.element_idx.get(20), 1);
+            assert!(
+                (updated.mass.get(14) - (2275.0 - expect_dump)).abs() < 1.0,
+                "源格应剩 ~1143.2，got {}",
+                updated.mass.get(14)
+            );
+            assert!(
+                (updated.temperature.get(20) - 300.0).abs() < 1e-3,
+                "倾倒温度应随源格，got {}",
+                updated.temperature.get(20)
+            );
             let events = &*sd.sim_events.ptr;
-            assert_eq!(events.world_damage_info.len(), 0, "开放方向（0 格固体）无 damage");
+            assert_eq!(events.world_damage_info.len(), 0, "开放方向无墙壁 damage");
         }
         DestroyElementsTable();
     }

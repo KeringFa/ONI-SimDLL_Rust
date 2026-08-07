@@ -241,13 +241,16 @@ pub(crate) fn update_building_to_building_inner(
         }
         let bldg_hc = bldg.total_heat_capacity;
         let bldg_tc = bldg.thermal_conductivity;
+        // 原版 L36659 每轮重读 `*pfVar20`（建筑实时温度，前一接触已写回）→ 逐接触累积。
+        // 2026-08-07 修复：此前用循环前快照 → 多接触时只有最后一个接触对建筑生效。
+        let mut cur_bldg_temp = bldg.temperature;
         for (ch, c) in contacts {
             let c_hc = c.total_heat_capacity;
             if c_hc <= 0.0 {
                 continue;
             }
             // 暖侧 HC：contactT < bldgT → bldgHC，否则 contactHC
-            let f21 = if c.temperature < bldg.temperature {
+            let f21 = if c.temperature < cur_bldg_temp {
                 bldg_hc
             } else {
                 c_hc
@@ -256,25 +259,25 @@ pub(crate) fn update_building_to_building_inner(
                 * scale
                 * c.thermal_conductivity
                 * bldg_tc
-                * (c.temperature - bldg.temperature)
+                * (c.temperature - cur_bldg_temp)
                 * f21
                 * 0.005;
-            let mut new_b = k / bldg_hc + bldg.temperature;
+            let mut new_b = k / bldg_hc + cur_bldg_temp;
             new_b = new_b.max(min_seen).min(max_seen);
             let mut new_c = c.temperature - k / c_hc;
             new_c = new_c.max(min_seen).min(max_seen);
             // 能量守恒：min(|Δbldg|×bldgHC, |Δcontact|×contactHC)，带 k 符号
-            let e1 = (new_b - bldg.temperature).abs() * bldg_hc;
+            let e1 = (new_b - cur_bldg_temp).abs() * bldg_hc;
             let e2 = (new_c - c.temperature).abs() * c_hc;
             let mut ec = e1.min(e2);
             if k < 0.0 {
                 ec = -ec;
             }
-            new_b = ec / bldg_hc + bldg.temperature;
+            new_b = ec / bldg_hc + cur_bldg_temp;
             new_c = c.temperature - ec / c_hc;
             // 交叉（方向反转）→ 热容加权平均钳制
-            if (new_b - new_c) * (bldg.temperature - c.temperature) < 0.0 {
-                new_b = (c.temperature * c_hc + bldg.temperature * bldg_hc) / (c_hc + bldg_hc);
+            if (new_b - new_c) * (cur_bldg_temp - c.temperature) < 0.0 {
+                new_b = (c.temperature * c_hc + cur_bldg_temp * bldg_hc) / (c_hc + bldg_hc);
                 new_b = new_b.max(min_seen).min(max_seen);
                 new_c = new_b;
             }
@@ -297,6 +300,7 @@ pub(crate) fn update_building_to_building_inner(
                 rec.heat_exchange_handle,
                 new_b,
             );
+            cur_bldg_temp = new_b;
         }
     }
 }

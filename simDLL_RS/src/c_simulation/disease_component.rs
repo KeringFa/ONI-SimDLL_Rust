@@ -232,6 +232,23 @@ pub fn disease_emitter_count() -> usize {
     DISEASE_EMITTER_MANAGER.lock().active_count()
 }
 
+/// 每帧输出交付（原版 CopySimDataToGame diseaseEmittedInfo 拷贝 + 源重置）：
+/// resize game 到 sim 长度 → 逐条拷贝 → 源条目重置为 {0xFF, 0}（无发射帧不残留旧数据）。
+/// 2026-08-07 补齐：此前 copy_sim_data_to_game 从未交付该通道，C# diseaseEmittedInfos 恒空。
+pub fn swap_disease_emitted_output(game_data: &mut crate::a_framework::game_data::GameData) {
+    let mut mgr = DISEASE_EMITTER_MANAGER.lock();
+    let n = mgr.emitted_info.len();
+    game_data.disease_emitted_info.resize(n, Default::default());
+    for idx in 0..n {
+        game_data.disease_emitted_info.set(idx, mgr.emitted_info[idx]);
+        mgr.emitted_info[idx] = crate::a_framework::game_data::DiseaseEmittedInfo {
+            disease_idx: 0xFF,
+            padding: [0; 3],
+            count: 0,
+        };
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn disease_emitter_record(handle: i32) -> Option<DiseaseEmitterData> {
     DISEASE_EMITTER_MANAGER.lock().record(handle).copied()
