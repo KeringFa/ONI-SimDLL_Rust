@@ -1,0 +1,67 @@
+# 原版特性/缺陷记录（2026-08-05 起）
+
+> 记录原版 simDLL/C# 中经实测确认的**特性或缺陷**，供日后回归对照。项目版保持严格对照原版，
+> 除非用户明确要求"偏离修复"，否则不主动修改这些行为。
+
+## 1. 盐水分批相变不产盐（2026-08-05 实测确认，判定为原版缺陷，不修复）
+
+**现象**：
+- 原版 ≥5kg 盐水被热源分批（5kg/批）蒸发（DoPartialHeatTransition）时，只产生蒸汽，
+  **不产生盐**——该分支没有 highTempTransitionOre 处理。
+- 原版 <5kg 盐水高温相变（DoStateTransition）会产盐：
+  实测 4kg → 0.28kg 盐 = 4 × 0.07（SaltWater highTempTransitionOreMassConversion）。
+
+**机制**（04_temperature.c）：
+- `DoPartialHeatTransition`（L2105-2471）：mass≥5、本格温度 < high−3 时每批抽邻格热量
+  转 5kg 为蒸汽排走（气体目标排下方格/本格；液体目标 SpawnFallingLiquid）——
+  **无 SpawnOre 分支**，且 mass==5 也放行（可整批蒸发完，全程不产盐）。
+- `DoStateTransition`（L78-260）高温分支：整格切换为 highTempTransitionIdx +
+  按 oreMassConversion 扣质量 SpawnOre（盐）。
+
+**项目版实测**（测试 `partial_evaporation_completes_without_ore`，253f103）：
+- 100kg 盐水被热源缓慢加热 → partial 全程拦截（20 次×5kg）→ 完全蒸发为蒸汽、零 SpawnOre；
+- DoStateTransition 路径产盐 7% 与原版 4kg 测试一致。项目版行为与原版完全一致。
+
+**决定**：判定为原版缺陷（partial 漏 ore 处理），**不修复**、不复刻也不偏离；
+保持严格对照原版。若日后用户要求"分批也产盐"（偏离修复），需另行立项。
+
+## 2. visibleGrid 可见性门控——经 PrepareGameData 载荷上传（2026-08-07 订正）
+
+**订正说明**：2026-08-06 曾定性为"消息已废弃、全可见兜底"，该结论**前提不成立**——
+原调查以标识符 `visibleGrid` 检索 C#，但 C# 侧字段名是 **`Grid.Visible`**，因而漏检。
+
+**正确机制**：
+- C# `Game.StepTheSim`（Game.cs L1055-1060）**每帧**发送：
+  `Sim.HandleMessage(SimMessageHashes.PrepareGameData, Grid.Visible.Length, Grid.Visible)`，
+  载荷即战争迷雾/已探索度字节数组（Grid.Visible，Grid.cs L718）；
+- 原版 `PrepareGameData`（02_save_load.c L346-401）→ `GameSyncFunction`（L666-684）
+  断言剩余字节 == width×height 后 memcpy 到 mGameData.visibleGrid，交换后成为
+  sim 下一帧的可见性缓冲；
+- simDLL 侧 4 处门控真实生效：SpawnFallingLiquid（L133524）、SpawnOreInfo/回调
+  （L133705）、ElementChunk 回调（L141416）、液滴/气体生成（L146677）——
+  未探索区域不产生这些事件；
+- `SetVisibleCells` 消息确已废弃（无发送方），但可见性数据改由 PrepareGameData 载荷传入。
+
+**项目版**：2026-08-07 已修复 `handle_prepare_game_data`（此前丢弃载荷 → visible_grid
+恒 0xFF）；现在每帧把 Grid.Visible 写入 m_game_data.visible_grid（交换前，镜像原版），
+未探索区域不再持续生成液滴/矿石/碎片回调（行为对齐 + 性能收益）。
+
+**决定**：按原版实现；已修复并实测（全量回归通过）。
+
+## 3. HEP 辐射粒子系统归属——C# 本体 + simDLL 三件套（2026-08-06 定性）
+
+**结论**：辐射粒子（Radbolt）本体是 **C# 纯游戏对象**（HighEnergyParticle.cs）：
+- 飞行：MovingUpdate 按方向×速度移动，逐格 payload−0.1 + 非真空格
+  ModifyDiseaseOnCell(RadiationPoisoning, 5)；payload≤0 自毁；
+- 碰撞：撞 HighEnergyParticlePort（捕获/穿过）、撞粒子（合并）、撞动物/复制人
+  （Health.Damage(20) + 病菌）、撞固体（爆炸）——纯 C# 碰撞/伤害/动画；
+- 爆炸（EmitRemainingPayload）：`emitter.emitRads = payload×0.5×600/9` +
+  `SimMessages.AddRemoveSubstance(Fallout, payload×0.001, 5000K, RadiationPoisoning)`。
+
+**simDLL 侧仅三件（均已实现并实测对齐）**：
+1. RadiationEmitter 组件（粒子飞行/爆炸时发射辐射——radiation_emitter.rs）；
+2. ModifyCell Add 生成 Fallout 固体（add_solid 链路）；
+3. ModifyDiseaseOnCell 病菌修改（病菌组件）。
+
+**用户实测验收**：撞墙生成放射性污染物 + 大量辐射、生成/飞行逐格衰减、
+撞击动物/复制人伤害均与原版无异。此问题完结。

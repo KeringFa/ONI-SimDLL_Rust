@@ -1,4 +1,9 @@
-﻿# 代办清单
+# 代办清单
+
+> **归档说明（2026-08-07）**：历史规划/审查文档（docs/superpowers、.superpowers、
+> 全量对照审查、疑难杂症.txt 等）已移至 `other/` 归档（git 忽略），避免干扰后续
+> 分析。本清单仍为唯一进行中记录；原版特性.txt 为对照参考（§2 可见性结论已订正）。
+
 
 ## [进行中] 全量代码审查（2026-08-02）
 
@@ -18,7 +23,7 @@
 **第一轮审查发现（2026-08-02，内联执行；子代理消息投递在本环境不可用）**：
 - ✅ 元素表 9 个附属结构字段映射逐行核对正确（03_elements.c L296-382）；消息结构体布局（MassConsumption/MassEmission/ModifyCell/DigPoint）与 C# 声明一致。
 - 🔴 **Critical：copy_sim_data_to_game 事件交换缺失 consumed_mass_info / emitted_mass_info** → **已修复**（2026-08-02 17:49 轮：补交换 + 实现 ElementConsumer 消费链路）。
-- 🟠 **Important：process_mass_emission 空桩** → **已实现**（消息式发射：加质量+事件+MassEmittedCallback）；ElementEmitter 组件本体（喷口建筑逐帧发射）仍待实现；RadiationEmitter/ElementChunk/BuildingHeatExchange 等组件消息仍被丢弃。
+- 🟠 **Important：process_mass_emission 空桩** → **已实现**（消息式发射：加质量+事件+MassEmittedCallback）；ElementEmitter / RadiationEmitter / ElementChunk / BuildingHeatExchange 等组件消息**均已实现**（2026-08-06 确认，早期"仍被丢弃/待实现"记录过时）。
 - 🟡 Minor：elements_table.rs 过时注释（L305 映射描述仍为旧错误）；病菌汇总简化（与已知偏差一致）。
 - 修复进度：① ✅ 补交换 + ElementConsumer（水泵链路：注册→设速率→逐帧 BFS 消费→consumedMassInfo 回传，句柄经 component_state_changed 回传 C#）② ✅ MassEmission 消息（加质量+回调）③ ✅ 过时注释清理。
 
@@ -39,9 +44,24 @@
 ## [备忘] 遗留技术隐患与已知偏差（含审查待分诊）
 
 - **测试套件并行 flaky（不做处理，仅知悉）**：全量 `cargo test` 偶发 lib 失败（frame_processor/sim_data_ops 等不持 LIB_TESTS_LOCK 的既有竞态，多次确认与新增代码无关），串行 `--test-threads=1` 稳定全过。对策：遇 flaky 用 `cargo test -- --test-threads=1`。
-- **液体已知偏差**：① ~~病菌混合简化（无 gDisease 表）~~ **已解决（2026-08-05 病菌表阶段 1）**；② 相变留桩（升华/熔融发射未实现，仅累积纹理值）；③ powf 参数反编译丢失取 1.0（仅影响 alpha）；④ 压力循环门控只跳固体（原版更严 state&3<2）；⑤ post_process 过压分支潜在 0/0 NaN（观察未修，ppd.max_mass 修复后风险降低）。
-- **气体分层 bug**：DoDensityDisplacement 对气体也生效（原版 L1810 同款），用户判定为行为 bug，暂不修（保留决策）。
-- **visible_grid 全可见兜底**：屏幕外也会发液滴事件（开销问题，不影响行为）；SetVisibleCells 消息的 C# 发送方未定位，找到后可做屏幕级门控。
+- **液体已知偏差（2026-08-06 C2 收尾审查：①~⑤ 全部已解决）**：
+  ① ~~病菌混合简化~~ **已解决（2026-08-05 病菌表阶段 1）**；
+  ② ~~相变留桩~~ **已解决（升华/持续蒸发 2026-08-03 用户实测验收；DoStateTransition
+     熔融发射/cellMeltedInfo 已实现）**；
+  ③ ~~powf 占位~~ **已解决（2026-08-06 液面高度 mass/1000，3af2d31）**；
+  ④ ~~压力循环门控只跳固体~~ **已解决（2026-08-03 修正：邻格 pressure state&3<=1，
+     同元素液体邻格不再纳入压差）**；
+  ⑤ ~~post_process 过压 0/0 NaN~~ **已解决（2026-08-03 ppd.max_mass>0 守卫）**。
+- **气体分层（保持原版，2026-08-06 已确认影响）**：DoDensityDisplacement 对气体也
+  生效（原版 L1810 同款）——影响 = **气体密度分层**：重气（CO2）沉底、轻气（O2）
+  上浮（摩尔质量比较）+ 同元素温度驱动交换（暖上升）。用户实测 CO2 全部沉底且
+  与原版一致；分层速度正常。**已完结（决定保持原版，不修）**。
+- **visible_grid（消息已废弃，2026-08-06 定性）**：C# 两个托管程序集**完全无
+  visibleGrid 引用**，SetVisibleCells 仅是 SimMessageHashes 遗留常量（无发送方）；
+  原版 simDLL 也只有常量、无 handler。可见性数组由 simDLL 构造时初始化（行为上
+  全可见——原版液滴正常生成即证门控通过）。**原版当前版本同样"全可见兜底"**，
+  屏幕外发液滴事件是原版行为，非性能缺口；本项目 0xFF 初始化 + 每帧 swap 一致。
+  **已完结（已写入 原版特性.txt §2）**。
 - **液体性能（已知优化项）**：元素表每格加锁查询（G_ELEMENTS_TABLE Mutex），液体密集区帧率可能受影响；优化方向：update_data 一次性读出元素数据快照或改 RwLock。
 - **game_data.rs 释放不一致**：game_data.rs 同样 leak 分配 flow/accumulated_flow（L309-332）但 Drop 未释放（L356 注释已过时）；sim_data.rs 已补释放，建议统一。
 
@@ -377,8 +397,8 @@
 - **病菌混合简化（gDisease 表）**：~~混合已实现~~（2026-08-05 病菌表阶段 1）；
   格子病菌模拟全量（UpdateCells/PostProcess/CalculateFinalDiseaseCount）仍待
   实现，另立项（病菌阶段 2）。
-- **visible_grid 全可见兜底**：SetVisibleCells 消息的 C# 发送方未定位，找到后可做
-  屏幕级门控（性能项）。
+- **visible_grid（消息已废弃，见上方定性）**：C# 无发送方/无引用；原版当前版本
+  同样全可见兜底，行为一致，非性能缺口。
 - **元素表每格加锁性能**：G_ELEMENTS_TABLE Mutex → RwLock/快照（性能项）。
 - **review-full 未覆盖**：a_framework 结构体布局全量核对（00_types_reference）、
   存档格式、FFI 导出、纹理公式细节——建议单独一轮审查。
@@ -650,7 +670,8 @@ update_neighbour_liquid_mass、post_process_cell 气体分支（蒸发/挤压/�
     （已知代办性能项）。但单线程下无锁竞争，且 2x/3x 更忙却不卡 → 非 1x 卡顿
     的唯一/主因，更可能是帧提交节奏（1x 低频率突发）与同步偶合。
   - 正确修法：元素表读路径无锁化（子步内快照/不可变冻结）——跨模块重构，
-    有回归风险；以及定位 C# 侧 SetVisibleCells（visible_grid 屏幕级门控）。
+    有回归风险。visible_grid 门控已定性：SetVisibleCells 消息废弃、C# 无发送方，
+    原版当前版本同样全可见，非性能缺口（见上方定性）。
 - **决策**：暂缓。待 c2 光照/辐射等模块收尾后专项处理（与"元素表每格加锁
   性能"项合并立项）。若用户希望立即处理，先做"子步内元素表快照"重构 +
   游戏内对比 1x/2x/3x 卡顿。
@@ -716,10 +737,13 @@ property_texture`（曝光纹理）+ NewGameFrame 每区域阳光强度；**生�
 - 阶段 B = RadiationEmitter 组件（建筑辐射与生物辐射共用）；用户澄清"建造辐射"= 建筑辐射。
 - **辐射分类澄清（用户）**：建筑辐射与生物辐射同一类（RadiationEmitter，可控发射器）；
   铀元素辐射另一类（铀材料建筑、天然铀矿、熔融铀等——元素辐射，阶段 A 的 25 格核原理）。
-- **辐射粒子系统（HEP/Radbolt）结论**：纯 C#（HighEnergyParticle GameObject）——生成
+- **辐射粒子系统（HEP/Radbolt）结论（2026-08-06 已完结）**：纯 C#（HighEnergyParticle
+  GameObject）——生成
   （Spawner 读 Grid.Radiation）、飞行/衰减消失/撞击砖块/生物全在 C#（Grid 只读 +
   ScenePartitioner）；唯一 sim 交互 = 撞击后 SimMessages.AddRemoveSubstance 生成 Fallout
-  （走 ModifyCell，已实现）。**不属 simDLL 范围，阶段 B 不含粒子系统**。
+  （走 ModifyCell，已实现）+ RadiationEmitter 辐射（粒子飞行/爆炸 emitter.emitRads）
+  + ModifyDiseaseOnCell 病菌。**用户实测验收（2026-08-06）**：撞墙生成放射性污染物 +
+  大量辐射、逐格衰减、撞击动物/复制人伤害均与原版无异。已写入 原版特性.txt §3。
 - **原版细致实测覆盖确认（用户，2026-08-04）**：
   - 铀元素砖/气闸类建筑发射辐射 = 阶段 A 元素辐射（doReplaceElement=true → 格内铀材料
     +质量 → 25 格核）；非密实建筑不替换格内元素 → 不辐射，无新路径；
@@ -1140,7 +1164,8 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
 - **验证**：用户实测植物病菌扩散至气体恢复正常；全量 493 lib + 53 集成测试
   串行全过；release 构建成功。
 - **另**：用户提示"气体纹理 5kg/格、扩散千层饼"为独立长期问题，尚未定位
-  （可能为高气压存档正常表现或流动渲染差异），留待病菌模块审查后复查。
+  （可能为高气压存档正常表现或流动渲染差异）。2026-08-06 用户决定**延后**处理，
+  已留 flow 量级诊断测试作基线（见末尾液面高度完成段）。
 
 ## [已完成] 病菌模块全量对照审查（2026-08-06 内联）
 
@@ -1154,8 +1179,9 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
   DiseaseEmittedInfo/DiseaseConsumedCallback 布局、辐射病菌贡献（+count×0.001）、
   update_data 挂接顺序、copy_sim_data_to_game 病菌字段、跨模块调用方统一语义。
 - 全量 493 lib + 53 集成测试串行全过；release 构建成功。
-- **下一步建议**：气体纹理"5kg/格、扩散千层饼"独立问题复查；或推进后续模块
-  （ElementEmitter 本体 / 升华 / 光照 / 辐射之后的气体模拟等）。
+- **下一步建议**：液面高度（mass/1000）与气体纹理（每帧 flow 清零 e19b5f3）
+  均已实测验收；2026-08-06 C2 收尾审查结论见 review-c2-wrapup.md。后续候选：
+  D 类 rayon 分区分发多线程 / 大类分类优化 / 全量回归实测。
 
 ## [已完成] 塌方/不稳定方块下落 DoUnstableCheck + SetSavedOptions（2026-08-06 内联 TDD）
 
@@ -1205,4 +1231,272 @@ RadialBeams = sim 侧无行为。若日后 mod/DLC 用到再补。
   串行全过；release 构建成功。
 - **待实测**：部署 → 加载存档/开局边界正常（顶行真空/底行 unobtanium）；
   太空暴露删除、气体/液体不回归。
+
+## [已完成] 液面高度修复：mass/maxMass 隐式液面 + 质量差驱动流动（2026-08-06 内联 TDD）
+
+- **现象**：液体无论质量多小均显示满格高度（此前 `liquid_powf()=1.0` 占位，
+  液面 alpha / 梯度深度恒为 1）。
+- **修复（3af2d31）**：`liquid_powf()=1.0` → `liquid_mass_ratio(mass)=clamp(mass/1000,0,1)`：
+  - `UpdateLiquidPropertyTexture` 液面格（上方为气体/真空）alpha = mass/1000
+    （原版 05_liquid_flow.c L397 powf 对应物；`GetEstimatedLiquidGradientValue`
+    显式传入 **1000.0** 满格常量，01 版本实证同语义）；
+  - `estimated_liquid_gradient_value` 梯度深度因子 = mass_ratio；
+  - 幂指数仍按 1.0（非原版 powf 参数，反编译不可恢复）；若实测液面高度曲线
+    与原版有差，再校准幂指数。
+- **流动驱动核对（无需改动，本就成立）**：
+  - 水平扩散（liquid_flow.rs L876）：`f23 = (mass_self − left_mass) × 0.25`，
+    min(viscosity)、门限 min_horizontal_flow —— **质量差驱动**；
+  - 下落（L725-732）：目标容量 = max(mass×1.01, max_mass) − below_mass；
+  - update_pressure（L1096）：`flow_coeff × (mass_cell − mass_neighbor)`，
+    钳制 ±12.5% —— 压力均衡同样由质量差驱动。
+  - 即"液面高度由质量隐式表达、流动由高度差（质量差）驱动"全链路成立。
+- **测试**：+2 回归（surface alpha=25@100kg/1000kg、gradient=0.1）+ 1 诊断
+  （气体扩散 flow 量级基线 `diagnostic_flow_texture_magnitude_gas_diffusion`）；
+  全量 506 lib 测试串行全过；release 构建成功。
+- **气体纹理（2026-08-06 已修复，见末尾根因段 e19b5f3）**：气体扩散"千层饼/
+  水波纹"、稳定后扩散动画仍持续渲染（连自然氧石方块跟着播升华冒泡动画但质量
+  不减少）——根因是项目缺原版 Sim::Main 的每帧 flow 清零，flow 累积历史总量
+  （平衡后 raw 纹理 30.6），C# 25% 混合收敛到 30.6 → 动画永不停止。
+- **待实测**：部署 DLL → 少量液体（如 100kg）液面应为约 1/10 高度，随质量增减
+  平滑变化；液体流动/合并/液滴/满格过压不回归。
+
+## [已完成] 气体纹理根因：每帧 flow 清零（2026-08-06 内联 TDD，e19b5f3）
+
+- **现象**：气体扩散时"千层饼/密集水波纹"；气压稳定后扩散动画仍持续渲染，
+  连自然氧石方块跟着播升华冒泡动画（质量实际不减少）。原版平衡后动画静止。
+- **其他 AI 分析（用户提供）**：simDLL flow 无自动衰减；稳定后"恢复静止"靠
+  DoGasPressureDisplacement 返回 0 / 元素变化 scale 归零 / 质量极小清 flow；
+  真正的渐变恢复由 C# Property.Flow 每帧混合（blend=0.25）完成。
+- **根因（逐层证据）**：
+  1. 原版 Sim::Main（SimDLL_Source.c L2119）在 BeginFrameProcessing 之后有
+     一个每帧 `memset()`——即清零 flow（帧内增量累加器）；另一处 memset
+     （每 16 帧清 accumulated_flow）项目早已实现（copy_sim_data_to_game L317）。
+  2. C# PropertyTextures：Property.Flow 纹理 blend=true、blendSpeed=0.25，
+     每帧把显示值拉向 raw（externalFlowTex = GameData.propertyTextureFlow，
+     Game.cs L1078）；FlowOffsetRenderer 用 Klei/Flow 着色器双缓冲生成偏移动画。
+  3. 交叉验证：old / 神秘版本 frame_manager 均有"帧开始：清零 flow /
+     accumulated_flow / 4 个变化追踪数组"（data.rs L2616）。
+  4. 探针实证：密封房间 100kg 气体（pressure flow=0.1 真实值）扩散到平衡
+     （20000 帧）后，**无清零**时 raw flow 纹理停在 30.6 永不衰减（C# 混合
+     收敛到 30.6）；**每帧清零**后平衡时 raw 纹理趋近 0。
+- **修复（e19b5f3）**：
+  - `sim_data_ops::clear_flow`：整张 flow 数组（Vector4f × width×height 含边界）
+    清为 default；物理阶段只写 flow、不读它做决策 → 零副作用。
+  - sim_thread：BeginFrameProcessing 后调用 clear_flow（镜像原版 Sim::Main
+    L2119 memset 位置：每 wake-up 一次，子步间累积、CopySimDataToGame 时输出）。
+  - 未动 accumulated_flow（原版 16 帧窗口清零已在 copy_sim_data_to_game 实现）。
+- **测试**：+2（`flow_texture_returns_to_rest_when_cleared_each_frame` 平衡后
+  raw 纹理 <0.05、`clear_flow_zeroes_entire_array`）；全量 508 lib 测试串行全过；
+  release 构建成功。
+- **待实测**：部署 DLL → 气体扩散动画在扩散期间正常、气压稳定后 ~1 秒内渐隐至
+  静止；氧石升华冒泡动画不再无故播放；液体流动动画同链路（同步受益）。
+
+## [已完成] 大类分类优化·方案 A（纯文档整理，2026-08-06）
+
+- **产出**：
+  - `docs/superpowers/2026-08-02-module-classification.md` 重写为 2026-08-06 修订版：
+    A/B/C1/C2 语义不变，**D 类正式入册**（d1 活动区域 / d2 线程模型 / d3 rayon 规划）；
+    ElementEmitter / 气体流动 / 辐射 / 疾病全部归位为"完成"；add_solid
+    （DoVerticalDisplacement）从"暂不做"更正为"已实现"；病菌表升级"完成"；
+    已知偏差 ①~⑤ 清零；新增"目录命名已知问题"清单（4 项）。
+  - `docs/superpowers/2026-08-03-module-index.md` 更新：补 gas/radiation/disease/
+    element_emitter/radiation_emitter/disease_component/d1/d2 的原版行号查表，
+    状态列全部修正。
+- **已知问题（记录不处理，D 类开工时一并）**：① sim_frame_manager 语义 C1、
+  位置 a_framework；② c_simulation 与 c2_physics 命名风格不一致（建议统一 c1_*/c2_*）；
+  ③ save_load.rs 混搭 A 存档 + C1 handler；④ d1/d2 语义偏执行层（保持现状）。
+- **零代码改动**（lib.rs 未动、无 git mv），全量 508 测试与 release 构建不受影响。
+- **下一步（用户规划）**：全量回归实测 → 构建仓库安排 rayon（d3 立项时处理
+  上述目录命名问题 + 元素表旧快照双缓冲回收优化）。
+
+## [已完成] DoLiquidPressureDisplacement（液体↔液体挤压，2026-08-06 内联 TDD，090ff04）
+
+- **背景**：用户问"气体不被液体斜角挤压"；排查确认水平挤压→displace_gas 对角逃逸
+  已实现且复现测试通过（ea9c07d）；同时确认**原版液体压力位移（液体↔液体挤压）
+  此前缺失**——run_pressure_task 只做液体→气体/真空质量转移，不覆盖异元素液体邻格。
+- **已实现（严格对照 11_msvcrt_ignored.c L43219-43460，未抄任何项目版本）**：
+  1. `displace_liquid_directional`（L43219-43325）：beyond 为气体 → DisplaceGas 挤走
+     + SwapCells（邻格液体整体搬入）；beyond 为真空 → DisplaceGas 因质量 0 失败
+     （原版怪癖，真空 beyond 挤不动）；beyond 为液体 → 合并 + ClearCell；固体 → false。
+  2. `do_liquid_pressure_displacement`（L43326-43460）：门控（dst 可渗透/异元素/
+     快照一致/dst 为液体）；netFlow = mass[src] − flow 四分量和；beyond+dst 质量
+     < netFlow 才位移；displacement = netFlow×0.125 灌入邻格 + 元素/温度覆盖 +
+     病菌 12.5% 转移（无 0 守卫，原版恒调）+ 源格扣减。
+  3. `run_liquid_displacement_task`（循环 L42480-42557）：区域收缩 [3,w−4]×[3,h−4]
+     （beyond 需 2 格余量，原版 L42520-42528）；左/右按 iterateDirection、
+     下方带 mass≥maxMass 门（maxMass 查 updatedCells 当前元素）；flow x/y/z/w 记账。
+  4. 接线 update_data：update_liquid_loop 之后、CopyFrom 之前（原版位置）。
+- **测试**：+5（beyond 液体合并、beyond 气体逃逸、四门控、循环+flow 记账、病菌
+  12.5%）；全量 514 lib 测试串行全过；release 构建成功。
+- **待实测**：部署 → 异元素液体（如水/污染水）相邻时高压侧挤压低压侧、低压内容
+  被推走；同时请用户复测"液体挤压气体"原版特殊情况（水平路径已在 ea9c07d 验证
+  对角逃逸；若仍有差异，提供具体布局）。
+
+## [已完成] 液体分支顺序修正：自上而下遍历 + 移除非原版液体压力任务（2026-08-06，86d7512）
+
+- **用户实测（原版）**：密封竖井 [气1 下][液1 中][液2 上] 满格（1000/1000）时，
+  **液2 先分支 1 合并 5kg 给液1**（f22=max(1000×1.01,1000)−1000=10 → f23=5），
+  随后液1/液2 分支 3 与气体换位（气体上顶）；液2 位置为真空时气体**不动**
+  （分支 3 角落检查 → SpawnFallingLiquid 液滴）。用户问"这属于液体分支？"——
+  **是**：update_liquid 分支 1（同元素合并）先于分支 3（气体交换）判定。
+- **根因 1：遍历顺序**。update_liquid_loop 此前自下而上（min_y→max_y）：液1 先与
+  气体交换，液2 的分支 1 目标格已变气体 → displace_gas 失败 → 5kg 合并丢失。
+  **改为自上而下（max_y→min_y）**：上方液体先合并，再与气体换位——复现用户序列。
+- **根因 2：非原版 run_pressure_task**。原版压力循环（11_msvcrt L42092）只处理
+  气体/真空源格（state&3<2）；液体源不进压力循环。此前 run_pressure_task（液体源
+  →真空 12.5% 压力转移）会在 update_liquid 之前把液2 位置的真空填成液体，
+  破坏分支 3 角落判定（真空时不转移的用例）。**已移除**（函数+直接测试删除，
+  update_data 测试按原版纯扩散语义更新：右 18.75/左 25/上 0/源 56.25）。
+- **测试**：+3 回归（竖井合并+换位级联含精确 5kg、真空不换位、L 形合并）；
+  516 lib 测试串行全过；release 构建成功。
+- **待实测**：部署 → 竖井满格场景应"先合并 5kg 再换位"、真空场景气体不动；
+  回归液体水平扩散/下落/液面/合并（扩散速度与原版一致，无 12.5% 压力叠加）。
+
+## [已完成] UpdateLiquid 阶段 E：对角气体换位（2026-08-06，f401f22）
+
+- **用户精确布局实测（原版）**：气1(1,1)=1kg、液1(2,1)=1000kg、液2(2,2)=300kg、
+  砖块(1,2)，三格砖封。原版 1 秒后：**气1→(2,2)、液2→(1,1)、液1 不动**；
+  液2 位置为真空则气1 不动；液2=1000kg 时先分支 1 合并 5kg 再换位。
+- **缺失机制**：update_liquid **阶段 E 对角换位**（05_liquid_flow.c L1128-1205）——
+  正交方向走不通且质量未耗尽时，液体与**对角格气体**整格换位
+  （优先 cell−width+1 右下，回退 cell−width−1 左下）。此前注释"斜向流动属后续
+  任务"从未实现 → 该布局气体永不动。
+- **已实现（严格对照原版）**：全从 updatedCells 读取；右下分支要求 below 非固体
+  且 bit0 置位、cell 无 bit0、目标无 bit2、below 无 bit0/1；左下分支要求目标为
+  气体、left 固体或不可渗透、below 非固体、cell 无 bit0、目标无 bit2、below
+  无 bit0/1；SwapCells + 双 substance 事件。
+- **测试**：+4（直接单调用 1000kg 合并+换位精确质量 995/1005、全管线 300/1000kg
+  位置、真空不换位；更新 horizontal-corner 测试期望气体到液2 格）；全量 520 lib
+  测试串行全过；release 构建成功。
+- **待实测**：部署 → 用户精确布局 1 秒内气1 应到 (2,2)、液2 到 (1,1)；1000kg
+  时先合并 5kg；液2 为真空时气1 不动。
+
+## [已完成] 对照审查 + 液2 膨胀根因修复（2026-08-06，7d3fedd/7d34850，用户实测验收）
+
+- **审查产出**：.superpowers/sdd/review-c2-diagonal-swap.md。
+- **发现 1（误诊还原）**：86d7512 自上而下遍历是误诊——用户布局（液1 被水平
+  阻挡）自下而上同样满足"液2 先合并 5kg 再阶段 E 换位"；原版循环确为自下而上
+  （11_msvcrt L42424-42439 min_y→max_y）。已还原（7d3fedd）。
+- **发现 2（液2 膨胀 1200kg 根因）**：自上而下时液2 先换位（updated 7=液2），
+  液1 左分支从 cells 快照读气体质量 0 → f23 被 viscosity 截断 → 灌入已换位的
+  液2（同元素合并）→ 膨胀（游戏水=125 → 1120+，用户实测 ~1200）。原版自下而上
+  液1 先处理（左邻仍是气体 → displace_gas 被挡）→ 帧内零扩散。
+- **验证**：换位帧液2=995、液1=1005（无膨胀），帧 1 起液1 才均质化（2.5kg/帧）；
+  回归测试 diagonal_swap_no_mass_inflation_bottom_up；全量 522 lib 测试串行全过；
+  release 构建成功。
+- **用户实测验收**：液体斜角换位与原版无异。
+- **保留**：run_pressure_task 移除（非原版，源格门控 state&3<2 只处理气体/真空）。
+- **下一步（用户规划）**：全量回归实测 → 构建仓库安排 rayon（d3 立项时处理
+  目录命名问题 + 元素表旧快照双缓冲回收优化）。
+
+---
+
+## [进行中] 三份全量审查报告核实 + 修复（2026-08-07，Doubao/GLM/Hy3）
+
+**来源**：全量对照审查/ 目录下三份报告。逐条对照原版源码核实，结论如下。
+
+### ✅ 确认属实并已修复（本轮 6 项）
+1. **背墙换热温度写反**（Hy3 P0-1）：temperature.rs 两分支对调返回值 → 格子拿背墙
+   温度、背墙拿格子温度。已修复 + 精确数值回归测试
+   `backwall_exchange_cell_gets_cell_temp_not_backwall`。
+2. **Grid.Visible 摄取缺失**（Hy3 P0-2）：handle_prepare_game_data 丢弃载荷 → 可见性
+   门控恒通过。已改为把 Grid.Visible 写入 m_game_data.visible_grid（交换前）。
+   **原版特性.txt §2“全可见兜底”结论订正**（可见性走 PrepareGameData 载荷，
+   非 SetVisibleCells）。
+3. **disease_emitted_info 未交付**（Doubao #3 / GLM #1）：copy_sim_data_to_game 补
+   swap_disease_emitted_output（拷贝 + 源重置 0xFF/0）。
+4. **导热板多接触不累积**（Doubao #4 / GLM P1-6）：改用逐接触实时温度 cur_bldg_temp
+   （原版 L36659 每轮重读建筑温度）。
+5. **温度兜底 300 应为 293**（Hy3 P1-1）：save_load.rs 两处 300.0 → 293.0
+   （0x43928000=293.0）。
+6. **ProcessCellProperties 缺位移+回调**（GLM #4 / Hy3 P1-7）：补 DisplaceLiquid/
+   DisplaceGas（bit0/bit1 判定）+ callback_info push。
+
+### ❌ 判断错误（不处理）
+- Doubao #1 GDU 字段顺序（与 C# 逐字段一致）；
+- Doubao #2 DiseaseEmitter 区域循环/停表（原版 elapsed+=dt 也在区域检查内）；
+- Doubao #10 升华/不稳定/部分热转换留桩（均已实现）；
+- Doubao #11 CellEnergy 消息桩（已实现）；
+- Doubao #12 组件消息桩（已实现）；
+- Doubao #6 SetVisibleCells（确废弃，但可见性走 PrepareGameData——已归入 P0-2 修复）。
+
+### ⚠️ 部分属实 / 待定（后续处理）
+- GLM #2 element_chunk 释放槽位：活跃碎片零热容已修；释放槽位我们清零、原版保留
+  上一帧温度（纵深防御项，低优先）。
+- Hy3 P0-3 / P1-7 MassEmission 缺位移/失败回调（方向属实，待补）。
+- SYSINFO_Release 签名（GLM #3 / Hy3 P2-2）：多 1 参，C# 无调用方 → P2。
+- buffer_size vs remaining（Doubao #5）：低影响，待定。
+- new_frame_and_queue 入队时机（Doubao #7 / GLM #5）：待与原版帧管理对照。
+- GameData::Drop 泄漏 29 事件向量（GLM #6，MsvcVector 无 Drop）：低影响（shutdown 时）。
+- emitted_mass_info elem_idx 0xFFFF（GLM #10）：低影响。
+- Hy3 P1-2/P1-4/P1-5/P1-9、GLM #7/#8、CrashNotifyPayload 字段序：待进一步核对。
+- Doubao #8 consolidate_events 空桩：架构上事件直接入队，是否需合并待评估。
+- Hy3 P2-1 三个尺寸测试缺 #[test]：应补（ABI 保护恢复）。
+
+**测试**：527 lib 串行全过；release 构建成功；干净 DLL 已部署（9:26）。
+
+## [已完成] 全量回归实测（2026-08-07）
+
+用户全量回归实测通过（含 6 项修复后的背墙换热/战争迷雾/导热板/病菌发射等验证），
+未发现问题。下一步进入 d3（rayon 分区分发多线程）立项前的收尾。
+
+## [已完成] 审查剩余 5 项收尾（2026-08-07）
+
+1. **MassEmission 位移/失败回调**（Hy3 P0-3）：目标格异元素时先按 msg 元素形态
+   DisplaceGas/DisplaceLiquid，成功才加质量；失败推失败回调（emitted=0、elem 0xffff、
+   全零）且不加质量。+回归测试 `mass_emission_failure_pushes_failure_callback_without_adding`。
+2. **SYSINFO_Release 签名**（GLM #3 / Hy3 P2-2）：改为无参，sysinfo 用全局 AtomicPtr
+   持有 acquire 指针，release 从全局取。+测试。
+3. **P2-1 三个 ABI 尺寸测试补 #[test]**（Hy3）：add/set/remove ElementConsumer 尺寸断言
+   恢复生效。
+4. **element_chunk 释放槽位保留温度**（GLM #2 剩余）：swap 不再 clear、update 不再全槽
+   清零（原版只清 delta_kj）；已释放槽位保留上一帧温度。+回归测试
+   `update_preserves_released_slot_temperature`。
+5. **frame_count 用 remaining()**（Doubao #5）：sim_frame_manager L626 改用剩余字节。
+
+**测试**：532 lib 串行全过；release 构建成功；干净 DLL 已部署（10:06）。
+**下一步**：d3 rayon 分区分发多线程立项（规格文档：原版线程模型 → rayon 映射、
+分区边界、双缓冲无读者释放协议；一并处理目录命名问题）。
+
+---
+
+## [已完成] 液泵冰水 + 切换倍速崩溃根因（2026-08-07，ElementChunk 零热容不写温度）
+
+**现象**：液泵吸水/排水时泵存储库水块周期性结冰（泵判定格出冰方块）、切换倍速
+崩溃（`FallingWater T(0) M(10)`）；气泵正常。无 mod 时冰消失但崩溃仍在。
+
+**根因（最终定位）**：`element_chunk.rs update_element_chunks_inner` 对
+`heat_capacity <= 0`（质量 0，泵存储水被排水器抽空）的活跃碎片直接 `continue`，
+输出槽位保持清零后的 **0K**。C# `SimTemperatureTransfer` 每帧读
+`simData.elementChunks[handleIndex].temperature` → 泵存储水块显示 0K →
+冻结成冰；0K 水被排入管道 → 排水口 `FallingWater.AddParticle(T=0, M=10)` 崩溃。
+日志铁证：无 mod 会话 GDU `element_chunk_info` 洪流 5492 条 `chunk(t=0.0)`。
+
+**修复**：对照原版 ElementChunk::Update（11_msvcrt L38306-38310）——输出写入在
+换热 if 块**之外**、无条件执行。已改为：活跃碎片总是上报真实温度（跳过换热时
+delta=0），零热容不再 continue。回归测试
+`update_reports_temperature_even_with_zero_heat_capacity`（526 lib 全过）。
+
+**本轮连带修复（均为严格对照原版的真实差异）**：
+1. **DoPressureBreak L2995 signed/unsigned**：原版 `uVar9` 为 uint，
+   `(count-1)<2` 在 0 格固体时回绕为 false；Rust `as i32` 得 -1<2=true 误报
+   “突破成功”。改为 `count==1||count==2`，开放方向不再误拦墙壁破坏/下方倾倒。
+2. **find_reachable_state 缺 offset_idx 轮转**：原版 AnyInputCellHasState
+   `(offset+i)%列表长度` 轮流吸取；已实现轮转 + 回归测试。
+3. **CRITICAL-2（temperature.rs 低温相变范围检查用旧温度）**：原版 L345-349 用
+   新温度 `max(0,t+1.5)` 做窗口检查并 push；已修复 + 回归测试。
+4. **CRITICAL-1（building_temperature.rs 越界写入）**：原版严格越界时跳过写入+
+   相变+sum_k；已按 else 结构对齐（NaN 语义保持一致）。
+
+**排查过程排除项**：管道温度全程 300K/无冻结、GDU 液滴 0 条、消费温度 300K、
+相变 push 0 条、塌方回调 callback 非 -1、GDU 布局字段顺序一致、落滴落地无元素
+转换、mod 干扰（无 mod 复测仍崩溃）——最终由新增 GDU other events 探针的
+`chunk(t=0.0)` 洪流锁定碎片温度通道。
+
+**探针清理**：全部 [DIAG-2026-08-06] 探针 + D1 探针（update_data 区域统计/
+frozen-probe/NewGameFrame diag）已删除；ConduitTemperatureManager Set/Add 日志
+还原为 trace。干净 DLL 已部署。
+
+**下一步（用户规划）**：全量回归实测 → 构建仓库安排 rayon（d3 立项时处理
+目录命名问题 + 元素表旧快照双缓冲回收优化）。
 

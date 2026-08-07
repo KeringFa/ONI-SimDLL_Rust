@@ -36,3 +36,7 @@ other/
 .codex/
 .workbuddy/
 
+# 额外反编译产物（体积大，仅本地参考，不进仓库）
+OxygenNotIncluded_Source/0Harmony/
+OxygenNotIncluded_Source/UnityEngine.CoreModule/
+OxygenNotIncluded_Source/UnityEngine.ImageConversionModule/
