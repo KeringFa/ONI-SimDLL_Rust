@@ -229,7 +229,7 @@ fn cell_read(
 /// - 4B version (int)
 /// - 4B width (int)
 /// - 4B height (int)
-/// - if version > 13: 4B offset (int) + 4B skip (int)
+/// - if version > 13: 4B x_offset (int) + 4B y_offset (int)（世界在簇网格中的列/行）
 /// - if version > 12: 1B flag (byte) → ApplySaveSettings
 /// - cell 数据（width × height 个 cell，stride = gSimData.width）
 /// - if version > 8: disease 数据
@@ -254,11 +254,18 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
     let save_width = reader.read_int().unwrap_or(0);
     let save_height = reader.read_int().unwrap_or(0);
 
-    // L38-42: if version > 13, 读取 offset + skip
-    let mut offset: i32 = 0;
+    // L38-42: if version > 13, 读取 x_offset + y_offset
+    // 头字段 = 世界在簇网格中的 (列, 行) 坐标（C# SIM_BeginSave 直接写
+    // data.world.offset.x/y，BestFit 摆放位置；已用真实 worldgen 存档核对：
+    // 例 TerraMoonlet(0,0)、TundraMoonlet(162,176)、RegolithMoonlet(360,155)）。
+    // 反编译的 Load 只读 x 作线性起点、丢弃 y——但原版多星图各世界内容正常，
+    // 且 y>0 世界若按 x-only 会与第 0 行世界重叠（实测：WarpOilySwamp 被
+    // RegolithMoonlet 覆盖 → "内容错误/中子质边界消失"）。正确语义 = y*stride+x。
+    let mut x_offset: i32 = 0;
+    let mut y_offset: i32 = 0;
     if version > 0xd {
-        offset = reader.read_int().unwrap_or(0);
-        let _ = reader.read_int(); // skip
+        x_offset = reader.read_int().unwrap_or(0);
+        y_offset = reader.read_int().unwrap_or(0);
     }
 
     // L43-46: if version > 12, 读取 flag
@@ -270,7 +277,8 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         version,
         save_width,
         save_height,
-        offset,
+        x_offset,
+        y_offset,
         remaining = reader.remaining(),
         "Load: header parsed"
     );
@@ -288,6 +296,7 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
     let stride = sim_data.width; // 含边界的宽度
     let void_idx = sim_data.void_element_idx;
     let vacuum_idx = sim_data.vacuum_element_idx;
+    let start = (y_offset as i64) * (stride as i64) + (x_offset as i64);
 
     // L53-114: cell 读取循环
     // 对照源码 L61: CellRead(*(CellSOA **)(gSimData + 0x28), ...) — 读取到 updated_cells
@@ -299,7 +308,6 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         }
         let cells = unsafe { &mut *cells_ptr };
 
-        let start = offset as i64;
         for row in 0..save_height as i64 {
             let row_start = start + row * (stride as i64);
             for col in 0..save_width as i64 {
@@ -345,7 +353,7 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         let disease_ptr = globals::G_DISEASE.lock().0;
 
         for row in 0..save_height as i64 {
-            let row_start = offset as i64 + row * (stride as i64);
+            let row_start = start + row * (stride as i64);
             for col in 0..save_width as i64 {
                 let cell_idx = (row_start + col) as usize;
 
@@ -399,7 +407,7 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
             let backwall = unsafe { &mut *backwall_ptr };
 
             for row in 0..save_height as i64 {
-                let row_start = offset as i64 + row * (stride as i64);
+                let row_start = start + row * (stride as i64);
                 for col in 0..save_width as i64 {
                     let cell_idx = (row_start + col) as usize;
 
@@ -452,7 +460,7 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
         sim_data.init_settle_thermal_boundaries = true;
     }
 
-    tracing::info!(version, save_width, save_height, offset, "Load done");
+    tracing::info!(version, save_width, save_height, x_offset, y_offset, "Load done");
     sim_data_ptr as *mut c_void
 }
 
@@ -2519,6 +2527,104 @@ mod tests {
                 for y in 1..4usize {
                     assert_eq!(buf.element_idx.get(y * 6), unob, "left y={}", y);
                     assert_eq!(buf.element_idx.get(y * 6 + 5), unob, "right y={}", y);
+                }
+            }
+        }
+        clean_up();
+    }
+
+    #[test]
+    fn handle_load_applies_y_offset_when_placing_world() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        clean_up();
+
+        // 元素表：vacuum=211，测试元素=200
+        {
+            let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.element_indices.clear();
+            table.elements.resize(212, Default::default());
+            table.elements[211].id = 0x2d39bf75i32; // vacuum
+            table.element_indices.insert(0x2d39bf75u32, 211u16);
+            table.elements[200].id = 0x12345678i32;
+            table.element_indices.insert(0x12345678u32, 200u16);
+        }
+
+        // AllocateCells(6,6) → sim 8×8（stride=8）
+        let mut alloc_w = BinaryBufferWriter::new();
+        alloc_w.write_int(6);
+        alloc_w.write_int(6);
+        alloc_w.write_bool(false);
+        alloc_w.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&alloc_w.into_bytes());
+        let _ = handle_allocate_cells(&mut reader);
+
+        // 预填 updated_cells 为真空，便于断言"未被覆盖"
+        unsafe {
+            let sd = &mut *globals::G_SIM_DATA.lock().0;
+            let cells = &mut *sd.updated_cells.ptr;
+            for i in 0..64usize {
+                cells.element_idx.set(i, 211);
+            }
+        }
+
+        // Save：w=3 h=2 x_offset=2 y_offset=3 → start = 3*8+2 = 26
+        let mut w = BinaryBufferWriter::new();
+        w.write_bytes(b"SIMSAVE\0");
+        w.write_int(15);
+        w.write_int(3); // save_width
+        w.write_int(2); // save_height
+        w.write_int(2); // x_offset
+        w.write_int(3); // y_offset
+        w.write_byte(0);
+        for i in 0..6u32 {
+            w.write_uint(0x12345678);
+            w.write_float(300.0 + i as f32);
+            w.write_float(1000.0 + i as f32);
+            w.write_float(0.0);
+        }
+        for _ in 0..6u32 {
+            w.write_uint(0);
+            w.write_int(0);
+        }
+        for _ in 0..6u32 {
+            w.write_uint(0x2d39bf75);
+            w.write_float(0.0);
+            w.write_float(0.0);
+        }
+        let data = w.into_bytes();
+        let mut load_reader = BinaryBufferReader::new(&data);
+        let result = handle_load(&mut load_reader);
+        assert!(!result.is_null());
+
+        unsafe {
+            let sd = &*globals::G_SIM_DATA.lock().0;
+            let cells = &*sd.updated_cells.ptr;
+            // 期望：row3 col2..4 = 26,27,28；row4 col2..4 = 34,35,36（y*stride+x）
+            let expected = [26usize, 27, 28, 34, 35, 36];
+            for (i, &idx) in expected.iter().enumerate() {
+                assert_eq!(
+                    cells.element_idx.get(idx),
+                    200,
+                    "cell {} 应在 sim idx {}（y*stride+x）",
+                    i,
+                    idx
+                );
+            }
+            // 旧 x-only 实现会放到 row0：2,3,4,10,11,12 —— 必须仍是真空
+            let wrong = [2usize, 3, 4, 10, 11, 12];
+            for &idx in &wrong {
+                assert_eq!(
+                    cells.element_idx.get(idx),
+                    211,
+                    "sim idx {} 不应被覆盖（x-only 旧行为）",
+                    idx
+                );
+            }
+            // 其余位置保持真空
+            for idx in 0..64usize {
+                if !expected.contains(&idx) && !wrong.contains(&idx) {
+                    assert_eq!(cells.element_idx.get(idx), 211, "sim idx {} 应保持真空", idx);
                 }
             }
         }
