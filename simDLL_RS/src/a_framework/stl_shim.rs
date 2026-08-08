@@ -156,8 +156,16 @@ impl<T: Default + Copy> MsvcVector<T> {
         let elem_align = std::mem::align_of::<T>().max(8);
         if new_len == 0 {
             if !self.begin.is_null() {
-                let old_len = self.len();
-                let old_byte_len = old_len * elem_size;
+                // 对照 MSVC std::vector 析构语义：clear()/析构释放必须按**容量**
+                // （capacity_end − begin）计算字节数，与 push/resize 增长时的分配
+                // 布局一致。此前误用 len——push 2x 增长后 len < capacity，dealloc
+                // 尺寸 < 分配尺寸 → 违反 GlobalAlloc 契约（未定义行为）→ 堆损坏。
+                let cap = if !self.capacity_end.is_null() {
+                    (self.capacity_end as usize).saturating_sub(self.begin as usize) / elem_size
+                } else {
+                    0
+                };
+                let old_byte_len = cap * elem_size;
                 let layout = Layout::from_size_align(old_byte_len.max(1), elem_align).unwrap();
                 unsafe { dealloc(self.begin as *mut u8, layout) };
             }

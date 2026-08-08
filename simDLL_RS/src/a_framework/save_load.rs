@@ -44,6 +44,27 @@ pub fn clean_up() {
         let mut sim = globals::G_SIM.lock();
         if !sim.0.is_null() {
             unsafe {
+                // 对照原版 02_save_load.c L632-645（CleanUp）：
+                //   1. 若 sim 线程可 join → 先 FrameSync::GameSync 放行阻塞在
+                //      SimSync 的 sim 线程（交换双缓冲并唤醒）
+                //   2. Thread::Join 等待 sim 线程真正退出
+                //   3. 最后才 delete gSim
+                // 此前直接 Box::from_raw → sim 线程仍可能通过裸指针访问
+                // gSim+0x50（frame_manager）→ use-after-free / 堆损坏。
+                let thread_running = crate::a_framework::sim_thread::G_SIM_THREAD
+                    .get()
+                    .map(|h| h.lock().is_some())
+                    .unwrap_or(false);
+                if thread_running {
+                    let fs_ptr =
+                        crate::a_framework::frame_sync::FrameSync::get_ptr();
+                    if !fs_ptr.is_null() {
+                        // GameSync 会等待 m_sim_ready_to_swap（sim 到达 SimSync），
+                        // 交换双缓冲后唤醒 sim 线程（与原版 GameSync 一致）。
+                        crate::a_framework::frame_sync::FrameSync::game_sync(fs_ptr);
+                    }
+                }
+                crate::a_framework::sim_thread::join_sim_thread();
                 let _ = Box::from_raw(sim.0);
             }
             sim.0 = std::ptr::null_mut();
@@ -69,6 +90,16 @@ pub fn clean_up() {
                 let _ = Box::from_raw(sim_data.0);
             }
             sim_data.0 = std::ptr::null_mut();
+        }
+    }
+
+    // 对照源码 02_save_load.c L653：CleanUp 调用 FrameSync::clear() 复位
+    // m_initialized/m_sim_data/m_game_data。此前缺失 → 二次加载/世界生成时
+    // initGameData 的"已初始化"判断残留 → 缓冲不重建 → 越界写（见 frame_sync.rs）。
+    {
+        let fs_ptr = crate::a_framework::frame_sync::FrameSync::get_ptr();
+        if !fs_ptr.is_null() {
+            unsafe { (*fs_ptr).clear(); }
         }
     }
 

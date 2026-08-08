@@ -261,13 +261,25 @@ impl SimFrameManager {
     /// 锁序：sim 线程 m_sim_mutex → frame_mutex；本函数仅 frame_mutex，
     /// 单向无嵌套，无死锁。
     pub fn new_frame(&mut self) {
-        let _guard = self.frame_mutex.lock();
+        unsafe { self.frame_mutex.lock_raw(); }
+        self.new_frame_locked();
+        unsafe { self.frame_mutex.unlock_raw(); }
+    }
+
+    /// new_frame 的锁内核心（调用方须已持 frame_mutex）。
+    fn new_frame_locked(&mut self) {
         let frame_ptr = if self.frame_pool.is_empty() {
             let boxed = Box::new(SimFrameInfo::default());
             Box::into_raw(boxed)
         } else {
-            let ptr = self.frame_pool.as_slice()[0];
-            self.frame_pool.erase(0);
+            // 原版 NewFrame（08_sim_frame_manager.c L1162-1164）：framePool 非空时
+            // **pop_back**——取末尾元素 `*(begin + (size-1)*8)`，随后 end -= 8。
+            // 此前误用取头部 erase(0)，虽不改变"取空闲帧"语义，但不符合源码顺序。
+            let len = self.frame_pool.len();
+            let ptr = self.frame_pool.as_slice()[len - 1];
+            unsafe {
+                self.frame_pool.end = self.frame_pool.end.sub(1);
+            }
             ptr
         };
         if !frame_ptr.is_null() {
@@ -736,13 +748,23 @@ impl SimFrameManager {
     /// 入队逻辑在 SimFrameManager 的其他方法中（如 Sim 线程主循环）。
     /// 此处只调用 new_frame()，入队由 Sim 线程主循环处理。
     fn new_frame_and_queue(&mut self) {
-        // 旧 currentFrame 已经被填充了消息，需要入队
+        // 对照原版 NewFrame（08_sim_frame_manager.c L1128-1169）：
+        // 入队 + 取新帧在**同一把 frame_mutex 内原子完成**。
+        // 此前入队在锁外 push_unchecked → 与 sim 线程 begin_frame_processing
+        // （持锁遍历/清空 queued_frames）数据竞争 → 帧被撕裂/重复入队 →
+        // 消息被处理两次 → 重复回显（3× 突发下 667 条重复交付）。
+        // 另补原版 30 帧队列上限背压：队列满时旧帧丢回帧池（主动丢帧）。
+        unsafe { self.frame_mutex.lock_raw(); }
         let old_frame = self.current_frame;
         if !old_frame.is_null() {
-            self.queued_frames.push_unchecked(old_frame);
+            if self.queued_frames.len() < 30 {
+                self.queued_frames.push_unchecked(old_frame);
+            } else {
+                self.frame_pool.push_unchecked(old_frame);
+            }
         }
-        // 创建新帧
-        self.new_frame();
+        self.new_frame_locked();
+        unsafe { self.frame_mutex.unlock_raw(); }
     }
 
     /// BeginFrameProcessing：开始帧处理。

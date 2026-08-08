@@ -65,9 +65,12 @@ impl FrameSync {
         _full_height: i32,
         source_cells: &CellSOA,
     ) {
+        // 对照源码 09_crashdump_logger.c L757-773：已初始化仅调试器断点告警，
+        // **照常重建**（重新分配 m_sim_data/m_game_data 并拷贝）。
+        // 此前 early-return 导致二次加载/世界生成时缓冲停留在旧尺寸，
+        // 新世界按新尺寸写入旧缓冲 → 越界写（0xc0000374 世界生成崩溃根因之一）。
         if self.m_initialized {
-            tracing::warn!("FrameSync::initGameData: already initialized");
-            return;
+            tracing::warn!("FrameSync::initGameData: already initialized, rebuilding");
         }
 
         let total_game_cells = (game_width as usize) * (game_height as usize);

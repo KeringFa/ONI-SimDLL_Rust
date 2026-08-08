@@ -6,7 +6,7 @@
 //! - `GetReachableCells`（11_msvcrt_ignored.c L34451）；
 //! - CopySimDataToGame emittedMassInfo 拷贝+清零（11_msvcrt_ignored.c L31626-31648）。
 
-use crate::a_framework::game_data::{ComponentStateChangedMessage, EmittedMassInfo};
+use crate::a_framework::game_data::{CallbackInfo, EmittedMassInfo};
 use crate::a_framework::sim_data::SimData;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -425,12 +425,15 @@ impl ElementEmitterManager {
                         rec.blocked_state = 0;
                         if cb != 0xFFFFFFFF {
                             let events = unsafe { &mut *sim.sim_events.ptr };
-                            events.component_state_changed_messages.push(
-                                ComponentStateChangedMessage {
-                                    callback_idx: cb as i32,
-                                    sim_handle: -1,
-                                },
-                            );
+                            // 原版 ElementEmitter::Update（SimDLL_Source.c L141577-141610）：
+                            // blocked/unblocked 回调推送到 **callbackInfo**（simEvents+0x120，
+                            // 4B CallbackInfo），C# 只登记不 Release（Game.cs L1135-1144
+                            // callbackInfo.Add，可重复触发）。此前误推 componentStateChangedMessages
+                            // → C# 首次触发即 Release 回调句柄 → 版本飙升 + 旧句柄残留 →
+                            // "mismatched handle version" 崩溃。此为崩溃根因修复。
+                            events.callback_info.push(CallbackInfo {
+                                callback_idx: cb as i32,
+                            });
                         }
                     }
                 } else if rec.blocked_state != 1 {
@@ -438,12 +441,9 @@ impl ElementEmitterManager {
                     rec.blocked_state = 1;
                     if cb != 0xFFFFFFFF {
                         let events = unsafe { &mut *sim.sim_events.ptr };
-                        events.component_state_changed_messages.push(
-                            ComponentStateChangedMessage {
-                                callback_idx: cb as i32,
-                                sim_handle: -1,
-                            },
-                        );
+                        events.callback_info.push(CallbackInfo {
+                            callback_idx: cb as i32,
+                        });
                     }
                 }
                 // TryEmit
@@ -865,7 +865,7 @@ mod tests {
         update_element_emitters(&mut sim, 0.2, 6);
         let events = unsafe { &*sim.sim_events.ptr };
         let cb = events
-            .component_state_changed_messages
+            .callback_info
             .as_slice()
             .iter()
             .find(|m| m.callback_idx == 55);

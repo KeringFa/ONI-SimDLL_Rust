@@ -47,6 +47,11 @@ pub fn compute_region_bounds(sim: &SimData, region: &ActiveRegion) -> RegionBoun
     let h = sim.height as i64;
     let interior_x = w - 2;
     let interior_y = h - 2;
+    // 宽/高 < 3 时 interior < 1，clamp(1, interior) min>max 会 panic
+    // （原版用 min/max 宏只产生退化边界不崩）——先早退返回空区域，循环自然跳过。
+    if w < 3 || h < 3 {
+        return RegionBounds { min_x: 1, min_y: 1, max_x: 0, max_y: 0 };
+    }
     let min_x = (region.min_x as i64).clamp(1, interior_x) as usize;
     let min_y = (region.min_y as i64).clamp(1, interior_y) as usize;
     let max_x = (region.max_x as i64).clamp(1, interior_x) as usize;
@@ -130,3 +135,4 @@ mod tests {
         assert!(!b.is_empty());
     }
 }
+
