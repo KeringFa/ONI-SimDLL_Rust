@@ -4,16 +4,58 @@
 //! 对照源码 09_crashdump_logger.c 中的 Logger 实现。
 
 use once_cell::sync::OnceCell;
+use std::ffi::{c_char, CStr};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::reload;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::Registry;
 
 struct LoggerState {
     _file_guard: WorkerGuard,
 }
 
 static LOGGER: OnceCell<Mutex<LoggerState>> = OnceCell::new();
+/// 运行时日志级别控制句柄（logger 初始化后可用；RS_SetLogLevel 动态更新）。
+static RELOAD_HANDLE: OnceCell<reload::Handle<EnvFilter, Registry>> = OnceCell::new();
+
+/// 把字符串级别解析为 EnvFilter（off/error/warn/info/debug/trace）。
+fn parse_level(level: &str) -> Option<EnvFilter> {
+    let normalized = level.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "off" | "error" | "warn" | "info" | "debug" | "trace" => {
+            Some(EnvFilter::new(normalized))
+        }
+        _ => None,
+    }
+}
+
+/// 动态设置日志级别。返回 false 表示级别非法或 logger 未初始化。
+pub fn set_level(level: &str) -> bool {
+    let Some(filter) = parse_level(level) else {
+        return false;
+    };
+    match RELOAD_HANDLE.get() {
+        Some(handle) => handle.reload(filter).is_ok(),
+        None => false,
+    }
+}
+
+/// FFI：RS_SetLogLevel —— 由 SimDLL_Rust mod 配置调用（UTF-8 NUL 结尾字符串）。
+#[no_mangle]
+pub extern "C" fn RS_SetLogLevel(level: *const c_char) -> i32 {
+    if level.is_null() {
+        return 0;
+    }
+    let level = unsafe { CStr::from_ptr(level) }.to_string_lossy().into_owned();
+    if set_level(&level) {
+        1
+    } else {
+        0
+    }
+}
 
 /// 解析日志目录：SIMDLL_LOG_DIR 环境变量 > 游戏 logs 目录（可创建/可写才用）> 系统临时目录兜底。
 fn resolve_log_dir() -> PathBuf {
@@ -58,7 +100,8 @@ pub fn init() -> bool {
         .with_writer(std::io::stderr)
         .with_ansi(true);
 
-    let filter = tracing_subscriber::EnvFilter::new("info");
+    let filter = EnvFilter::new("info");
+    let (filter, reload_handle) = reload::Layer::new(filter);
 
     let result = tracing_subscriber::registry()
         .with(filter)
@@ -72,6 +115,7 @@ pub fn init() -> bool {
         return false;
     }
 
+    let _ = RELOAD_HANDLE.set(reload_handle);
     let _ = LOGGER.set(Mutex::new(LoggerState { _file_guard: file_guard }));
     tracing::info!("simDLL_RS logger initialized");
     true

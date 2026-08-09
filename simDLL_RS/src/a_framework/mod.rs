@@ -8,6 +8,7 @@ pub mod crashdump;
 pub mod frame_sync;
 pub mod game_data;
 pub mod game_data_update;
+pub mod loader_hook;
 pub mod logger;
 pub mod message_handler;
 pub mod save_load;
