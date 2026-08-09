@@ -4,74 +4,39 @@
 //! 对照源码 09_crashdump_logger.c 中的 Logger 实现。
 
 use once_cell::sync::OnceCell;
-use std::ffi::{c_char, CStr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::reload;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::Registry;
 
 struct LoggerState {
     _file_guard: WorkerGuard,
 }
 
 static LOGGER: OnceCell<Mutex<LoggerState>> = OnceCell::new();
-/// 运行时日志级别控制句柄（logger 初始化后可用；RS_SetLogLevel 动态更新）。
-static RELOAD_HANDLE: OnceCell<reload::Handle<EnvFilter, Registry>> = OnceCell::new();
-/// 日志启用标志：由 RS_SetLogLevel 设置（off → false，其余级别 → true）。
+/// 日志启用标志：由 RS_SetLogEnabled 设置（发布版只有开/关，无等级）。
 /// SIM_Initialize 等入口据此决定是否创建日志文件——默认关闭时完全不生成日志。
 static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// 把字符串级别解析为 EnvFilter（off/error/warn/info/debug/trace）。
-fn parse_level(level: &str) -> Option<EnvFilter> {
-    let normalized = level.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "off" | "error" | "warn" | "info" | "debug" | "trace" => {
-            Some(EnvFilter::new(normalized))
-        }
-        _ => None,
-    }
-}
-
-/// 动态设置日志级别。返回 false 表示级别非法或 logger 未初始化。
-pub fn set_level(level: &str) -> bool {
-    let Some(filter) = parse_level(level) else {
-        return false;
-    };
-    match RELOAD_HANDLE.get() {
-        Some(handle) => handle.reload(filter).is_ok(),
-        None => false,
-    }
-}
-
-/// FFI：RS_SetLogLevel —— 由 SimDLL_Rust mod 配置调用（UTF-8 NUL 结尾字符串）。
+/// FFI：RS_SetLogEnabled —— 由 SimDLL_Rust mod 配置调用（纯开关，发布版无等级）。
+/// enabled=true 且未初始化 → 惰性初始化（创建日志文件）；false → 不创建。
 #[no_mangle]
-pub extern "C" fn RS_SetLogLevel(level: *const c_char) -> i32 {
-    if level.is_null() {
-        return 0;
-    }
-    let level = unsafe { CStr::from_ptr(level) }.to_string_lossy().into_owned();
-    let normalized = level.trim().to_ascii_lowercase();
-    LOG_ENABLED.store(normalized != "off", Ordering::Relaxed);
-    // 日志默认关闭且从未初始化：不创建日志文件（默认不启用日志），视为成功。
-    if normalized == "off" && LOGGER.get().is_none() {
+pub extern "C" fn RS_SetLogEnabled(enabled: bool) -> i32 {
+    LOG_ENABLED.store(enabled, Ordering::Relaxed);
+    // 关闭且从未初始化：不创建日志文件（默认不启用日志），视为成功。
+    if !enabled && LOGGER.get().is_none() {
         return 1;
     }
-    // 非 off 级别且 logger 未初始化 → 惰性初始化（此时才创建日志文件）。
-    if LOGGER.get().is_none() {
+    // 启用且 logger 未初始化 → 惰性初始化（此时才创建日志文件）。
+    if enabled && LOGGER.get().is_none() {
         let _ = init();
     }
-    if set_level(&normalized) {
-        1
-    } else {
-        0
-    }
+    1
 }
 
-/// 按启用标志初始化日志：仅当日志已启用（RS_SetLogLevel 设置过非 off 级别）且
+/// 按启用标志初始化日志：仅当日志已启用（RS_SetLogEnabled(true)）且
 /// 尚未初始化时才创建日志文件；默认关闭 → 不生成任何日志文件。
 pub fn ensure_init_if_enabled() {
     if LOG_ENABLED.load(Ordering::Relaxed) && LOGGER.get().is_none() {
@@ -122,8 +87,13 @@ pub fn init() -> bool {
         .with_writer(std::io::stderr)
         .with_ansi(true);
 
-    let filter = EnvFilter::new("info");
-    let (filter, reload_handle) = reload::Layer::new(filter);
+    // 发布版固定 info 级（只输出"有价值"日志；每帧 entry/done 等噪音已降为
+    // debug/trace，玩家配置无法开启）。内部调试：SIMDLL_LOG_VERBOSE=1 → debug。
+    let filter = if std::env::var("SIMDLL_LOG_VERBOSE").map(|v| v == "1").unwrap_or(false) {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::new("info")
+    };
 
     let result = tracing_subscriber::registry()
         .with(filter)
@@ -137,7 +107,6 @@ pub fn init() -> bool {
         return false;
     }
 
-    let _ = RELOAD_HANDLE.set(reload_handle);
     let _ = LOGGER.set(Mutex::new(LoggerState { _file_guard: file_guard }));
     tracing::info!("simDLL_RS logger initialized");
     true

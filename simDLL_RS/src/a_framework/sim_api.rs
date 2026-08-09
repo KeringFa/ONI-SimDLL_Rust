@@ -131,7 +131,8 @@ pub extern "C" fn SIM_HandleMessage(id: c_int, size: c_int, data: *mut c_schar) 
     catch_unwind(AssertUnwindSafe(|| {
         // 诊断日志：记录入口参数（info 级别，用于诊断 data=null 消息不分派问题）
         let data_null = data.is_null();
-        tracing::info!(id, size, data_null, "SIM_HandleMessage entry");
+        // 噪音（每帧每条消息高频）：降为 debug，发布版 info 下不输出。
+        tracing::debug!(id, size, data_null, "SIM_HandleMessage entry");
 
         // L219: 检查 gSim 是否非 null
         let sim_ptr = crate::globals::G_SIM.lock().0;
@@ -164,14 +165,15 @@ pub extern "C" fn SIM_HandleMessage(id: c_int, size: c_int, data: *mut c_schar) 
         // 对照源码 L229-238
         if !handled {
             if let Some(handler_result) = super::message_handler::dispatch_handler_table(id as u32, &mut reader) {
-                tracing::info!(id, "phase 2 dispatched");
+                tracing::debug!(id, "phase 2 dispatched");
                 result = handler_result;
             } else {
                 tracing::warn!(id, "phase 2 no handler found");
             }
         }
 
-        tracing::info!(id, handled, result_null = result.is_null(), "SIM_HandleMessage done");
+        // 噪音（每帧高频）：降为 debug。
+        tracing::debug!(id, handled, result_null = result.is_null(), "SIM_HandleMessage done");
         result
     }))
     .unwrap_or_else(|_| {

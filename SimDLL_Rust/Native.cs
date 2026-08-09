@@ -13,9 +13,9 @@ namespace SimDLL_Rust
         [DllImport("SimDLL_RS.sim")]
         internal static extern int RS_LoaderInstall();
 
-        /// 动态设置 Rust 日志级别（UTF-8 NUL 结尾：off/error/warn/info/debug/trace）。
+        /// 日志开关（发布版无等级，纯开/关）。
         [DllImport("SimDLL_RS.sim")]
-        internal static extern int RS_SetLogLevel(byte[] level);
+        internal static extern int RS_SetLogEnabled(bool enabled);
 
         /// 设置调度模式：0=Auto，1=D2（rayon 装箱），2=D1（1 星 1 线程 + 超线程）。
         /// 返回实际生效模式（D1 无超线程时回退 D2 返回 1）。

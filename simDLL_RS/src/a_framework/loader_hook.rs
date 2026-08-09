@@ -43,8 +43,8 @@ const fn hook(name: &'static [u8], target: usize) -> HookSpec {
 #[no_mangle]
 pub extern "C" fn RS_LoaderInstall() -> i32 {
     // 注意：这里不初始化 logger——日志默认关闭（接口 mod 配置 "off" 时不创建
-    // 日志文件）；仅当接口 mod 通过 RS_SetLogLevel 设置为非 off 级别时才惰性
-    // 初始化。无 subscriber 时 tracing 宏为 no-op，安装结果可安全丢弃。
+    // 日志文件）；仅当接口 mod 通过 RS_SetLogEnabled(true) 启用时才惰性初始化。
+    // 无 subscriber 时 tracing 宏为 no-op，安装结果可安全丢弃。
     let result = unsafe { install_all() };
     tracing::info!(result, "RS_LoaderInstall done");
     result

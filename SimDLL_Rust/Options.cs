@@ -331,7 +331,7 @@ namespace SimDLL_Rust
                 if (changed)
                 {
                     // 配置已保存；重启后 OnLoad 的 ModConfig.Apply() 才实际应用
-                    // （RS_SetLogLevel）——日志只在下次启动后生成。
+                    // （RS_SetLogEnabled）——日志只在下次启动后生成。
                     ShowRestartConfirmDialog(parent);
                 }
             }, true);
