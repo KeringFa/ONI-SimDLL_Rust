@@ -26,7 +26,7 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 
-use crate::a_framework::{logger, sim_api};
+use crate::a_framework::sim_api;
 use crate::c_simulation::conduit_temperature;
 
 /// 一个接管点：原版导出名（NUL 结尾）+ 本 DLL 对应实现地址。
@@ -42,9 +42,9 @@ const fn hook(name: &'static [u8], target: usize) -> HookSpec {
 /// 安装全部接管点。返回成功安装数；失败返回负错误码。
 #[no_mangle]
 pub extern "C" fn RS_LoaderInstall() -> i32 {
-    // hook 安装早于 SIM_Initialize，logger 尚未初始化；先初始化以便记录
-    // 安装结果（幂等，不影响后续 SIM_Initialize 的 logger::init）。
-    let _ = logger::init();
+    // 注意：这里不初始化 logger——日志默认关闭（接口 mod 配置 "off" 时不创建
+    // 日志文件）；仅当接口 mod 通过 RS_SetLogLevel 设置为非 off 级别时才惰性
+    // 初始化。无 subscriber 时 tracing 宏为 no-op，安装结果可安全丢弃。
     let result = unsafe { install_all() };
     tracing::info!(result, "RS_LoaderInstall done");
     result

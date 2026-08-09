@@ -50,7 +50,16 @@ pub extern "C" fn RS_SetLogLevel(level: *const c_char) -> i32 {
         return 0;
     }
     let level = unsafe { CStr::from_ptr(level) }.to_string_lossy().into_owned();
-    if set_level(&level) {
+    let normalized = level.trim().to_ascii_lowercase();
+    // 日志默认关闭且从未初始化：不创建日志文件（默认不启用日志），视为成功。
+    if normalized == "off" && LOGGER.get().is_none() {
+        return 1;
+    }
+    // 非 off 级别且 logger 未初始化 → 惰性初始化（此时才创建日志文件）。
+    if LOGGER.get().is_none() {
+        let _ = init();
+    }
+    if set_level(&normalized) {
         1
     } else {
         0
