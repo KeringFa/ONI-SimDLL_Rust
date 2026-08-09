@@ -5,6 +5,7 @@
 //! `docs/d3_rayon_技术参考.md`（提炼自桌面版旧 d3 线，不照抄旧代码）。
 use std::sync::OnceLock;
 
+pub mod affinity;
 pub mod bin_pack;
 pub mod pipeline;
 
