@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using UnityEngine;
 
 namespace SimDLL_Rust
 {
@@ -9,30 +10,13 @@ namespace SimDLL_Rust
     /// 供 Options 屏判断"启用超线程优化"勾选项是否可勾选（无超线程 → 灰显禁用）。
     /// 检测失败/异常 → 保守返回 false（禁用方向 1）。
     /// 注：旧 API GetLogicalProcessorInformation 在本机（Win11/部分环境）不返回
-    /// ProcessorCore 条目（全为 Group），导致检测恒 false——故改用 Ex 版。
+    /// ProcessorCore 条目（全为 Group），导致检测恒 false——故改用 Ex 版；
+    /// 字段读取用手写偏移（不用 Marshal 结构布局，规避 Mono/.NET 布局差异）。
     /// </summary>
     public static class CpuInfo
     {
         private const uint RELATION_PROCESSOR_CORE = 0;
         private const uint LTP_HYPER_THREADING_PRESENT = 0x1;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
-        {
-            public uint Relationship;
-            public uint Size;
-            // PROCESSOR_RELATIONSHIP 起始（offset 8）：Flags 为第 1 字节。
-            public byte ProcessorFlags;
-            public byte EfficiencyClass;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 20)]
-            public byte[] Reserved;
-            public ushort GroupCount;
-            // GROUP_AFFINITY[1]（8 字节）
-            public ushort GroupMask;
-            public ushort GroupReserved1;
-            public ushort GroupReserved2;
-            public ushort GroupReserved3;
-        }
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetLogicalProcessorInformationEx(
@@ -47,6 +31,7 @@ namespace SimDLL_Rust
                 if (!GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, IntPtr.Zero, ref len)
                     || len == 0)
                 {
+                    Debug.Log("[SimDLL_Rust] CpuInfo: first call failed (len=" + len + ")");
                     return false;
                 }
                 IntPtr buffer = Marshal.AllocHGlobal((int)len);
@@ -55,25 +40,38 @@ namespace SimDLL_Rust
                     if (!GetLogicalProcessorInformationEx(
                         RELATION_PROCESSOR_CORE, buffer, ref len))
                     {
+                        Debug.Log("[SimDLL_Rust] CpuInfo: second call failed");
                         return false;
                     }
-                    int size = Marshal.SizeOf<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>();
                     int offset = 0;
-                    while (offset + size <= (int)len)
+                    int cores = 0;
+                    int htCores = 0;
+                    while (offset + 8 <= (int)len)
                     {
-                        var info = Marshal.PtrToStructure<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
-                            buffer + offset);
-                        if (info.Relationship == RELATION_PROCESSOR_CORE
-                            && (info.ProcessorFlags & LTP_HYPER_THREADING_PRESENT) != 0)
+                        // Windows ABI：EX 条目头部 Relationship@0、Size@4；
+                        // RelationProcessorCore 的 PROCESSOR_RELATIONSHIP.Flags 在 offset+8。
+                        uint relationship = (uint)Marshal.ReadInt32(buffer, offset);
+                        uint size = (uint)Marshal.ReadInt32(buffer, offset + 4);
+                        if (relationship == RELATION_PROCESSOR_CORE)
                         {
-                            return true;
+                            cores++;
+                            byte flags = Marshal.ReadByte(buffer, offset + 8);
+                            if ((flags & LTP_HYPER_THREADING_PRESENT) != 0)
+                            {
+                                htCores++;
+                                Debug.Log("[SimDLL_Rust] CpuInfo: HT present, cores="
+                                    + cores + " flags=" + flags);
+                                return true;
+                            }
                         }
-                        if (info.Size <= 0)
+                        if (size == 0)
                         {
                             break;
                         }
-                        offset += (int)info.Size;
+                        offset += (int)size;
                     }
+                    Debug.Log("[SimDLL_Rust] CpuInfo: no HT flags (cores=" + cores + ", htCores="
+                        + htCores + ", len=" + len + ")");
                     return false;
                 }
                 finally
@@ -81,8 +79,9 @@ namespace SimDLL_Rust
                     Marshal.FreeHGlobal(buffer);
                 }
             }
-            catch
+            catch (Exception e)
             {
+                Debug.Log("[SimDLL_Rust] CpuInfo: exception " + e.GetType().Name + ": " + e.Message);
                 return false;
             }
         }
