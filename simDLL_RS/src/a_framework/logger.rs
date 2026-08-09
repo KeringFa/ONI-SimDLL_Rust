@@ -20,6 +20,12 @@ static LOGGER: OnceCell<Mutex<LoggerState>> = OnceCell::new();
 /// SIM_Initialize 等入口据此决定是否创建日志文件——默认关闭时完全不生成日志。
 static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// 日志开关查询（供 perf_probe 等附属输出判断是否应写入——发布版默认关，
+/// 玩家开启日志后 simdll_perf.log 才生成）。
+pub fn is_log_enabled() -> bool {
+    LOG_ENABLED.load(Ordering::Relaxed)
+}
+
 /// FFI：RS_SetLogEnabled —— 由 SimDLL_Rust mod 配置调用（纯开关，发布版无等级）。
 /// enabled=true 且未初始化 → 惰性初始化（创建日志文件）；false → 不创建。
 #[no_mangle]

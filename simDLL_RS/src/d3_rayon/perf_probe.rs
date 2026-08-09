@@ -33,6 +33,11 @@ fn window_start() -> &'static Mutex<Instant> {
 
 /// update_data 完成一帧后调用（region_count、mode=0 串行/1 D2/2 D1）。
 pub fn frame_done(region_count: usize, mode: i32, threads: usize, elapsed_us: u64) {
+    // 受日志开关控制：默认关闭（发布版不生成 simdll_perf.log）；
+    // 玩家开启日志后本探针才统计并写入。
+    if !crate::a_framework::logger::is_log_enabled() {
+        return;
+    }
     let mut p = PERF.lock().unwrap();
     p.frames += 1;
     p.total_us += elapsed_us;
