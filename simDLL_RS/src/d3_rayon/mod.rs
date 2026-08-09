@@ -15,42 +15,11 @@ pub mod scheduler;
 /// 预留给游戏主线程/系统的物理核数（2026-08-08 用户拍板 = 1）。
 pub const RESERVE_CORES: usize = 1;
 
-/// 物理核数：Windows `GetLogicalProcessorInformation` 按 RelationProcessorCore 统计
-/// （8C16T → 8、4C8T → 4）；API 失败（老系统/权限）回退 `available_parallelism`。
+/// 物理核数：统一走 Ex API 拓扑（affinity::CpuTopology）。
+/// 注：旧 API GetLogicalProcessorInformation 在本机返回全 Group → fallback 逻辑核
+/// （16），导致 rayon 池 15 线程超额订阅——已弃用。
 pub fn physical_cores() -> usize {
-    use windows::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformation, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
-    };
-    unsafe {
-        let mut needed: u32 = 0;
-        // 第一次调用只取所需缓冲区大小（预期 ERROR_INSUFFICIENT_BUFFER）
-        if GetLogicalProcessorInformation(None, &mut needed).is_err() || needed == 0 {
-            return fallback_parallelism();
-        }
-        let count = (needed as usize) / std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>();
-        if count == 0 {
-            return fallback_parallelism();
-        }
-        let mut buf = vec![SYSTEM_LOGICAL_PROCESSOR_INFORMATION::default(); count];
-        if GetLogicalProcessorInformation(Some(buf.as_mut_ptr()), &mut needed).is_err() {
-            return fallback_parallelism();
-        }
-        let cores = buf
-            .iter()
-            .filter(|info| info.Relationship == RelationProcessorCore)
-            .count();
-        if cores == 0 {
-            fallback_parallelism()
-        } else {
-            cores
-        }
-    }
-}
-
-fn fallback_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    crate::d3_rayon::affinity::CpuTopology::cached().physical_cores
 }
 
 /// D1 门控：仅当活动区域数 > 1（多星/多已发现世界）时启用并行。
@@ -66,7 +35,12 @@ static G_RAYON_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 pub fn pool() -> &'static rayon::ThreadPool {
     G_RAYON_POOL.get_or_init(|| {
-        let threads = physical_cores().saturating_sub(RESERVE_CORES).max(1);
+        // 物理核数用 Ex API 拓扑（旧 API 在本机返回全 Group → fallback 逻辑核 16，
+        // 导致线程池 15 线程超额订阅）。复用 affinity::CpuTopology。
+        let threads = crate::d3_rayon::affinity::CpuTopology::cached()
+            .physical_cores
+            .saturating_sub(RESERVE_CORES)
+            .max(1);
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("simdll-d3-{i}"))
             .num_threads(threads)
