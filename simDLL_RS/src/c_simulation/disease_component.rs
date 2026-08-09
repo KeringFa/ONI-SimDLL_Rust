@@ -330,7 +330,7 @@ pub(crate) fn update_disease_emitters(sim: &mut SimData, dt: f32, bounds: Region
         let cell = rec.cell as usize;
         let x = cell % width;
         let y = cell / width;
-        if x < bounds.min_x || x > bounds.max_x || y < bounds.min_y || y > bounds.max_y {
+                if x < bounds.min_x || x >= bounds.max_x || y < bounds.min_y || y >= bounds.max_y {
             continue;
         }
         let interval = rec.emit_interval;
@@ -982,10 +982,10 @@ mod tests {
         process_disease_emitter_messages(&mut frame, &mut sd);
         frame.disease_emitter_messages.modifies.clear_keep_capacity();
         let bounds = crate::d1_activity::RegionBounds {
-            min_x: 1,
-            min_y: 1,
-            max_x: 1,
-            max_y: 1,
+    min_x: 1,
+    min_y: 1,
+    max_x: 2,
+    max_y: 2,
         };
         // interval=1.0：elapsedTime 0.2×5=1.0；第 6 次调用时 1.0<=1.0 触发 → cell7 +10
         for _ in 0..5 {
@@ -1025,10 +1025,10 @@ mod tests {
         process_disease_emitter_messages(&mut frame, &mut sd);
         frame.disease_emitter_messages.modifies.clear_keep_capacity();
         let bounds = crate::d1_activity::RegionBounds {
-            min_x: 1,
-            min_y: 1,
-            max_x: 3,
-            max_y: 3,
+    min_x: 1,
+    min_y: 1,
+    max_x: 4,
+    max_y: 4,
         };
         // interval=0.2：第 1 次 elapsed=0 不触发；第 2 次 elapsed=0.2 触发
         update_disease_emitters(&mut sd, 0.2, bounds);
@@ -1062,10 +1062,10 @@ mod tests {
         frame.disease_emitter_messages.modifies.clear_keep_capacity();
         // bounds 不含 cell7（(1,1)）→ 不发射
         let bounds = crate::d1_activity::RegionBounds {
-            min_x: 2,
-            min_y: 2,
-            max_x: 2,
-            max_y: 2,
+    min_x: 2,
+    min_y: 2,
+    max_x: 3,
+    max_y: 3,
         };
         update_disease_emitters(&mut sd, 0.2, bounds);
         unsafe {
@@ -1168,8 +1168,8 @@ mod tests {
         sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
             min_x: 1,
             min_y: 1,
-            max_x: 1,
-            max_y: 1,
+            max_x: 2,
+            max_y: 2,
             current_sunlight_intensity: 0.0,
             current_cosmic_radiation_intensity: 0.0,
         });
@@ -1333,8 +1333,8 @@ mod tests {
         sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
             min_x: 2,
             min_y: 2,
-            max_x: 5,
-            max_y: 5,
+            max_x: 6,
+            max_y: 6,
             current_sunlight_intensity: 0.0,
             current_cosmic_radiation_intensity: 0.0,
         });
@@ -1390,8 +1390,8 @@ mod tests {
         sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
             min_x: 1,
             min_y: 1,
-            max_x: 14,
-            max_y: 6,
+            max_x: 15,
+            max_y: 7,
             current_sunlight_intensity: 0.0,
             current_cosmic_radiation_intensity: 0.0,
         });

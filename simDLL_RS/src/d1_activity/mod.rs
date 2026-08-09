@@ -23,7 +23,7 @@ pub struct RegionBounds {
 impl RegionBounds {
     /// 空区域（min > max）→ 循环自然跳过。
     pub fn is_empty(&self) -> bool {
-        self.min_x > self.max_x || self.min_y > self.max_y
+        self.min_x >= self.max_x || self.min_y >= self.max_y
     }
 
     /// 区域内格数。
@@ -31,7 +31,7 @@ impl RegionBounds {
         if self.is_empty() {
             0
         } else {
-            ((self.max_x - self.min_x + 1) * (self.max_y - self.min_y + 1)) as u64
+            ((self.max_x - self.min_x) * (self.max_y - self.min_y)) as u64
         }
     }
 }
@@ -54,8 +54,9 @@ pub fn compute_region_bounds(sim: &SimData, region: &ActiveRegion) -> RegionBoun
     }
     let min_x = (region.min_x as i64).clamp(1, interior_x) as usize;
     let min_y = (region.min_y as i64).clamp(1, interior_y) as usize;
-    let max_x = (region.max_x as i64).clamp(1, interior_x) as usize;
-    let max_y = (region.max_y as i64).clamp(1, interior_y) as usize;
+    // max 为排他上界：最大有效 = interior+1 = w-1（原版 `x < width-1`）
+    let max_x = (region.max_x as i64).clamp(1, interior_x + 1) as usize;
+    let max_y = (region.max_y as i64).clamp(1, interior_y + 1) as usize;
     RegionBounds {
         min_x,
         min_y,
@@ -69,8 +70,9 @@ pub fn full_grid_bounds(sim: &SimData) -> RegionBounds {
     RegionBounds {
         min_x: 1,
         min_y: 1,
-        max_x: (sim.width as usize).saturating_sub(2),
-        max_y: (sim.height as usize).saturating_sub(2),
+        // 排他上界：内部最后格 w-2 的后一位 = w-1
+        max_x: (sim.width as usize).saturating_sub(1),
+        max_y: (sim.height as usize).saturating_sub(1),
     }
 }
 
@@ -113,7 +115,8 @@ mod tests {
         assert_eq!(b.min_y, 1);
         assert_eq!(b.max_x, 211);
         assert_eq!(b.max_y, 154);
-        assert_eq!(b.cell_count(), 129 * 154);
+        // max 为排他上界：x 覆盖 83..211 = 128 列，y 覆盖 1..154 = 153 行
+        assert_eq!(b.cell_count(), 128 * 153);
     }
 
     #[test]
@@ -130,8 +133,9 @@ mod tests {
         let b = compute_region_bounds(&sd, &r);
         assert_eq!(b.min_x, 1);
         assert_eq!(b.min_y, 1);
-        assert_eq!(b.max_x, 8);
-        assert_eq!(b.max_y, 8);
+        // 排他上界钳到 interior+1 = 9（覆盖内部 1..8）
+        assert_eq!(b.max_x, 9);
+        assert_eq!(b.max_y, 9);
         assert!(!b.is_empty());
     }
 }

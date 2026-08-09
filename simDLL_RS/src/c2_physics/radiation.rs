@@ -85,8 +85,8 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
 
     // —— 第一遍：top→bottom（y 从 max_y 递减，上方格 cell+width 先算）——
     // occlusion + 衰减
-    for y in (min_y..=max_y).rev() {
-        for x in min_x..=max_x {
+    for y in (min_y..max_y).rev() {
+        for x in min_x..max_x {
             let cell = y * w + x;
             let (elem, props, mass, rad) = {
                 let u = unsafe { &*sim.updated_cells.ptr };
@@ -133,8 +133,8 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
     }
 
     // —— 第二遍：元素扩散 → 宇宙应用 → 钳制 ——
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
+    for y in min_y..max_y {
+        for x in min_x..max_x {
             let cell = y * w + x;
             let (elem, mass) = {
                 let u = unsafe { &*sim.updated_cells.ptr };
@@ -491,8 +491,8 @@ mod tests {
         sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
             min_x: 1,
             min_y: 1,
-            max_x: 1,
-            max_y: 1,
+            max_x: 2,
+            max_y: 2,
             current_sunlight_intensity: 0.0,
             current_cosmic_radiation_intensity: 0.0,
         });

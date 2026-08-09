@@ -826,7 +826,7 @@ pub(crate) fn run_temperature_task(
     sim: &mut SimData,
     bounds: crate::d1_activity::RegionBounds,
 ) {
-    run_temperature_band(sim, bounds, bounds.min_y, bounds.max_y + 1);
+            run_temperature_band(sim, bounds, bounds.min_y, bounds.max_y);
 }
 
 /// 温度行带任务（D2：原版 UpdateData L144430 把每个区域的温度按 worker 数切行带，
@@ -850,7 +850,7 @@ pub(crate) fn run_temperature_band(
         return;
     }
     for row in row_start..row_end {
-        for col in bounds.min_x..=bounds.max_x {
+                for col in bounds.min_x..bounds.max_x {
             if row >= h - 1 || col >= w - 1 {
                 continue;
             }

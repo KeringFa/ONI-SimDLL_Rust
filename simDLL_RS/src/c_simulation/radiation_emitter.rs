@@ -461,12 +461,12 @@ fn tick_constant(sim: &mut SimData, bounds: RegionBounds, rec: &mut RadiationEmi
     let linger = sim.radiation_linger_rate;
     for dy in -ry..=ry {
         let y = ey + dy;
-        if y < bounds.min_y as i32 || y > bounds.max_y as i32 || y < 1 || y >= h as i32 - 1 {
+    if y < bounds.min_y as i32 || y >= bounds.max_y as i32 || y < 1 || y >= h as i32 - 1 {
             continue;
         }
         for dx in -rx..=rx {
             let x = ex + dx;
-            if x < bounds.min_x as i32 || x > bounds.max_x as i32 || x < 1 || x >= w as i32 - 1 {
+    if x < bounds.min_x as i32 || x >= bounds.max_x as i32 || x < 1 || x >= w as i32 - 1 {
                 continue;
             }
             if !in_radial_range(x, y, ex, ey, rec.emit_angle, rec.emit_direction) {
@@ -597,9 +597,9 @@ fn set_pulsing_pixel(
             continue;
         }
         if x < bounds.min_x as i32
-            || x > bounds.max_x as i32
+                    || x >= bounds.max_x as i32
             || y < bounds.min_y as i32
-            || y > bounds.max_y as i32
+                    || y >= bounds.max_y as i32
         {
             continue;
         }
@@ -638,9 +638,9 @@ pub fn update_radiation_emitters(
             let cx = rec.cell % w;
             (
                 cx >= bounds.min_x as i32
-                    && cx <= bounds.max_x as i32
+                    && cx < bounds.max_x as i32
                     && cy >= bounds.min_y as i32
-                    && cy <= bounds.max_y as i32,
+                    && cy < bounds.max_y as i32,
                 rec.emit_rads > 0.0 && (rec.emit_radius_x != 0 || rec.emit_radius_y != 0),
             )
         };

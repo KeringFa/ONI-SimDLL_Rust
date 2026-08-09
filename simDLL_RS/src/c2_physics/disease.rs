@@ -204,8 +204,8 @@ pub(crate) fn run_disease_diffusion_task(sim: &mut SimData, bounds: RegionBounds
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
         return;
     }
-    for row in bounds.min_y..=bounds.max_y {
-        for col in bounds.min_x..=bounds.max_x {
+                for row in bounds.min_y..bounds.max_y {
+                for col in bounds.min_x..bounds.max_x {
             let cell = row * width + col;
             let (right_ok, down_ok) = {
                 let cells = unsafe { &*sim.cells.ptr };
@@ -321,8 +321,8 @@ pub(crate) fn run_disease_growth_task(sim: &mut SimData, bounds: RegionBounds) {
     let radiation_enabled = sim.radiation_enabled;
     {
         let updated = unsafe { &mut *sim.updated_cells.ptr };
-        for row in bounds.min_y..=bounds.max_y {
-            for col in bounds.min_x..=bounds.max_x {
+        for row in bounds.min_y..bounds.max_y {
+        for col in bounds.min_x..bounds.max_x {
                 let cell = row * width + col;
                 if cell >= updated.disease_count.len() {
                     continue;
@@ -333,8 +333,8 @@ pub(crate) fn run_disease_growth_task(sim: &mut SimData, bounds: RegionBounds) {
     }
     {
         let updated = unsafe { &mut *sim.updated_cells.ptr };
-        for row in bounds.min_y..=bounds.max_y {
-            for col in bounds.min_x..=bounds.max_x {
+        for row in bounds.min_y..bounds.max_y {
+        for col in bounds.min_x..bounds.max_x {
                 let cell = row * width + col;
                 if cell >= updated.disease_count.len() || cell >= updated.disease_idx.len() {
                     continue;
@@ -605,10 +605,10 @@ mod tests {
         set_both(&mut sd, 15, 0, 0, 50, 5);
         set_both(&mut sd, 20, 0, 0, 50, 5);
         let bounds = crate::d1_activity::RegionBounds {
-            min_x: 2,
-            min_y: 2,
-            max_x: 2,
-            max_y: 2,
+    min_x: 2,
+    min_y: 2,
+    max_x: 3,
+    max_y: 3,
         };
         run_disease_diffusion_task(&mut sd, bounds);
         unsafe {
@@ -699,7 +699,7 @@ mod tests {
         // temp=30（最优带 → f=1.0）、count=500、mass=1.0（min=100≤500≤1000）、acc=0
         // growth=(2^-0.02-1)×500=-6.88365；f25=-6.88365 → count=494、acc=-0.88365、tick 5→6
         set_updated(&mut sd, 7, 30.0, 1.0, 0, 500, 5, 0.0, 0.0);
-        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+    let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 4, max_y: 2 };
         run_disease_growth_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -718,7 +718,7 @@ mod tests {
         // temp=-10 → hl[0]=5 → f=2^-0.04=0.97265495
         // f25=(500×0.97265495-500)+(-6.88365)=-20.5562 → count=480、acc=-0.5562
         set_updated(&mut sd, 7, -10.0, 1.0, 0, 500, 5, 0.0, 0.0);
-        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+    let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 4, max_y: 2 };
         run_disease_growth_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -736,7 +736,7 @@ mod tests {
         // count=50 < min=100 → growth=-1.0×0.2=-0.2；temp 最优 → f=1.0
         // f25=-0.2 → count+=trunc(-0.2)=0 → 50；acc=-0.2
         set_updated(&mut sd, 7, 30.0, 1.0, 0, 50, 5, 0.0, 0.0);
-        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+    let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 4, max_y: 2 };
         run_disease_growth_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -754,7 +754,7 @@ mod tests {
         // count=2000 > max=1000 → growth=(2^-0.02-1)×2000=-27.5346
         // f25=-27.5346 → count=1973、acc=-0.5346
         set_updated(&mut sd, 7, 30.0, 1.0, 0, 2000, 5, 0.0, 0.0);
-        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+    let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 4, max_y: 2 };
         run_disease_growth_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -771,7 +771,7 @@ mod tests {
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         // acc=0.4、count=500、temp 最优 → f25=0.4-6.88365=-6.48365 → count=494、acc=-0.48365
         set_updated(&mut sd, 7, 30.0, 1.0, 0, 500, 5, 0.4, 0.0);
-        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+    let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 4, max_y: 2 };
         run_disease_growth_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -789,7 +789,7 @@ mod tests {
         // radiation_enabled=true、radiation=10、killRate=0.5
         // f25=-6.88365-5.0=-11.88365 → count=489、acc=-0.88365
         set_updated(&mut sd, 7, 30.0, 1.0, 0, 500, 5, 0.0, 10.0);
-        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+    let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 4, max_y: 2 };
         run_disease_growth_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -809,7 +809,7 @@ mod tests {
         set_updated(&mut sd, 7, 30.0, 1.0, 0, 0, 0, 0.5, 0.0);
         // 无病菌格（0xff, count=0, tick=7）→ 第二遍同样 count<1 → 清除 → tick=1
         set_updated(&mut sd, 8, 30.0, 1.0, 0xff, 0, 7, 0.0, 0.0);
-        let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 3, max_y: 1 };
+    let bounds = crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 4, max_y: 2 };
         run_disease_growth_task(&mut sd, bounds);
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -919,8 +919,8 @@ mod tests {
         sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
             min_x: 2,
             min_y: 2,
-            max_x: 2,
-            max_y: 2,
+            max_x: 3,
+            max_y: 3,
             current_sunlight_intensity: 0.0,
             current_cosmic_radiation_intensity: 0.0,
         });

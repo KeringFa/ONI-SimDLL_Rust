@@ -64,7 +64,7 @@ pub fn update_data(sim_data: &mut SimData) {
         if !queue_ptr.is_null() {
             let queue = unsafe { &*queue_ptr };
             let n_workers = queue.worker_count().max(1);
-            let total_rows = bounds.max_y + 1 - bounds.min_y;
+            let total_rows = bounds.max_y - bounds.min_y;
             let base = total_rows / n_workers;
             let extra = total_rows % n_workers;
             let mut row = bounds.min_y;

@@ -34,9 +34,9 @@ pub(crate) fn run_gas_pressure_task(
         return;
     }
     let x_min = bounds.min_x.max(1) as i32;
-    let x_max = (bounds.max_x as i32).min(w - 2);
+    let x_max = (bounds.max_x as i32).min(w - 1);
     let y_min = bounds.min_y.max(1) as i32;
-    let y_max = (bounds.max_y as i32).min(h - 2);
+    let y_max = (bounds.max_y as i32).min(h - 1);
     if x_min > x_max || y_min > y_max {
         return;
     }
@@ -203,9 +203,9 @@ pub(crate) fn run_gas_displacement_task(
     }
     // 2 格余量（beyond 距源格 2）
     let x_min = bounds.min_x.max(3) as i32;
-    let x_max = (bounds.max_x as i32).min(w - 4);
+    let x_max = (bounds.max_x as i32).min(w - 3);
     let y_min = bounds.min_y.max(3) as i32;
-    let y_max = (bounds.max_y as i32).min(h - 4);
+    let y_max = (bounds.max_y as i32).min(h - 3);
     if x_min > x_max || y_min > y_max {
         return;
     }

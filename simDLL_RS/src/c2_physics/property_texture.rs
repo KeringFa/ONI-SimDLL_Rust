@@ -766,8 +766,8 @@ mod tests {
         sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
             min_x: 1,
             min_y: 1,
-            max_x: 14,
-            max_y: 6,
+            max_x: 15,
+            max_y: 7,
             current_sunlight_intensity: 0.0,
             current_cosmic_radiation_intensity: 0.0,
         });

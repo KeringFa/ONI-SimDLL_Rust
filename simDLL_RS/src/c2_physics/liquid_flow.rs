@@ -74,8 +74,8 @@ pub(crate) fn update_liquid_loop(
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
         return;
     }
-    for row in bounds.min_y..=bounds.max_y {
-        for col in bounds.min_x..=bounds.max_x {
+    for row in bounds.min_y..bounds.max_y {
+    for col in bounds.min_x..bounds.max_x {
             if row >= height - 1 || col >= width - 1 {
                 continue;
             }
@@ -107,8 +107,8 @@ pub(crate) fn post_process_loop(
     if width < 3 || height < 3 || sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
         return;
     }
-    for row in bounds.min_y..=bounds.max_y {
-        for col in bounds.min_x..=bounds.max_x {
+    for row in bounds.min_y..bounds.max_y {
+    for col in bounds.min_x..bounds.max_x {
             if row >= height - 1 || col >= width - 1 {
                 continue;
             }
@@ -159,8 +159,8 @@ pub(crate) fn run_space_vacuum_task(
     unsafe {
         let updated = &mut *sim.updated_cells.ptr;
         let flow = std::slice::from_raw_parts_mut(sim.flow.ptr, total);
-        for row in bounds.min_y..=bounds.max_y {
-            for col in bounds.min_x..=bounds.max_x {
+    for row in bounds.min_y..bounds.max_y {
+    for col in bounds.min_x..bounds.max_x {
                 if row >= height - 1 || col >= width - 1 {
                     continue;
                 }
@@ -2446,9 +2446,9 @@ pub(crate) fn run_liquid_displacement_task(
         return;
     }
     let x_min = bounds.min_x.max(3) as i32;
-    let x_max = (bounds.max_x as i32).min(w - 4);
+    let x_max = (bounds.max_x as i32).min(w - 3);
     let y_min = bounds.min_y.max(3) as i32;
-    let y_max = (bounds.max_y as i32).min(h - 4);
+    let y_max = (bounds.max_y as i32).min(h - 3);
     if x_min > x_max || y_min > y_max {
         return;
     }
@@ -4353,10 +4353,10 @@ mod tests {
                 }
             }
             sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
-                min_x: 0,
-                min_y: 0,
-                max_x: 11,
-                max_y: 9,
+            min_x: 0,
+            min_y: 0,
+            max_x: 12,
+            max_y: 10,
                 current_sunlight_intensity: 0.0,
                 current_cosmic_radiation_intensity: 0.0,
             });
