@@ -51,14 +51,18 @@ pub fn ensure_init_if_enabled() {
 }
 
 /// 解析日志目录：SIMDLL_LOG_DIR 环境变量 > 游戏 logs 目录（可创建/可写才用）> 系统临时目录兜底。
-fn resolve_log_dir() -> PathBuf {
+pub(crate) fn resolve_log_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SIMDLL_LOG_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    let game_logs =
-        PathBuf::from("D:\\Games\\steam\\steamapps\\common\\OxygenNotIncluded\\logs");
+    // 动态推导：宿主 exe（OxygenNotIncluded.exe）所在目录下的 logs——
+    // 不能写死路径（玩家 Steam 库位置不同）。current_exe 在 DLL 内返回宿主 exe。
+    let game_logs = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("logs")))
+        .unwrap_or_else(|| PathBuf::from("logs"));
     if std::fs::create_dir_all(&game_logs).is_ok() {
         // 目录可创建不代表可写：探针文件实测，失败即降级临时目录
         let probe = game_logs.join(".simdll_write_probe");

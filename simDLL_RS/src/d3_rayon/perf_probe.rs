@@ -65,15 +65,12 @@ pub fn frame_done(region_count: usize, mode: i32, threads: usize, elapsed_us: u6
             avg_us as f64 / 1000.0,
             p.max_us as f64 / 1000.0
         );
-        // 写游戏 logs 目录（与 simdll.log 同目录）；失败回退临时目录。
-        let game_logs = "D:\\Games\\steam\\steamapps\\common\\OxygenNotIncluded\\logs";
-        let path = if std::fs::create_dir_all(game_logs).is_ok() {
-            format!("{game_logs}\\simdll_perf.log")
+        // 写游戏 logs 目录（与 simdll.log 同目录，动态推导）；失败回退临时目录。
+        let dir = crate::a_framework::logger::resolve_log_dir();
+        let path = if std::fs::create_dir_all(&dir).is_ok() {
+            dir.join("simdll_perf.log")
         } else {
-            std::env::temp_dir()
-                .join("simdll_perf.log")
-                .to_string_lossy()
-                .into_owned()
+            std::env::temp_dir().join("simdll_perf.log")
         };
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
