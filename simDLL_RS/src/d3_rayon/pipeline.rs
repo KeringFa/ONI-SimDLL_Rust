@@ -202,11 +202,8 @@ mod tests {
         }
     }
 
-    /// 并行路径基本可用性：2 个活动区域各放液体，跑 pipeline 不 panic，
-    /// 各区域液体被处理（质量守恒、事件合并进全局）。
-    #[test]
-    fn parallel_pipeline_runs_and_merges_events() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+    /// 构造 2 个活动区域、各放 100kg 液体的最小 sim（含元素表初始化）。
+    fn make_two_region_sim() -> SimData {
         init_table();
         let mut sd = SimData::new_for_allocate(14, 12, 7, true, false);
         sd.vacuum_element_idx = 0;
@@ -244,6 +241,15 @@ mod tests {
             current_sunlight_intensity: 0.0,
             current_cosmic_radiation_intensity: 0.0,
         });
+        sd
+    }
+
+    /// 并行路径基本可用性：2 个活动区域各放液体，跑 pipeline 不 panic，
+    /// 各区域液体被处理（质量守恒、事件合并进全局）。
+    #[test]
+    fn parallel_pipeline_runs_and_merges_events() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut sd = make_two_region_sim();
         let bounds: Vec<RegionBounds> = sd
             .active_regions
             .as_slice()
@@ -280,6 +286,61 @@ mod tests {
         assert!(
             events.substance_change_info.len() >= 0,
             "事件合并不应破坏全局缓冲"
+        );
+        crate::b_elements::elements_table::DestroyElementsTable();
+    }
+
+    /// 一致性：同一多区域布局分别走串行（run_region_physics_a(false) 循环）与并行
+    /// （run_parallel_pipeline），两者液体总质量都应守恒（并行用区域 RNG，逐格随机
+    /// 结果统计等价而非逐字节一致，故只比守恒/总量）。
+    #[test]
+    fn parallel_matches_serial_mass_conservation() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let mut sd_s = make_two_region_sim();
+        let bounds: Vec<RegionBounds> = sd_s
+            .active_regions
+            .as_slice()
+            .iter()
+            .map(|r| crate::d1_activity::compute_region_bounds(&sd_s, r))
+            .collect();
+        let pp: Vec<RegionBounds> = sd_s
+            .active_regions
+            .as_slice()
+            .iter()
+            .map(|r| crate::d1_activity::compute_post_process_bounds(&sd_s, r))
+            .collect();
+        let cosmic = vec![0.0f32; 2];
+        // —— 串行路径（一帧）——
+        for i in 0..2 {
+            crate::c2_physics::run_region_physics_a(&mut sd_s, bounds[i], cosmic[i], false);
+            crate::c2_physics::run_region_emitters(&mut sd_s, bounds[i]);
+            crate::c2_physics::run_region_physics_c(&mut sd_s, bounds[i], pp[i]);
+        }
+        // —— 并行路径（一帧，独立 sim）——
+        let mut sd_p = make_two_region_sim();
+        run_parallel_pipeline(&mut sd_p, bounds.clone(), pp.clone(), cosmic.clone());
+        // —— 断言：两版液体总质量守恒 ——
+        let mass_of = |sd: &SimData| -> f32 {
+            unsafe {
+                let u = &*sd.updated_cells.ptr;
+                let mut t = 0.0f32;
+                for i in 0..(14 * 12) {
+                    if u.element_idx.get(i) == 1 {
+                        t += u.mass.get(i);
+                    }
+                }
+                t
+            }
+        };
+        let ms = mass_of(&sd_s);
+        let mp = mass_of(&sd_p);
+        assert!(
+            (ms - 200.0).abs() < 0.5,
+            "串行液体应守恒 200kg，got {ms}"
+        );
+        assert!(
+            (mp - 200.0).abs() < 0.5,
+            "并行液体应守恒 200kg，got {mp}"
         );
         crate::b_elements::elements_table::DestroyElementsTable();
     }
