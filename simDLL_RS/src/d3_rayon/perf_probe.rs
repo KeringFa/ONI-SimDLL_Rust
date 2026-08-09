@@ -13,6 +13,7 @@ struct FrameSample {
     max_us: u64,
     last_region_count: usize,
     last_mode: i32,
+    last_threads: usize,
 }
 
 static PERF: Mutex<FrameSample> = Mutex::new(FrameSample {
@@ -21,6 +22,7 @@ static PERF: Mutex<FrameSample> = Mutex::new(FrameSample {
     max_us: 0,
     last_region_count: 0,
     last_mode: 0,
+    last_threads: 1,
 });
 
 static WINDOW_START: OnceLock<Mutex<Instant>> = OnceLock::new();
@@ -30,7 +32,7 @@ fn window_start() -> &'static Mutex<Instant> {
 }
 
 /// update_data 完成一帧后调用（region_count、mode=0 串行/1 D2/2 D1）。
-pub fn frame_done(region_count: usize, mode: i32, elapsed_us: u64) {
+pub fn frame_done(region_count: usize, mode: i32, threads: usize, elapsed_us: u64) {
     let mut p = PERF.lock().unwrap();
     p.frames += 1;
     p.total_us += elapsed_us;
@@ -39,6 +41,7 @@ pub fn frame_done(region_count: usize, mode: i32, elapsed_us: u64) {
     }
     p.last_region_count = region_count;
     p.last_mode = mode;
+    p.last_threads = threads;
 
     let elapsed = window_start().lock().unwrap().elapsed();
     if elapsed.as_millis() >= 5000 {
@@ -49,10 +52,11 @@ pub fn frame_done(region_count: usize, mode: i32, elapsed_us: u64) {
             0
         };
         let line = format!(
-            "[simdll-perf] window={win_ms}ms frames={} mode={} regions={} avg={:.2}ms max={:.2}ms\n",
+            "[simdll-perf] window={win_ms}ms frames={} mode={} regions={} threads={} avg={:.2}ms max={:.2}ms\n",
             p.frames,
             p.last_mode,
             p.last_region_count,
+            p.last_threads,
             avg_us as f64 / 1000.0,
             p.max_us as f64 / 1000.0
         );
@@ -80,6 +84,7 @@ pub fn frame_done(region_count: usize, mode: i32, elapsed_us: u64) {
             max_us: 0,
             last_region_count: 0,
             last_mode: 0,
+            last_threads: 1,
         };
         *window_start().lock().unwrap() = Instant::now();
     }

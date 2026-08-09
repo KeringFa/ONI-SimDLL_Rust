@@ -180,8 +180,10 @@ pub fn update_data(sim_data: &mut SimData) {
     {
         let _perf_t0 = std::time::Instant::now();
         use crate::d3_rayon::scheduler::SchedulerMode;
+        let mut perf_threads = 1usize;
         match crate::d3_rayon::scheduler::current_mode() {
             SchedulerMode::D2 => {
+                perf_threads = crate::d3_rayon::pool().current_num_threads();
                 crate::d3_rayon::pipeline::run_parallel_pipeline(
                     sim_data,
                     bounds_list,
@@ -198,6 +200,7 @@ pub fn update_data(sim_data: &mut SimData) {
                     if let Some(groups) =
                         crate::d3_rayon::d1_pipeline::build_d1_groups(&bounds_list, topo)
                     {
+                        perf_threads = groups.len();
                         crate::d3_rayon::d1_pipeline::run_d1_pipeline(
                             sim_data,
                             &bounds_list,
@@ -218,6 +221,7 @@ pub fn update_data(sim_data: &mut SimData) {
             }
             SchedulerMode::Auto => {
                 if crate::d3_rayon::should_parallelize(region_count) {
+                    perf_threads = crate::d3_rayon::pool().current_num_threads();
                     crate::d3_rayon::pipeline::run_parallel_pipeline(
                         sim_data,
                         bounds_list,
@@ -237,6 +241,7 @@ pub fn update_data(sim_data: &mut SimData) {
         crate::d3_rayon::perf_probe::frame_done(
             region_count,
             perf_mode,
+            perf_threads,
             _perf_t0.elapsed().as_micros() as u64,
         );
     }
