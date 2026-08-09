@@ -5,6 +5,8 @@
 //! `docs/d3_rayon_技术参考.md`（提炼自桌面版旧 d3 线，不照抄旧代码）。
 use std::sync::OnceLock;
 
+pub mod bin_pack;
+
 /// 预留给游戏主线程/系统的物理核数（2026-08-08 用户拍板 = 1）。
 pub const RESERVE_CORES: usize = 1;
 
