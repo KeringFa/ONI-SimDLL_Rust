@@ -13,6 +13,7 @@ pub mod temperature;
 pub mod gas_flow;
 pub mod radiation;
 pub mod disease;
+pub mod region_events;
 
 /// SimBase::UpdateData 的桩实现。
 ///
