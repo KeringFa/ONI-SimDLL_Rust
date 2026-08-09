@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 pub mod affinity;
 pub mod bin_pack;
+pub mod d1_pipeline;
 pub mod pipeline;
 
 /// 预留给游戏主线程/系统的物理核数（2026-08-08 用户拍板 = 1）。
