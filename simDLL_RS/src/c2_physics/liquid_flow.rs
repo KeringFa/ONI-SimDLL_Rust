@@ -1315,6 +1315,22 @@ pub(crate) fn fast_combined_temperature(mass_a: f32, temp_a: f32, mass_b: f32, t
     (mass_a * temp_a + mass_b * temp_b) / (mass_a + mass_b)
 }
 
+/// CalculateCombinedTemperature（原版 SimDLL_Source.c L140988，ElementEmitter 用）：
+/// 加权平均后**钳制到 [min(temp_a,temp_b), max(temp_a,temp_b)]**；总质量<=0 返回 0。
+/// 此前 element_emitter 误用 fast_combined_temperature（无钳制）→ 合并温度可能越界。
+pub(crate) fn calculate_combined_temperature(
+    mass_a: f32,
+    temp_a: f32,
+    mass_b: f32,
+    temp_b: f32,
+) -> f32 {
+    if mass_a + mass_b <= 0.0 {
+        return 0.0;
+    }
+    let avg = (mass_a * temp_a + mass_b * temp_b) / (mass_a + mass_b);
+    avg.clamp(temp_a.min(temp_b), temp_a.max(temp_b))
+}
+
 /// 清空格子 flow 四分量（原版 L2455-2458/L2552-2555，flow 为 Vector4f 数组）。
 fn clear_flow(sim: &mut SimData, cell: usize) {
     if !sim.flow.ptr.is_null() {
@@ -2966,16 +2982,17 @@ fn do_pressure_break(sim: &mut SimData, cell: usize, ratio: f32, offset: isize) 
             let elem = updated.element_idx.get(c);
             if let Some(ppd2) = elements_table::get_element_post_process_data(elem) {
                 // 原版 L2720-2728：边界格是液体且有质量 → 从压强比中扣除
+                // 原版 L2742-2752：边界格为液体且有质量 → 从压力比中扣除 mass/maxMass；
+                // 随后**无条件**按 (resistance < ratio) 判定突破。此前 Rust 把判定嵌进
+                // `if m > 0.0` 内，mass<=0 时漏判 → 不炸墙泄压（待对照 P2-2）。
+                let mut ratio_eff = ratio;
                 if (ppd2.state & 3) == 2 {
                     let m = updated.mass.get(c);
                     if m > 0.0 {
-                        let ratio_after = ratio - m / ppd2.max_mass;
-                        if resistance < ratio_after {
-                            push_world_damage(sim, cell, offset, solid_count);
-                            return true;
-                        }
+                        ratio_eff = ratio - m / ppd2.max_mass;
                     }
-                } else if resistance < ratio {
+                }
+                if resistance < ratio_eff {
                     push_world_damage(sim, cell, offset, solid_count);
                     return true;
                 }

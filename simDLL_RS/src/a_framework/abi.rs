@@ -15,13 +15,17 @@ pub type GameMessageHandler = unsafe extern "C" fn(c_int, *mut *mut c_void);
 
 /// 崩溃通知 payload（传递给 GameMessageHandler）。
 ///
-/// 对照源码 09_crashdump_logger.c 中的崩溃通知逻辑。
-/// 2 个指针字段 = 16 字节。
+/// 对照源码 09_crashdump_logger.c L186-210/L430-443 与 C# Sim.cs
+/// `DLLReportMessageMessage { IntPtr callstack; IntPtr message; IntPtr file; int line; }`：
+/// 4 字段 28B，对齐到 32B。此前 {message, stack_trace} 16B 字段错位 → C# 读
+/// callstack@0/message@8/file@16/line@24 时内容对调且越界读 16B。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CrashNotifyPayload {
-    pub message: *const c_char,
-    pub stack_trace: *const c_char,
+    pub callstack: *const c_char, // @0
+    pub message: *const c_char,   // @8
+    pub file: *const c_char,      // @16
+    pub line: c_int,              // @24
 }
 
 /// SYSINFO_Acquire 返回的最小 JSON（NUL 终止）。
@@ -40,8 +44,9 @@ mod tests {
     }
 
     #[test]
-    fn crash_notify_payload_size_is_16() {
-        assert_eq!(std::mem::size_of::<CrashNotifyPayload>(), 16);
+    fn crash_notify_payload_size_is_32() {
+        // C# DLLReportMessageMessage：3×IntPtr + int，对齐后 32B
+        assert_eq!(std::mem::size_of::<CrashNotifyPayload>(), 32);
     }
 
     #[test]

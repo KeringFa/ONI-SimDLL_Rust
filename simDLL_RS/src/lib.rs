@@ -51,7 +51,8 @@ pub mod globals {
     impl<T> Copy for SendSyncPtr<T> {}
 
     /// C# 注册的消息回调。对应原版 `gGameMessageHandler`。
-    pub static G_GAME_MESSAGE_HANDLER: OnceCell<GameMessageHandler> = OnceCell::new();
+    /// 用 Mutex<Option<..>> 以便 CleanUp 时置空（原版 CleanUp L645 置 0）。
+    pub static G_GAME_MESSAGE_HANDLER: Mutex<Option<GameMessageHandler>> = Mutex::new(None);
 
     /// 全局 SimData 指针。对应原版 `gSimData`（unique_ptr<SimData>）。
     /// null 表示尚未 AllocateCells。

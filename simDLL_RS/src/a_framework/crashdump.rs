@@ -111,7 +111,7 @@ unsafe extern "system" fn sim_dll_unhandled_exception_filter(
     let frame_count = capture_backtrace(&mut frames);
 
     // 步骤 7：通知 GameMessageHandler（如果已注册）
-    if let Some(handler) = G_GAME_MESSAGE_HANDLER.get() {
+    if let Some(handler) = *G_GAME_MESSAGE_HANDLER.lock() {
         let stacktrace_str = format!(
             "simDLL_RS crash at {}\n{} frames captured:\n",
             now.format("%Y-%m-%d %H:%M:%S"),
@@ -124,9 +124,14 @@ unsafe extern "system" fn sim_dll_unhandled_exception_filter(
         let trace_cstr = leak_c_string(trace);
         let filename_cstr = leak_c_string(dump_filename);
 
+        // 原版 09_crashdump_logger.c L186-210：message_id=0 的 payload 为
+        // {callstack=堆栈, message=转储文件名, file=null, line=0}（C# 按
+        // DLLReportMessageMessage 布局读取：callstack@0/message@8/file@16/line@24）。
         let payload = CrashNotifyPayload {
+            callstack: trace_cstr as *const c_char,
             message: filename_cstr as *const c_char,
-            stack_trace: trace_cstr as *const c_char,
+            file: std::ptr::null(),
+            line: 0,
         };
         let payload_ptr: *mut CrashNotifyPayload = &payload as *const _ as *mut _;
         let payload_double_ptr: *mut *mut c_void = payload_ptr as *mut *mut c_void;
@@ -216,8 +221,10 @@ mod tests {
     #[test]
     fn crash_notify_payload_can_be_constructed() {
         let payload = CrashNotifyPayload {
+            callstack: std::ptr::null(),
             message: std::ptr::null(),
-            stack_trace: std::ptr::null(),
+            file: std::ptr::null(),
+            line: 0,
         };
         let _ = payload;
     }

@@ -128,7 +128,13 @@ impl ParallelTaskQueue {
 
     /// 关闭并等待 worker 退出（原版析构：置 mShuttingDown + join）。
     pub fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+        // 丢失唤醒修复：标志必须在 state 锁内设置（worker 在 wait 释放锁前检查标志）。
+        // 此前锁外 store + notify_all 存在窗口：worker 检查 false 后即将 wait，
+        // shutdown 已 notify → worker 永久睡眠 → join 死锁。
+        {
+            let _guard = self.state.lock().unwrap();
+            self.shutting_down.store(true, Ordering::SeqCst);
+        }
         self.task_cond.notify_all();
         let workers = std::mem::take(&mut *self.workers.lock().unwrap());
         for w in workers {

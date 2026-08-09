@@ -451,7 +451,9 @@ impl ElementEmitterManager {
                 if emitted.mass > 0.0 {
                     let out = &mut sim.element_emitter.emitted_mass_info;
                     let cur = out.get(idx);
-                    let combined = crate::c2_physics::liquid_flow::fast_combined_temperature(
+                    // 原版 ElementEmitter::Emit/Update 调 CalculateCombinedTemperature
+                    // （SimDLL_Source.c L141073/L141607）：加权平均后钳制到 [min,max]。
+                    let combined = crate::c2_physics::liquid_flow::calculate_combined_temperature(
                         cur.mass,
                         cur.temperature,
                         emitted.mass,

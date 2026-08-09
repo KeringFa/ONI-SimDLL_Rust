@@ -49,10 +49,8 @@ pub extern "C" fn SIM_Initialize(handler: Option<GameMessageHandler>) {
         // L327: CleanUp() — 清理旧资源
         save_load::clean_up();
 
-        // 注册 handler
-        if let Some(h) = handler {
-            let _ = G_GAME_MESSAGE_HANDLER.set(h);
-        }
+        // 注册 handler（原版 gGameMessageHandler = param_1，无条件赋值）
+        *G_GAME_MESSAGE_HANDLER.lock() = handler;
 
         // L329: FrameSync::clear(&gFrameSync)
         // 初始化 G_FRAME_SYNC（如果尚未初始化）并 clear
@@ -197,8 +195,9 @@ pub extern "C" fn SIM_HandleMessages(
     data: *mut c_schar,
 ) -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
-        // L266: 如果 count <= 0，返回 null
-        if count <= 0 || data.is_null() || size <= 0 {
+        // L266: 原版仅检查 count <= 0；data=null/size=0 时原版用空 reader 继续分派
+        // （Rust 此前额外拒绝 data.is_null()/size<=0，可能拒绝合法批量消息）。
+        if count <= 0 {
             return std::ptr::null_mut();
         }
 
@@ -214,8 +213,12 @@ pub extern "C" fn SIM_HandleMessages(
 
         for _ in 0..count {
             // L272: 构造 BinaryBufferReader
-            let data_slice = unsafe {
-                std::slice::from_raw_parts(data.add(offset) as *const u8, size as usize)
+            let data_slice: &[u8] = if data.is_null() || size <= 0 {
+                &[]
+            } else {
+                unsafe {
+                    std::slice::from_raw_parts(data.add(offset) as *const u8, size as usize)
+                }
             };
             let mut reader = BinaryBufferReader::new(data_slice);
 

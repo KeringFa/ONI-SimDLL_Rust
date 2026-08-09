@@ -269,7 +269,15 @@ impl SimFrameManager {
     /// new_frame 的锁内核心（调用方须已持 frame_mutex）。
     fn new_frame_locked(&mut self) {
         let frame_ptr = if self.frame_pool.is_empty() {
-            let boxed = Box::new(SimFrameInfo::default());
+            let mut boxed = Box::new(SimFrameInfo::default());
+            // 原版 SimFrameInfo 构造默认 debugProperties=0.001（L113777-113778）
+            unsafe {
+                (*boxed).debug_properties = DebugProperties {
+                    building_temperature_scale: 0.001,
+                    building_to_building_temperature_scale: 0.001,
+                    ..DebugProperties::default()
+                };
+            }
             Box::into_raw(boxed)
         } else {
             // 原版 NewFrame（08_sim_frame_manager.c L1162-1164）：framePool 非空时
@@ -317,12 +325,8 @@ impl SimFrameManager {
                 clear_component_messages(&mut frame.radiation_emitter_messages);
                 // 重置帧时间和调试属性
                 frame.elapsed_seconds = 0.0;
-                // 原版 SimFrameManager 构造默认 0.001（L113777-113778），C# SetDebugProperties 覆盖为 100f
-                frame.debug_properties = DebugProperties {
-                    building_temperature_scale: 0.001,
-                    building_to_building_temperature_scale: 0.001,
-                    ..DebugProperties::default()
-                };
+                // 原版 NewFrame 复用帧**不重置** debugProperties（★36）；
+                // 仅在新建帧时（上方 Box::new 路径）置构造默认值。
             }
         }
         self.current_frame = frame_ptr;

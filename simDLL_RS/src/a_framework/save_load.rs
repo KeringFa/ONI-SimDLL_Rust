@@ -71,6 +71,10 @@ pub fn clean_up() {
         }
     }
 
+    // 对照原版 02_save_load.c L645：CleanUp 置 gGameMessageHandler = 0
+    // （崩溃处理器回调已卸载 C# 委托）。
+    *globals::G_GAME_MESSAGE_HANDLER.lock() = None;
+
     // 释放 gDisease
     {
         let mut disease = globals::G_DISEASE.lock();
