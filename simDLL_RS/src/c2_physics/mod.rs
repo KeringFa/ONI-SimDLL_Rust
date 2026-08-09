@@ -171,13 +171,43 @@ pub fn update_data(sim_data: &mut SimData) {
                 .collect()
         }
     };
-    for (bounds, pp_bounds, cosmic_intensity) in region_bounds {
+    let bounds_list: Vec<_> = region_bounds.iter().map(|x| x.0).collect();
+    let pp_list: Vec<_> = region_bounds.iter().map(|x| x.1).collect();
+    let cosmic_list: Vec<_> = region_bounds.iter().map(|x| x.2).collect();
+    let region_count = bounds_list.len();
+    // d3 并行分支（feature "d3-rayon" 门控）：多区域 → 三段式并行；否则串行。
+    #[cfg(feature = "d3-rayon")]
+    if crate::d3_rayon::should_parallelize(region_count) {
+        crate::d3_rayon::pipeline::run_parallel_pipeline(
+            sim_data,
+            bounds_list,
+            pp_list,
+            cosmic_list,
+        );
+    } else {
+        run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
+    }
+    #[cfg(not(feature = "d3-rayon"))]
+    {
+        run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
+    }
+}
+
+/// 串行区域循环（d3 关闭或单区域时执行；行为与原版逐帧一致）。
+fn run_serial_regions(
+    sim_data: &mut SimData,
+    bounds_list: Vec<crate::d1_activity::RegionBounds>,
+    pp_list: Vec<crate::d1_activity::RegionBounds>,
+    cosmic_list: Vec<f32>,
+) {
+    for i in 0..bounds_list.len() {
+        let bounds = bounds_list[i];
         if bounds.is_empty() {
             continue;
         }
-        run_region_physics_a(sim_data, bounds, cosmic_intensity, false);
+        run_region_physics_a(sim_data, bounds, cosmic_list[i], false);
         run_region_emitters(sim_data, bounds);
-        run_region_physics_c(sim_data, bounds, pp_bounds);
+        run_region_physics_c(sim_data, bounds, pp_list[i]);
     }
 }
 

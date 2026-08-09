@@ -38,6 +38,14 @@ pub mod globals {
     unsafe impl<T> Send for SendSyncPtr<T> {}
     unsafe impl<T> Sync for SendSyncPtr<T> {}
 
+    impl<T> SendSyncPtr<T> {
+        /// 返回裸指针。方法调用强制闭包捕获整个包装（Rust 2021 disjoint capture
+        /// 下直接读 `.0` 字段只会捕获裸指针本身，绕过 Send 实现——d3 rayon 必需）。
+        pub fn get(&self) -> *mut T {
+            self.0
+        }
+    }
+
     impl<T> Default for SendSyncPtr<T> {
         fn default() -> Self {
             Self(std::ptr::null_mut())

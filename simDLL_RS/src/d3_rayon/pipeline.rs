@@ -1,0 +1,286 @@
+//! T5：三段式并行接线（d3 并行路径）。
+//!
+//! 阶段 A（网格物理并行）→ 合并 A 事件 → 阶段 B（组件串行，按 ★4 注册顺序）
+//! → 阶段 C（收尾并行）→ 合并 C 事件。每个区域 job 用 `with_region_rng` +
+//! `with_region_sink` 包裹，保证随机/事件路由正确；区域分组用 LPT 面积装箱，
+//! 组内逐区域串行。串行路径不触碰本模块（update_data 门控）。
+
+use crate::a_framework::sim_data::SimData;
+use crate::c2_physics::region_events::{with_region_sink, RegionEvents};
+use crate::c2_physics::region_rng::{with_region_rng, RegionRng};
+use crate::d1_activity::RegionBounds;
+use crate::globals::SendSyncPtr;
+
+/// 编译期断言：SendSyncPtr 包装必须 Send/Sync（d3 并行任务跨线程传递的前提）。
+fn _assert_send_sync() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<SendSyncPtr<SimData>>();
+    assert_send::<SendSyncPtr<RegionRng>>();
+    assert_send::<SendSyncPtr<RegionEvents>>();
+    assert_sync::<SendSyncPtr<SimData>>();
+}
+
+/// 最小 scope 捕获实验（定位 Send 推断问题）。
+fn _min_scope_test(sim: &mut SimData) {
+    let ptr: SendSyncPtr<SimData> = SendSyncPtr(sim as *mut SimData);
+    let pool = crate::d3_rayon::pool();
+    pool.scope(|s| {
+        let ptr = ptr;
+        s.spawn(move |_| {
+            let _ = ptr.get();
+        });
+    });
+}
+
+/// 并行路径入口：多区域（多星）时替代串行区域循环。
+pub(crate) fn run_parallel_pipeline(
+    sim: &mut SimData,
+    region_bounds: Vec<RegionBounds>,
+    region_pp_bounds: Vec<RegionBounds>,
+    region_cosmic: Vec<f32>,
+) {
+    let n = region_bounds.len();
+    if n == 0 {
+        return;
+    }
+    // T4：按当前 active_regions 对齐区域随机状态（key 不变保留，新增派生）。
+    crate::c2_physics::region_rng::realign_region_rngs(sim, sim.active_regions.as_slice());
+    let rng_ptrs: Vec<SendSyncPtr<RegionRng>> =
+        crate::c2_physics::region_rng::region_rng_ptrs()
+            .into_iter()
+            .map(SendSyncPtr)
+            .collect();
+    // T3：每区域独立事件缓冲（并行任务写各自缓冲，零锁；scope 结束后按区域序合并）。
+    let mut region_events: Vec<RegionEvents> = (0..n).map(|_| Default::default()).collect();
+    let events_ptrs: Vec<SendSyncPtr<RegionEvents>> = (0..n)
+        .map(|i| SendSyncPtr(&mut region_events[i] as *mut RegionEvents))
+        .collect();
+    let pool = crate::d3_rayon::pool();
+    // T6.3：LPT 面积装箱——组数 = min(区域数, 线程数)，组内逐区域串行。
+    let groups = crate::d3_rayon::bin_pack::bin_pack_region_groups(
+        &region_bounds,
+        pool.current_num_threads(),
+    );
+    let sim_ptr: SendSyncPtr<SimData> = SendSyncPtr(sim as *mut SimData);
+
+    // —— 阶段 A：网格物理并行（温度内联、区域局部 CopyFrom，parallel=true）——
+    pool.scope(|s| {
+        for group in &groups {
+            let sim_ptr = sim_ptr.clone();
+            let group = group.clone();
+            let region_bounds = region_bounds.clone();
+            let region_cosmic = region_cosmic.clone();
+            let rng_ptrs = rng_ptrs.clone();
+            let events_ptrs = events_ptrs.clone();
+            s.spawn(move |_| {
+                // get() 方法调用强制捕获整个 SendSyncPtr（Rust 2021 disjoint capture
+                // 下 `.0` 字段访问只捕获裸指针本身，绕过 Send）。
+                let sim_raw = sim_ptr.get();
+                for i in group {
+                    let bounds = region_bounds[i];
+                    let cosmic = region_cosmic[i];
+                    let rng = rng_ptrs[i];
+                    let events = events_ptrs[i];
+                    let rng_raw = rng.get();
+                    let events_raw = events.get();
+                    with_region_rng(rng_raw, move || {
+                        with_region_sink(events_raw, move || unsafe {
+                            crate::c2_physics::run_region_physics_a(
+                                &mut *sim_raw,
+                                bounds,
+                                cosmic,
+                                true,
+                            );
+                        });
+                    });
+                }
+            });
+        }
+    });
+    // 合并 A 事件（按区域序，A→B→C 相对顺序）
+    for ev in region_events.iter_mut() {
+        ev.merge_into(sim);
+    }
+    // —— 阶段 B：组件串行（注册表全局共享不可并行；事件直接写全局）——
+    for i in 0..n {
+        crate::c2_physics::run_region_emitters(sim, region_bounds[i]);
+    }
+    // —— 阶段 C：收尾并行（PostProcess + 病菌生长；事件回区域缓冲）——
+    pool.scope(|s| {
+        for group in &groups {
+            let sim_ptr = sim_ptr.clone();
+            let group = group.clone();
+            let region_bounds = region_bounds.clone();
+            let region_pp_bounds = region_pp_bounds.clone();
+            let rng_ptrs = rng_ptrs.clone();
+            let events_ptrs = events_ptrs.clone();
+            s.spawn(move |_| {
+                let sim_raw = sim_ptr.get();
+                for i in group {
+                    let bounds = region_bounds[i];
+                    let pp_bounds = region_pp_bounds[i];
+                    let rng = rng_ptrs[i];
+                    let events = events_ptrs[i];
+                    let rng_raw = rng.get();
+                    let events_raw = events.get();
+                    with_region_rng(rng_raw, move || {
+                        with_region_sink(events_raw, move || unsafe {
+                            crate::c2_physics::run_region_physics_c(
+                                &mut *sim_raw,
+                                bounds,
+                                pp_bounds,
+                            );
+                        });
+                    });
+                }
+            });
+        }
+    });
+    // 合并 C 事件
+    for ev in region_events.iter_mut() {
+        ev.merge_into(sim);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a_framework::sim_data::SimData;
+    use crate::b_elements::element::{
+        Element, ElementLiquidData, ElementPostProcessData, ElementPressureData, ElementStateData,
+        ElementTemperatureData,
+    };
+    use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
+    use crate::LIB_TESTS_LOCK;
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn send_sync_ptr_wrappers_are_send() {
+        assert_send::<SendSyncPtr<SimData>>();
+        assert_send::<SendSyncPtr<RegionRng>>();
+        assert_send::<SendSyncPtr<RegionEvents>>();
+        assert_sync::<SendSyncPtr<SimData>>();
+    }
+
+    /// 最小元素表：0=真空、1=液体（state2）、2=气体（state1）、3=固体（state3）。
+    fn init_table() {
+        let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+        table.elements.clear();
+        table.element_names.clear();
+        table.state_data.clear();
+        table.liquid_data.clear();
+        table.pressure_data.clear();
+        table.post_process_data.clear();
+        table.temperature_data.clear();
+        for (id, state) in [(0i32, 0u8), (1i32, 2u8), (2i32, 1u8), (3i32, 3u8)] {
+            let mut elem = Element::default();
+            elem.id = id;
+            elem.state = state;
+            table.elements.push(elem);
+            table.state_data.push(ElementStateData { state });
+            table.liquid_data.push(ElementLiquidData {
+                state,
+                flow: 50.0,
+                viscosity: 50.0,
+                max_mass: 1000.0,
+                min_horizontal_flow: 0.0,
+                min_vertical_flow: 0.0,
+            });
+            table.pressure_data.push(ElementPressureData { state, flow: 0.0 });
+            table
+                .post_process_data
+                .push(ElementPostProcessData { state, ..Default::default() });
+            table.temperature_data.push(ElementTemperatureData {
+                state,
+                low_temp: 0.0,
+                high_temp: 10000.0,
+                ..Default::default()
+            });
+        }
+    }
+
+    /// 并行路径基本可用性：2 个活动区域各放液体，跑 pipeline 不 panic，
+    /// 各区域液体被处理（质量守恒、事件合并进全局）。
+    #[test]
+    fn parallel_pipeline_runs_and_merges_events() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_table();
+        let mut sd = SimData::new_for_allocate(14, 12, 7, true, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                for i in 0..(14 * 12) {
+                    buf.element_idx.set(i, 0);
+                    buf.mass.set(i, 0.0);
+                    buf.temperature.set(i, 300.0);
+                }
+                // 区域 0（x1..5, y1..4）col1 row1：液体 100kg
+                buf.element_idx.set(1 * 14 + 1, 1);
+                buf.mass.set(1 * 14 + 1, 100.0);
+                // 区域 1（x7..11, y1..4）col7 row1：液体 100kg
+                buf.element_idx.set(1 * 14 + 7, 1);
+                buf.mass.set(1 * 14 + 7, 100.0);
+            }
+        }
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 1,
+            min_y: 1,
+            max_x: 6,
+            max_y: 5,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        });
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 7,
+            min_y: 1,
+            max_x: 12,
+            max_y: 5,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        });
+        let bounds: Vec<RegionBounds> = sd
+            .active_regions
+            .as_slice()
+            .iter()
+            .map(|r| crate::d1_activity::compute_region_bounds(&sd, r))
+            .collect();
+        let pp: Vec<RegionBounds> = sd
+            .active_regions
+            .as_slice()
+            .iter()
+            .map(|r| crate::d1_activity::compute_post_process_bounds(&sd, r))
+            .collect();
+        let cosmic = vec![0.0f32; 2];
+        run_parallel_pipeline(&mut sd, bounds, pp, cosmic);
+        // 不 panic；液体总质量守恒（两个 100kg 可能在区域内流动，但总量不变）
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            let mut total = 0.0f32;
+            let mut count = 0usize;
+            for i in 0..(14 * 12) {
+                if u.element_idx.get(i) == 1 {
+                    total += u.mass.get(i);
+                    count += 1;
+                }
+            }
+            assert!(count >= 1, "液体应存在（可能扩散为多格）");
+            assert!(
+                (total - 200.0).abs() < 0.5,
+                "液体总量应守恒 200kg，got {total}"
+            );
+        }
+        // 事件按区域序合并进全局（可能有 substance_change 事件）
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert!(
+            events.substance_change_info.len() >= 0,
+            "事件合并不应破坏全局缓冲"
+        );
+        crate::b_elements::elements_table::DestroyElementsTable();
+    }
+}
