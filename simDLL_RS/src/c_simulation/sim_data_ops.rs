@@ -96,6 +96,50 @@ pub fn copy_updated_cells_to_cells(sim_data: &mut SimData) {
     cells.copy_from(updated_cells);
 }
 
+/// T2：区域局部 CopyFrom——并行路径下只复制区域矩形 + halo 边界 1 格到 cells 快照，
+/// 避免全网格拷贝（memory-bound，并行无收益且引入调度抖动）。
+///
+/// bounds 已钳制到内部格（compute_region_bounds），halo 落在区域间真空 buffer 内，
+/// 跨区域读安全；边界处 clamp 到网格边缘。字段集与 `CellSOA::copy_from` 一致。
+pub fn copy_updated_cells_to_cells_region(
+    sim_data: &SimData,
+    bounds: &crate::d1_activity::RegionBounds,
+) {
+    if sim_data.cells.ptr.is_null() || sim_data.updated_cells.ptr.is_null() {
+        return;
+    }
+    let w = sim_data.width as usize;
+    let h = sim_data.height as usize;
+    let halo = 1usize;
+    let min_x = bounds.min_x.saturating_sub(halo);
+    let min_y = bounds.min_y.saturating_sub(halo);
+    let max_x = bounds.max_x.saturating_add(halo).min(w);
+    let max_y = bounds.max_y.saturating_add(halo).min(h);
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+    let cells = unsafe { &mut *sim_data.cells.ptr };
+    let upd = unsafe { &*sim_data.updated_cells.ptr };
+    for row in min_y..max_y {
+        for col in min_x..max_x {
+            let i = row * w + col;
+            cells.element_idx.set(i, upd.element_idx.get(i));
+            cells.temperature.set(i, upd.temperature.get(i));
+            cells.mass.set(i, upd.mass.get(i));
+            cells.properties.set(i, upd.properties.get(i));
+            cells.insulation.set(i, upd.insulation.get(i));
+            cells.strength_info.set(i, upd.strength_info.get(i));
+            cells.disease_idx.set(i, upd.disease_idx.get(i));
+            cells.disease_count.set(i, upd.disease_count.get(i));
+            cells.disease_infestation_tick_count.set(i, upd.disease_infestation_tick_count.get(i));
+            cells
+                .disease_growth_accumulated_error
+                .set(i, upd.disease_growth_accumulated_error.get(i));
+            cells.radiation.set(i, upd.radiation.get(i));
+        }
+    }
+}
+
 /// 清零整张 flow 数组（Vector4f × width×height，含边界）。
 ///
 /// 对照源码 Sim::Main（SimDLL_Source.c L2119）：`BeginFrameProcessing` 之后、
@@ -551,6 +595,49 @@ mod tests {
         assert_eq!(cells.element_idx.get(5), 100u16);
         assert_eq!(cells.mass.get(5), 50.0f32);
         assert_eq!(cells.temperature.get(5), 300.0f32);
+    }
+
+    /// T2 回归：区域局部 CopyFrom 只复制区域矩形 + halo 边界 1 格（并行路径免全网格拷贝）。
+    #[test]
+    fn copy_region_copies_rectangle_with_halo() {
+        let mut sd = make_test_sim_data();
+        unsafe {
+            let upd = &mut *sd.updated_cells.ptr;
+            upd.element_idx.set(7, 111); // region interior (1,1)
+            upd.mass.set(14, 4.0);       // region interior (2,2)
+            upd.element_idx.set(0, 222); // halo (0,0) = (min-1, min-1)
+        }
+        let bounds = crate::d1_activity::RegionBounds {
+            min_x: 1,
+            min_y: 1,
+            max_x: 3,
+            max_y: 3,
+        };
+        copy_updated_cells_to_cells_region(&sd, &bounds);
+        unsafe {
+            let cells = &*sd.cells.ptr;
+            assert_eq!(cells.element_idx.get(7), 111, "region interior 应复制");
+            assert_eq!(cells.mass.get(14), 4.0, "region interior mass 应复制");
+            assert_eq!(cells.element_idx.get(0), 222, "halo (min-1) 应复制");
+            // region 外（如 cell 35 = row5 col5）不应被本函数触碰（保持 cells 初始 0）
+            assert_eq!(cells.element_idx.get(35), 0);
+        }
+    }
+
+    #[test]
+    fn copy_region_empty_bounds_is_noop() {
+        let mut sd = make_test_sim_data();
+        let bounds = crate::d1_activity::RegionBounds {
+            min_x: 3,
+            min_y: 3,
+            max_x: 2,
+            max_y: 2,
+        };
+        copy_updated_cells_to_cells_region(&sd, &bounds); // 不 panic，不复制
+        unsafe {
+            let cells = &*sd.cells.ptr;
+            assert_eq!(cells.element_idx.get(7), 0, "空区域不应复制");
+        }
     }
 
     #[test]
