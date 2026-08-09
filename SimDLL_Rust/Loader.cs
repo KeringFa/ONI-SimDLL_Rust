@@ -53,9 +53,10 @@ namespace SimDLL_Rust
             ModConfig.Load(mod?.ContentPath ?? path);
             ModConfig.Apply();
 
-            // 调度模式：未启用超线程优化或 CPU 无超线程 → D2(1)；启用且检测通过 → D1(2)。
-            // D1 在 Rust 侧会再次校验拓扑（无 HT 自动回退 D2）。
-            int schedulerMode = 1;
+            // 调度模式：默认 Auto(0)——单区域/单星永远走串行（与原版一致），
+            // 多区域走 D2（rayon 装箱）；仅当启用超线程优化且 CPU 检测通过 → D1(2)。
+            // 注意：不能默认强制 D2(1)，否则单星也会进 D2 并行路径（行为偏离原版串行）。
+            int schedulerMode = 0;
             if (CpuInfo.HasHyperThreading() && ModConfig.HyperThreadOptimizationEnabled)
             {
                 schedulerMode = 2;

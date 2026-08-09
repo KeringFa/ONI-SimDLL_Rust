@@ -30,10 +30,12 @@ pub extern "C" fn RS_SetSchedulerMode(mode: i32) -> i32 {
     match mode {
         0 => {
             MODE.store(0, Ordering::Relaxed);
+            crate::d3_rayon::d1_pipeline::shutdown_executor();
             0
         }
         1 => {
             MODE.store(1, Ordering::Relaxed);
+            crate::d3_rayon::d1_pipeline::shutdown_executor();
             1
         }
         2 => {
@@ -43,6 +45,7 @@ pub extern "C" fn RS_SetSchedulerMode(mode: i32) -> i32 {
                 2
             } else {
                 MODE.store(1, Ordering::Relaxed);
+                crate::d3_rayon::d1_pipeline::shutdown_executor();
                 tracing::warn!("D1 requested but CPU has no hyper-threading; falling back to D2");
                 1
             }

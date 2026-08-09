@@ -1,9 +1,9 @@
 //! 方向 1（1 星 1 线程）：CPU 拓扑枚举、超线程检测与分组分配。
 //!
-//! 对照原理：Windows GetLogicalProcessorInformation（RelationProcessorCore）
-//! 返回每个物理核的逻辑处理器数（1=无超线程，2=启用超线程）。分组算法按
-//! Remix 后世界 tiles 降序：前（物理核−1）大世界独占物理核，其余最小世界
-//! 两两合并 + 太空员舱集群走超线程逻辑核。
+//! 对照原理：Windows GetLogicalProcessorInformationEx（RelationProcessorCore）
+//! 返回每个物理核的逻辑处理器数与 HT 标志。分组算法按 Remix 后世界 tiles
+//! 降序：前（物理核−1）大世界独占物理核，其余最小世界两两合并 +
+//! 太空员舱集群走超线程逻辑核（亲和性当前未实际绑定，OS 自由调度）。
 
 use std::sync::OnceLock;
 

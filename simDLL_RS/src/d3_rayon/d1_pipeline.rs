@@ -1,10 +1,10 @@
 //! 方向 1（1 星 1 线程）：D1 执行器。
 //!
-//! 每帧按组 spawn `std::thread`（组数 = 物理核组 + 超线程组，≤ 逻辑核数），
-//! 线程闭包内 `SetThreadAffinityMask` 绑定亲和性后执行阶段 A/C 的组内区域物理。
-//! 阶段 B（组件）保持串行（与 D2 一致）。事件经 region sink 路由后合并。
-//! 说明：线程采用每帧创建而非持久线程——sim 帧 200ms，创建开销（~1ms）可忽略，
-//! 换取实现简单可靠；std::thread + 亲和性 + 组并行的目标不变。
+//! 持久线程执行器：每组一个常驻 `std::thread`（组数 = 物理核组 + 超线程组，
+//! ≤ 逻辑核数），线程只在分组变化时重建；每帧经 mpsc 信号 + Barrier 同步，
+//! 执行阶段 A/C 的组内区域物理。阶段 B（组件）保持串行（与 D2 一致）。
+//! 事件经 region sink 路由后合并。亲和性绑定已移除（OS 自由调度，实测与
+//! rayon 持平；低配机器 4C8T 下线程数=组数更充分，作为玩家可选优化保留）。
 
 use crate::a_framework::sim_data::SimData;
 use crate::c2_physics::region_events::{with_region_sink, RegionEvents};
@@ -77,6 +77,10 @@ fn ht_idle_mask(topo: &CpuTopology, ht_index: usize) -> Option<u64> {
 }
 
 /// 当前线程设置亲和掩码（失败静默，回退 OS 调度）。
+/// 【实验 2026-08-09】亲和性绑定已移除（OS 自由调度、线程数=组数，
+/// 实测 +5 FPS 来自并行度而非超线程规划）；如要恢复绑定，在
+/// worker_loop 开头调用本函数即可。
+#[allow(dead_code)]
 fn set_thread_affinity(mask: u64) {
     unsafe {
         let _ = windows::Win32::System::Threading::SetThreadAffinityMask(
@@ -162,9 +166,10 @@ fn worker_loop(
     frame: Arc<Mutex<FrameContext>>,
     barrier: Arc<Barrier>,
 ) {
+    // 实验：不绑定亲和性，交给 OS 调度（线程数 = 组数，天然用满超线程核）。
     while let Ok(()) = rx.recv() {
         let (sim, phase, jobs) = {
-            let f = frame.lock().unwrap();
+            let f = frame.lock().unwrap_or_else(|e| e.into_inner());
             let sim = f.sim;
             let phase = f.phase;
             let jobs: Vec<_> = group
@@ -234,7 +239,7 @@ pub fn run_d1_pipeline(
         .collect();
     let sim_ptr = SendSyncPtr(sim as *mut SimData);
 
-    let mut executor_guard = G_D1_EXECUTOR.lock().unwrap();
+    let mut executor_guard = G_D1_EXECUTOR.lock().unwrap_or_else(|e| e.into_inner());
     // 分组变化（世界增删/尺寸变化）→ 重建执行器（线程重新创建并绑定亲和性）。
     let needs_rebuild = match &*executor_guard {
         Some(ex) => ex.groups != groups,
@@ -257,7 +262,7 @@ pub fn run_d1_pipeline(
 
     // 更新每帧上下文（主线程独占写入；worker 锁内读取）。
     {
-        let mut f = executor.frame.lock().unwrap();
+        let mut f = executor.frame.lock().unwrap_or_else(|e| e.into_inner());
         f.sim = sim_ptr;
         f.bounds = region_bounds.to_vec();
         f.pp = region_pp_bounds.to_vec();
@@ -283,7 +288,7 @@ pub fn run_d1_pipeline(
 
     // —— 阶段 C：组并行 ——
     {
-        let mut f = executor.frame.lock().unwrap();
+        let mut f = executor.frame.lock().unwrap_or_else(|e| e.into_inner());
         f.phase = Phase::C;
     }
     for tx in &executor.senders {
@@ -293,6 +298,12 @@ pub fn run_d1_pipeline(
     for ev in region_events.iter_mut() {
         ev.merge_into(sim);
     }
+}
+
+/// 销毁 D1 执行器（回收常驻线程）——模式切换离开 D1 时由 scheduler 调用。
+pub fn shutdown_executor() {
+    let mut guard = G_D1_EXECUTOR.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
 }
 
 #[cfg(test)]
