@@ -190,8 +190,15 @@ impl<T: Default + Copy> MsvcVector<T> {
             self.end = unsafe { self.begin.add(new_len) };
             return;
         }
-        // 增长：分配精确 new_len，拷贝旧元素（保留值）+ 填新段。
-        let new_byte_len = new_len.checked_mul(elem_size).expect("overflow");
+        // 增长：MSVC 2x 策略 max(old_cap*2, new_len)（★2，对齐原版 vector::resize
+        // 容量语义）。此前分配精确 new_len → capacity==len，与 push 的 2x 增长
+        // 布局不一致；clear()/析构按 capacity 释放已配套（resize(0) 修复）。
+        let new_cap = if cur_cap == 0 {
+            new_len
+        } else {
+            new_len.max(cur_cap * 2)
+        };
+        let new_byte_len = new_cap.checked_mul(elem_size).expect("overflow");
         let layout = Layout::from_size_align(new_byte_len, elem_align).unwrap();
         let new_buf = unsafe { alloc(layout) as *mut T };
         if new_buf.is_null() {
@@ -210,7 +217,7 @@ impl<T: Default + Copy> MsvcVector<T> {
         }
         self.begin = new_buf;
         self.end = unsafe { new_buf.add(new_len) };
-        self.capacity_end = self.end;
+        self.capacity_end = unsafe { new_buf.add(new_cap) };
     }
 
     /// 清空 vector（释放内存，重置为空）。
