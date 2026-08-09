@@ -177,15 +177,57 @@ pub fn update_data(sim_data: &mut SimData) {
     let region_count = bounds_list.len();
     // d3 并行分支（feature "d3-rayon" 门控）：多区域 → 三段式并行；否则串行。
     #[cfg(feature = "d3-rayon")]
-    if crate::d3_rayon::should_parallelize(region_count) {
-        crate::d3_rayon::pipeline::run_parallel_pipeline(
-            sim_data,
-            bounds_list,
-            pp_list,
-            cosmic_list,
-        );
-    } else {
-        run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
+    {
+        use crate::d3_rayon::scheduler::SchedulerMode;
+        match crate::d3_rayon::scheduler::current_mode() {
+            SchedulerMode::D2 => {
+                crate::d3_rayon::pipeline::run_parallel_pipeline(
+                    sim_data,
+                    bounds_list,
+                    pp_list,
+                    cosmic_list,
+                );
+            }
+            SchedulerMode::D1 => {
+                if region_count <= 1 {
+                    // 单区域/单星永远走串行（与原版一致）。
+                    run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
+                } else {
+                    let topo = crate::d3_rayon::affinity::CpuTopology::cached();
+                    if let Some(groups) =
+                        crate::d3_rayon::d1_pipeline::build_d1_groups(&bounds_list, topo)
+                    {
+                        crate::d3_rayon::d1_pipeline::run_d1_pipeline(
+                            sim_data,
+                            &bounds_list,
+                            &pp_list,
+                            &cosmic_list,
+                            &groups,
+                        );
+                    } else {
+                        // 分组失败（无 HT/拓扑异常）→ 回退 D2。
+                        crate::d3_rayon::pipeline::run_parallel_pipeline(
+                            sim_data,
+                            bounds_list,
+                            pp_list,
+                            cosmic_list,
+                        );
+                    }
+                }
+            }
+            SchedulerMode::Auto => {
+                if crate::d3_rayon::should_parallelize(region_count) {
+                    crate::d3_rayon::pipeline::run_parallel_pipeline(
+                        sim_data,
+                        bounds_list,
+                        pp_list,
+                        cosmic_list,
+                    );
+                } else {
+                    run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
+                }
+            }
+        }
     }
     #[cfg(not(feature = "d3-rayon"))]
     {

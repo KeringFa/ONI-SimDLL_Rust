@@ -5,12 +5,23 @@
 //! Remix 后世界 tiles 降序：前（物理核−1）大世界独占物理核，其余最小世界
 //! 两两合并 + 太空员舱集群走超线程逻辑核。
 
+use std::sync::OnceLock;
+
 /// CPU 拓扑（GetLogicalProcessorInformation，RelationProcessorCore）。
 pub struct CpuTopology {
     pub physical_cores: usize,
     pub logical_cores: usize,
     /// 每个物理核的逻辑处理器数（≥1；>1 表示启用超线程）。
     pub logical_per_core: Vec<usize>,
+}
+
+/// 拓扑缓存（进程内只查询一次；失败回退已由 query 内部处理）。
+static G_TOPOLOGY: OnceLock<CpuTopology> = OnceLock::new();
+
+impl CpuTopology {
+    pub fn cached() -> &'static CpuTopology {
+        G_TOPOLOGY.get_or_init(CpuTopology::query)
+    }
 }
 
 /// 一个调度组：region 索引 + 亲和掩码。
