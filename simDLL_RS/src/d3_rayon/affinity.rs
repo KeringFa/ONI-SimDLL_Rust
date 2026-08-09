@@ -25,6 +25,7 @@ impl CpuTopology {
 }
 
 /// 一个调度组：region 索引 + 亲和掩码。
+#[derive(Clone, PartialEq, Eq)]
 pub struct AffinityGroup {
     pub region_indices: Vec<usize>,
     /// Windows 亲和掩码（位 = 逻辑处理器）。

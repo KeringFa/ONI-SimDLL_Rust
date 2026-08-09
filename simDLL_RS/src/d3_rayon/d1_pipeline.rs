@@ -12,6 +12,8 @@ use crate::c2_physics::region_rng::{with_region_rng, RegionRng};
 use crate::d1_activity::RegionBounds;
 use crate::d3_rayon::affinity::{assign_groups, AffinityGroup, CpuTopology};
 use crate::globals::SendSyncPtr;
+use std::sync::{mpsc, Arc, Barrier, Mutex};
+use std::thread::JoinHandle;
 
 /// 太空员舱集群识别：HabitatModuleMedium/Small 世界 32×32 = 1024 tiles。
 /// region bounds 为区域矩形（compute_region_bounds 后与区域格子数一致）。
@@ -84,9 +86,131 @@ fn set_thread_affinity(mask: u64) {
     }
 }
 
+/// 每帧线程相位：A（网格物理）或 C（收尾）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    A,
+    C,
+}
+
+/// 每帧共享上下文（主线程写，worker 锁内读取后释放锁再执行物理）。
+struct FrameContext {
+    sim: SendSyncPtr<SimData>,
+    bounds: Vec<RegionBounds>,
+    pp: Vec<RegionBounds>,
+    cosmic: Vec<f32>,
+    rng_ptrs: Vec<SendSyncPtr<RegionRng>>,
+    events_ptrs: Vec<SendSyncPtr<RegionEvents>>,
+    phase: Phase,
+}
+
+/// 持久线程执行器：每组一个常驻线程 + mpsc 信号 + Barrier 帧同步。
+/// 线程只在分组变化时重建（避免每帧 spawn 开销——rayon 为持久池，D1 需同量级）。
+struct D1Executor {
+    groups: Vec<AffinityGroup>,
+    senders: Vec<mpsc::Sender<()>>,
+    handles: Vec<JoinHandle<()>>,
+    frame: Arc<Mutex<FrameContext>>,
+    barrier: Arc<Barrier>,
+}
+
+impl D1Executor {
+    fn new(
+        groups: Vec<AffinityGroup>,
+        frame: Arc<Mutex<FrameContext>>,
+        barrier: Arc<Barrier>,
+    ) -> Self {
+        let mut senders = Vec::with_capacity(groups.len());
+        let mut handles = Vec::with_capacity(groups.len());
+        for (gi, g) in groups.iter().enumerate() {
+            let (tx, rx) = mpsc::channel::<()>();
+            let frame = frame.clone();
+            let barrier = barrier.clone();
+            let g = g.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!("simdll-d1-{gi}"))
+                .spawn(move || worker_loop(rx, g, frame, barrier))
+                .expect("d1: spawn worker failed");
+            senders.push(tx);
+            handles.push(handle);
+        }
+        Self {
+            groups,
+            senders,
+            handles,
+            frame,
+            barrier,
+        }
+    }
+}
+
+impl Drop for D1Executor {
+    fn drop(&mut self) {
+        // 先 drop 所有 sender → worker recv 返回 Err → 退出；再 join。
+        self.senders.clear();
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// worker 主循环：等待 tick → 锁内取本组数据 → 释放锁 → 执行物理 → Barrier。
+/// panic 用 catch_unwind 包裹并照常 Barrier，避免主线程卡死。
+fn worker_loop(
+    rx: mpsc::Receiver<()>,
+    group: AffinityGroup,
+    frame: Arc<Mutex<FrameContext>>,
+    barrier: Arc<Barrier>,
+) {
+    while let Ok(()) = rx.recv() {
+        let (sim, phase, jobs) = {
+            let f = frame.lock().unwrap();
+            let sim = f.sim;
+            let phase = f.phase;
+            let jobs: Vec<_> = group
+                .region_indices
+                .iter()
+                .map(|&i| {
+                    let bounds = f.bounds[i];
+                    let cosmic = f.cosmic[i];
+                    let pp = f.pp[i];
+                    let rng = f.rng_ptrs[i].get();
+                    let events = f.events_ptrs[i].get();
+                    (bounds, cosmic, pp, rng, events)
+                })
+                .collect();
+            (sim, phase, jobs)
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (bounds, cosmic, pp, rng, events) in jobs {
+                with_region_rng(rng, || {
+                    with_region_sink(events, || unsafe {
+                        match phase {
+                            Phase::A => crate::c2_physics::run_region_physics_a(
+                                &mut *sim.get(),
+                                bounds,
+                                cosmic,
+                                true,
+                            ),
+                            Phase::C => crate::c2_physics::run_region_physics_c(
+                                &mut *sim.get(),
+                                bounds,
+                                pp,
+                            ),
+                        }
+                    });
+                });
+            }
+        }));
+        barrier.wait();
+    }
+}
+
+static G_D1_EXECUTOR: Mutex<Option<D1Executor>> = Mutex::new(None);
+
 /// D1 管线：阶段 A（组并行）→ 合并 A 事件 → 阶段 B（组件串行）→
 /// 阶段 C（组并行）→ 合并 C 事件。与 D2 `run_parallel_pipeline` 语义一致，
-/// 仅线程组织不同（每组一个 std::thread + 亲和性）。
+/// 线程组织为持久线程 + 亲和性（分组变化时重建执行器）。
 pub fn run_d1_pipeline(
     sim: &mut SimData,
     region_bounds: &[RegionBounds],
@@ -110,33 +234,44 @@ pub fn run_d1_pipeline(
         .collect();
     let sim_ptr = SendSyncPtr(sim as *mut SimData);
 
-    // —— 阶段 A：组并行（scoped 线程：可借用局部 region 数据，语义等价）——
-    std::thread::scope(|s| {
-        for (gi, g) in groups.iter().enumerate() {
-            let sim_ptr = sim_ptr.clone();
-            let rng_ptrs = rng_ptrs.clone();
-            let events_ptrs = events_ptrs.clone();
-            let g = g;
-            s.spawn(move || {
-                set_thread_affinity(g.affinity_mask);
-                let sim_raw = sim_ptr.get();
-                for &i in &g.region_indices {
-                    let rng_raw = rng_ptrs[i].get();
-                    let events_raw = events_ptrs[i].get();
-                    with_region_rng(rng_raw, move || {
-                        with_region_sink(events_raw, move || unsafe {
-                            crate::c2_physics::run_region_physics_a(
-                                &mut *sim_raw,
-                                region_bounds[i],
-                                region_cosmic[i],
-                                true,
-                            );
-                        });
-                    });
-                }
-            });
-        }
-    });
+    let mut executor_guard = G_D1_EXECUTOR.lock().unwrap();
+    // 分组变化（世界增删/尺寸变化）→ 重建执行器（线程重新创建并绑定亲和性）。
+    let needs_rebuild = match &*executor_guard {
+        Some(ex) => ex.groups != groups,
+        None => true,
+    };
+    if needs_rebuild {
+        let frame = Arc::new(Mutex::new(FrameContext {
+            sim: sim_ptr,
+            bounds: Vec::new(),
+            pp: Vec::new(),
+            cosmic: Vec::new(),
+            rng_ptrs: Vec::new(),
+            events_ptrs: Vec::new(),
+            phase: Phase::A,
+        }));
+        let barrier = Arc::new(Barrier::new(groups.len() + 1));
+        *executor_guard = Some(D1Executor::new(groups.to_vec(), frame, barrier));
+    }
+    let executor = executor_guard.as_mut().unwrap();
+
+    // 更新每帧上下文（主线程独占写入；worker 锁内读取）。
+    {
+        let mut f = executor.frame.lock().unwrap();
+        f.sim = sim_ptr;
+        f.bounds = region_bounds.to_vec();
+        f.pp = region_pp_bounds.to_vec();
+        f.cosmic = region_cosmic.to_vec();
+        f.rng_ptrs = rng_ptrs;
+        f.events_ptrs = events_ptrs;
+        f.phase = Phase::A;
+    }
+
+    // —— 阶段 A：组并行 ——
+    for tx in &executor.senders {
+        let _ = tx.send(());
+    }
+    executor.barrier.wait();
     for ev in region_events.iter_mut() {
         ev.merge_into(sim);
     }
@@ -147,30 +282,14 @@ pub fn run_d1_pipeline(
     }
 
     // —— 阶段 C：组并行 ——
-    std::thread::scope(|s| {
-        for g in groups.iter() {
-            let sim_ptr = sim_ptr.clone();
-            let rng_ptrs = rng_ptrs.clone();
-            let events_ptrs = events_ptrs.clone();
-            s.spawn(move || {
-                set_thread_affinity(g.affinity_mask);
-                let sim_raw = sim_ptr.get();
-                for &i in &g.region_indices {
-                    let rng_raw = rng_ptrs[i].get();
-                    let events_raw = events_ptrs[i].get();
-                    with_region_rng(rng_raw, move || {
-                        with_region_sink(events_raw, move || unsafe {
-                            crate::c2_physics::run_region_physics_c(
-                                &mut *sim_raw,
-                                region_bounds[i],
-                                region_pp_bounds[i],
-                            );
-                        });
-                    });
-                }
-            });
-        }
-    });
+    {
+        let mut f = executor.frame.lock().unwrap();
+        f.phase = Phase::C;
+    }
+    for tx in &executor.senders {
+        let _ = tx.send(());
+    }
+    executor.barrier.wait();
     for ev in region_events.iter_mut() {
         ev.merge_into(sim);
     }
