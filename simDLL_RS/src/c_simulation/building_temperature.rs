@@ -403,7 +403,10 @@ pub fn clear_building_temperature() {
 /// ×7.68935e-08×dt×buildingTemperatureScale；能量守恒交叉钳制；建筑终温 = Σk/(cellCount×perCellHC)
 /// + bldgT，钳制 [min_seen,max_seen] 后 + dt×operatingKW/(cellCount×perCellHC)；
 /// 推 buildingOverheatInfo / buildingNoLongerOverheatedInfo / buildingMeltedInfo。
-pub fn update_building_heat_exchange(sim_data: &mut SimData) {
+pub fn update_building_heat_exchange(
+    sim_data: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     if sim_data.updated_cells.ptr.is_null() || sim_data.sim_events.ptr.is_null() {
         return;
     }
@@ -419,6 +422,16 @@ pub fn update_building_heat_exchange(sim_data: &mut SimData) {
         }
         let handle = ((mgr.versions[index] as i32) << 24) | (index as i32 & 0xffffff);
         let rec = mgr.records[record_index as usize];
+        // 原版 BuildingHeatExchange::Update L137416-137419：仅处理完全落在
+        // region 矩形内的建筑（region.min <= simMin 且 simMax <= region.max）。
+        // 旧实现无 bounds → 未发现世界/区域外建筑也被逐帧换热（★4）。
+        if rec.sim_min_x < bounds.min_x as i32
+            || rec.sim_min_y < bounds.min_y as i32
+            || rec.sim_max_x > bounds.max_x as i32
+            || rec.sim_max_y > bounds.max_y as i32
+        {
+            continue;
+        }
         if rec.per_cell_heat_capacity <= 0.0 || rec.temperature < 0.0 {
             continue;
         }
@@ -798,6 +811,59 @@ mod tests {
         sd
     }
 
+    /// ★4 回归：组件按区域分派——完全落在 region 内的建筑换热，区域外建筑跳过。
+    /// 原版 BuildingHeatExchange::Update L137416-137419（region.min <= simMin 且
+    /// simMax <= region.max）。
+    #[test]
+    fn building_exchange_only_processes_in_region() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_temp_table(); // elem5：SHC=2、TC=4、highTemp=5000
+        let mut sd = make_exchange_sim();
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            // 建筑 A（game (1,2)-(2,3)）→ sim (2,3)-(3,4)：cell 20/21/26/27
+            // 建筑 B（game (3,2)-(4,3)）→ sim (4,3)-(5,4)：cell 22/23/28/29
+            for c in [20usize, 21, 26, 27, 22, 23, 28, 29] {
+                u.element_idx.set(c, 5);
+                u.mass.set(c, 100.0);
+                u.temperature.set(c, 300.0);
+                u.insulation.set(c, 1);
+            }
+        }
+        let ha = add_building(&add_msg(10, 2000.0)); // (1,2)-(2,3)
+        let mut msg_b = add_msg(11, 2000.0);
+        msg_b.min_x = 3;
+        msg_b.max_x = 4;
+        let hb = add_building(&msg_b); // (3,2)-(4,3)
+        // region（sim 坐标）：min(2,3)-max(4,6)（排他）→ 建筑 A（simMaxX=3）完全在内，
+        // 建筑 B（simMinX=4）在右边界外
+        let bounds = crate::d1_activity::RegionBounds {
+            min_x: 2,
+            min_y: 3,
+            max_x: 4,
+            max_y: 6,
+        };
+        update_building_heat_exchange(&mut sd, bounds);
+        let ta = BUILDING_TEMPERATURE_MANAGER.lock().record(ha).unwrap().temperature;
+        let tb = BUILDING_TEMPERATURE_MANAGER.lock().record(hb).unwrap().temperature;
+        assert!(ta < 2000.0, "区域内建筑 A 应换热降温，got {ta}");
+        assert!(
+            (tb - 2000.0).abs() < 1e-3,
+            "区域外建筑 B 不应被处理，got {tb}"
+        );
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert!(u.temperature.get(20) > 300.0, "A 覆盖格应升温");
+            assert!(
+                (u.temperature.get(22) - 300.0).abs() < 1e-3,
+                "B 覆盖格不应换热，got {}",
+                u.temperature.get(22)
+            );
+        }
+        remove_building(ha);
+        remove_building(hb);
+    }
+
     #[test]
     fn building_exchange_skips_vacuum_and_exchanges_with_matter_cell() {
         let _lock = LIB_TESTS_LOCK.lock().unwrap();
@@ -821,7 +887,8 @@ mod tests {
         msg.max_x = 2;
         msg.max_y = 4; // 面积 1×2 → perCellHC = 200/2 = 100
         let h = add_building(&msg);
-        update_building_heat_exchange(&mut sd);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_building_heat_exchange(&mut sd, b);
         let u = unsafe { &*sd.updated_cells.ptr };
         // 真空格不换热
         assert_eq!(u.temperature.get(26), 0.0);
@@ -849,7 +916,8 @@ mod tests {
         let mut msg = add_msg(10, 2000.0); // overheat=2000，温度=2000
         msg.operating_kilowatts = 2000.0;
         let h = add_building(&msg);
-        update_building_heat_exchange(&mut sd);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_building_heat_exchange(&mut sd, b);
         let events = unsafe { &*sd.sim_events.ptr };
         assert_eq!(events.building_overheat_info.len(), 1, "自热使建筑温度超过 overheat");
         assert_eq!(
@@ -877,7 +945,8 @@ mod tests {
             u.insulation.set(20, 1);
         }
         let h = add_building(&add_msg(10, 2000.0)); // overheat=2000，建筑 2000℃，周围 100℃
-        update_building_heat_exchange(&mut sd);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_building_heat_exchange(&mut sd, b);
         let events = unsafe { &*sd.sim_events.ptr };
         assert_eq!(events.building_no_longer_overheated_info.len(), 1);
         assert!(BUILDING_TEMPERATURE_MANAGER.lock().record(h).unwrap().temperature < 2000.0);

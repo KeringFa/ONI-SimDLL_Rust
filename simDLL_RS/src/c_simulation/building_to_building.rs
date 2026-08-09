@@ -212,6 +212,7 @@ pub(crate) fn update_building_to_building_inner(
     mgr: &mut BuildingToBuildingManager,
     sim: &mut SimData,
     dt: f32,
+    bounds: crate::d1_activity::RegionBounds,
 ) {
     if sim.sim_events.ptr.is_null() {
         return;
@@ -228,6 +229,15 @@ pub(crate) fn update_building_to_building_inner(
         else {
             continue;
         };
+        // 原版 BuildingToBuildingHeatExchange::Update L138440-138443：仅处理
+        // 完全落在 region 矩形内的建筑（★4）。
+        if bldg.sim_min_x < bounds.min_x as i32
+            || bldg.sim_min_y < bounds.min_y as i32
+            || bldg.sim_max_x > bounds.max_x as i32
+            || bldg.sim_max_y > bounds.max_y as i32
+        {
+            continue;
+        }
         // min/max_seen 遍历接触（含自身）
         let mut min_seen = bldg.temperature;
         let mut max_seen = bldg.temperature;
@@ -306,9 +316,13 @@ pub(crate) fn update_building_to_building_inner(
 }
 
 /// 顶层：update_data 组件阶段调用。
-pub fn update_building_to_building(sim: &mut SimData, dt: f32) {
+pub fn update_building_to_building(
+    sim: &mut SimData,
+    dt: f32,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     let mut mgr = B2B_MANAGER.lock();
-    update_building_to_building_inner(&mut mgr, sim, dt);
+    update_building_to_building_inner(&mut mgr, sim, dt, bounds);
 }
 
 #[cfg(test)]
@@ -409,7 +423,8 @@ mod tests {
         let h = mgr.register(-1, a);
         mgr.add_contact(h, b, 1);
         let mut sd = make_sim();
-        update_building_to_building_inner(&mut mgr, &mut sd, 0.2);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_building_to_building_inner(&mut mgr, &mut sd, 0.2, bounds);
         // 建筑 A 升温、B 降温，能量守恒
         assert!(record(a).unwrap().temperature > 300.0);
         assert!(record(b).unwrap().temperature < 400.0);
@@ -431,7 +446,8 @@ mod tests {
         let h = mgr.register(-1, a);
         mgr.add_contact(h, b, 1);
         let mut sd = make_sim();
-        update_building_to_building_inner(&mut mgr, &mut sd, 0.2);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_building_to_building_inner(&mut mgr, &mut sd, 0.2, bounds);
         let events = unsafe { &*sd.sim_events.ptr };
         assert_eq!(events.building_overheat_info.len(), 1, "接触方 B 过热");
         assert_eq!(events.building_overheat_info.get(0).handle.value, b);
@@ -449,7 +465,8 @@ mod tests {
         let h = mgr.register(-1, a);
         mgr.add_contact(h, b, 1);
         let mut sd = make_sim();
-        update_building_to_building_inner(&mut mgr, &mut sd, 0.2);
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        update_building_to_building_inner(&mut mgr, &mut sd, 0.2, bounds);
         let events = unsafe { &*sd.sim_events.ptr };
         assert_eq!(events.building_no_longer_overheated_info.len(), 1);
         assert_eq!(events.building_no_longer_overheated_info.get(0).handle.value, b);

@@ -134,14 +134,33 @@ pub fn update_data(sim_data: &mut SimData) {
         // 辐射模拟（原版 L42594-42914：UpdateComponents 前；radiationEnabled 门控，
         // 单星零执行；cosmic_intensity = 当前区域 currentCosmicRadiationIntensity）
         crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
-        // RadiationEmitter 组件（阶段 B：建筑/生物辐射；radiationEnabled 门控，单星零执行）
+        // 原版 L145434 SimData::UpdateComponents(sim, 0.2, region)：所有 SimComponent
+        // 在区域内按 region 裁剪分派（辐射后、太空真空前）。★4：此前 5 个组件在区域
+        // 循环外全局遍历、无 bounds → 未发现世界/区域外对象也被模拟，且组件时序
+        // 落到 PostProcess 之后（发射物 1 帧延迟）。调用顺序按原版 SimData 构造的
+        // 注册顺序（SimDLL_Source.c L121784-121875）：ElementConsumer → ElementEmitter
+        // → RadiationEmitter → ElementChunk → BuildingHeatExchange → BuildingToBuilding
+        // → DiseaseEmitter（原版第 8 的 DiseaseConsumer 无 C# 发送方，Rust 未实现）。
+        crate::c_simulation::frame_processor::process_element_consumers(sim_data, bounds);
+        crate::c_simulation::element_emitter::update_element_emitters(
+            sim_data,
+            0.2,
+            sim_data.width,
+            bounds,
+        );
         crate::c_simulation::radiation_emitter::update_radiation_emitters_global(
             sim_data,
             0.2,
             bounds,
         );
-        // 病菌阶段 3（2026-08-05）：DiseaseEmitter 组件 Update（原版 L145434
-        // UpdateComponents 位置：辐射任务后、太空真空前）。
+        crate::c_simulation::element_chunk::update_element_chunks(
+            sim_data,
+            0.2,
+            sim_data.width,
+            bounds,
+        );
+        crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data, bounds);
+        crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2, bounds);
         crate::c_simulation::disease_component::update_disease_emitters(sim_data, 0.2, bounds);
         // 太空真空特判（原版 L145466-145520）：worldZones==-1 且背墙真空 → 液体/气体
         // 持续删除至空 + flow 重置。原版顺序在 UpdateComponents 之后、PostProcessCell
@@ -153,17 +172,6 @@ pub fn update_data(sim_data: &mut SimData) {
         // 置于 PostProcessCell 之后：温度因子 + 种群因子 + 辐射杀伤 + tick 递增）。
         crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);
     }
-    // ElementConsumer 逐帧消费（2026-08-02：水泵/涡轮取水；原版 UpdateData 调组件 Update）
-    crate::c_simulation::frame_processor::process_element_consumers(sim_data);
-
-    // BuildingHeatExchange::Update（原版 L145434 组件阶段：建筑↔格子换热，dt=0.2）
-    crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data);
-    // ElementChunk::Update（原版 L145434 同一组件阶段：物质碎片换热）
-    crate::c_simulation::element_chunk::update_element_chunks(sim_data, 0.2, sim_data.width);
-    // ElementEmitter::Update（原版 L145434 同一组件阶段：发射器逐帧发射）
-    crate::c_simulation::element_emitter::update_element_emitters(sim_data, 0.2, sim_data.width);
-    // BuildingToBuildingHeatExchange::Update（原版 L145434 同一组件阶段：导热板建筑↔建筑换热）
-    crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2);
 }
 
 /// SimData::UpdateComponentsDataListOnly 的桩实现。

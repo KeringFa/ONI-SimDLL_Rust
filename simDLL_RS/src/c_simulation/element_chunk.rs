@@ -291,9 +291,14 @@ pub fn remove_element_chunk(handle: i32) -> bool {
 }
 
 /// 顶层 Update（update_data 组件阶段调用）。
-pub fn update_element_chunks(sim: &mut SimData, dt: f32, width: i32) {
+pub fn update_element_chunks(
+    sim: &mut SimData,
+    dt: f32,
+    width: i32,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     let mut mgr = ELEMENT_CHUNK_MANAGER.lock();
-    update_element_chunks_inner(&mut mgr, sim, dt, width);
+    update_element_chunks_inner(&mut mgr, sim, dt, width, bounds);
 }
 
 /// UpdateComponentsDataListOnly 路径：无时间流逝帧刷新输出（保证 GDU elementChunkInfos 非空）。
@@ -408,6 +413,7 @@ pub(crate) fn update_element_chunks_inner(
     sim: &mut SimData,
     dt: f32,
     width: i32,
+    bounds: crate::d1_activity::RegionBounds,
 ) {
     // 输出按 handle index 索引（原版 Update 首行 _Resize 到 items 数，写 output[handleIndex]）。
     // 2026-08-07 修正：resize 保留旧值（新槽位默认 0），不再全槽清零——
@@ -426,6 +432,18 @@ pub(crate) fn update_element_chunks_inner(
         let handle = ((mgr.versions[index] as i32) << 24) | handle_index;
         let chunk = &mut mgr.records[ri as usize];
         let mut delta = 0.0f32;
+        // 原版 ElementChunk::Update L140137-140139：仅处理落在 region 矩形内的碎片
+        // （cell/width → row/col 检查；★4）。max 为**包含**（`<= region.max`，
+        // 原版组件与温度任务的排他边界不同——严格复刻组件字面语义）。
+        let row = chunk.cell / width;
+        let col = chunk.cell % width;
+        if col < bounds.min_x as i32
+            || row < bounds.min_y as i32
+            || col > bounds.max_x as i32
+            || row > bounds.max_y as i32
+        {
+            continue;
+        }
         if chunk.heat_capacity > 0.0 {
             if chunk.adjuster.heat_capacity > 0.0 {
                 // adjuster 分支（原版 L140114-140120）：rate 1.0，不写格子；
@@ -779,7 +797,8 @@ mod tests {
         let h = mgr.add(6, &add_msg(4, 300.0)); // game 4 → sim 13
         mgr.modify_adjuster(h, 500.0, 100.0, 2.0);
         // adjuster 分支不依赖格子质量
-        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, b);
         let d = mgr.record(h).unwrap();
         assert!(
             d.temperature > 300.0,
@@ -804,7 +823,8 @@ mod tests {
             u.temperature.set(14, 300.0);
             u.insulation.set(14, 255);
         }
-        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, b);
         let d = mgr.record(h).unwrap();
         assert!(
             d.temperature < 5000.0,
@@ -823,7 +843,8 @@ mod tests {
         let mut sd = make_sim();
         let mut mgr = ElementChunkManager::new();
         let h = mgr.add(6, &add_msg(4, 6000.0)); // game 4 → sim 13（无质量格 → 世界分支不换热）
-        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, b);
         let events = unsafe { &*sd.sim_events.ptr };
         assert_eq!(events.element_chunk_melted_info.len(), 1);
         assert_eq!(events.element_chunk_melted_info.get(0).handle.value, h);
@@ -842,7 +863,8 @@ mod tests {
         let h = mgr.add(6, &add_msg(5, 300.0)); // index 0，初始 HC=200
         // 模拟泵存储水被抽空：HC→0（mass=0），温度保持 300K
         assert!(mgr.modify(h, 300.0, 0.0));
-        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, b);
         let out = mgr.output_snapshot();
         let idx = (h & 0xffffff) as usize;
         assert!(
@@ -865,12 +887,14 @@ mod tests {
         let mut sd = make_sim();
         let mut mgr = ElementChunkManager::new();
         let h = mgr.add(6, &add_msg(5, 300.0)); // index 0
-        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, b);
         let idx = (h & 0xffffff) as usize;
         assert!((mgr.output_snapshot()[idx].temperature - 300.0).abs() < 1e-3);
         // 移除后：槽位应保留温度，而非清零为 0
         assert!(mgr.remove(h));
-        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, b);
         let out = mgr.output_snapshot();
         assert!(
             (out[idx].temperature - 300.0).abs() < 1e-3,

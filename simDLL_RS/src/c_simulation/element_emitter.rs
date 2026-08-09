@@ -361,7 +361,13 @@ fn emit_into_cell(
 
 impl ElementEmitterManager {
     /// Update（原版 L1966-2104）。
-    pub fn update(&mut self, sim: &mut SimData, dt: f32, width: i32) {
+    pub fn update(
+        &mut self,
+        sim: &mut SimData,
+        dt: f32,
+        width: i32,
+        bounds: crate::d1_activity::RegionBounds,
+    ) {
         if sim.updated_cells.ptr.is_null() || sim.sim_events.ptr.is_null() {
             return;
         }
@@ -391,6 +397,16 @@ impl ElementEmitterManager {
                 continue;
             }
             let rec = &mut self.records[ri as usize];
+            // 原版 ElementEmitter::Update L141535-141537：仅处理落在 region 矩形内的
+            // 发射器（cell = [row, col]；★4）。max 为**包含**（`<= region.max`，
+            // 且原版 elapsedTime 累加在 region 检查通过后——此处过滤先于累加，一致）。
+            if rec.cell[1] < bounds.min_x as u16
+                || rec.cell[0] < bounds.min_y as u16
+                || rec.cell[1] > bounds.max_x as u16
+                || rec.cell[0] > bounds.max_y as u16
+            {
+                continue;
+            }
             rec.elapsed_time += dt;
             if rec.elapsed_time < rec.emit_interval {
                 continue;
@@ -588,8 +604,13 @@ fn try_emit(
 }
 
 /// 顶层 Update（update_data 组件阶段调用）。
-pub fn update_element_emitters(sim: &mut SimData, dt: f32, width: i32) {
-    ELEMENT_EMITTER_MANAGER.lock().update(sim, dt, width);
+pub fn update_element_emitters(
+    sim: &mut SimData,
+    dt: f32,
+    width: i32,
+    bounds: crate::d1_activity::RegionBounds,
+) {
+    ELEMENT_EMITTER_MANAGER.lock().update(sim, dt, width, bounds);
 }
 
 #[cfg(test)]
@@ -821,7 +842,8 @@ mod tests {
             disease_idx: 0xFF,
         };
         assert!(modify_element_emitter(&sim, &m));
-        update_element_emitters(&mut sim, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sim);
+        update_element_emitters(&mut sim, 0.2, 6, b);
         let out = &sim.element_emitter.emitted_mass_info;
         assert!(out.get(0).mass > 0.0, "应累积发射量，got {}", out.get(0).mass);
         assert_eq!(out.get(0).elem_idx, 3);
@@ -864,7 +886,8 @@ mod tests {
             disease_idx: 0xFF,
         };
         assert!(modify_element_emitter(&sim, &m));
-        update_element_emitters(&mut sim, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sim);
+        update_element_emitters(&mut sim, 0.2, 6, b);
         let events = unsafe { &*sim.sim_events.ptr };
         let cb = events
             .callback_info
@@ -907,7 +930,8 @@ mod tests {
             let rec = mgr.record(h).unwrap();
             assert_eq!(rec.cell, [2, 4], "modify 应存 [row,col]");
         }
-        update_element_emitters(&mut sim, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sim);
+        update_element_emitters(&mut sim, 0.2, 6, b);
         let u = unsafe { &*sim.updated_cells.ptr };
         assert_eq!(u.element_idx.get(16), 3, "sim 16（row2,col4）应变成气体");
         assert_ne!(
@@ -944,7 +968,8 @@ mod tests {
             disease_idx: 0xFF,
         };
         assert!(modify_element_emitter(&sim, &m));
-        update_element_emitters(&mut sim, 0.2, 6); // try_emit 使 offset_idx 0→1
+        let b = crate::d1_activity::full_grid_bounds(&sim);
+        update_element_emitters(&mut sim, 0.2, 6, b); // try_emit 使 offset_idx 0→1
         {
             let mgr = ELEMENT_EMITTER_MANAGER.lock();
             assert_eq!(mgr.record(h).unwrap().offset_idx, 1, "发射后轮转起点应前进");
@@ -987,7 +1012,8 @@ mod tests {
             disease_idx: 0xFF,
         };
         assert!(modify_element_emitter(&sim, &m));
-        update_element_emitters(&mut sim, 0.2, 6);
+        let b = crate::d1_activity::full_grid_bounds(&sim);
+        update_element_emitters(&mut sim, 0.2, 6, b);
         let u = unsafe { &*sim.updated_cells.ptr };
         assert_eq!(u.element_idx.get(7), 3);
         assert!(

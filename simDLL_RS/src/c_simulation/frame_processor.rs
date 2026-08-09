@@ -1660,7 +1660,10 @@ fn process_element_emitter_messages(frame: &mut SimFrameInfo, sim_data: &mut Sim
 
 /// ElementConsumer::Update（原版 L140776）：逐帧对每个注册消费者 BFS 消费，
 /// 结果填入 elementConsumer.consumedMassInfo（供 C# 泵/涡轮取用）。
-pub(crate) fn process_element_consumers(sim: &mut SimData) {
+pub(crate) fn process_element_consumers(
+    sim: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
     if sim.updated_cells.ptr.is_null() {
         return;
     }
@@ -1677,6 +1680,15 @@ pub(crate) fn process_element_consumers(sim: &mut SimData) {
         }
         let x = e.cell_x as usize;
         let y = e.cell_y as usize;
+        // 原版 ElementConsumer::Update L140806-140808：仅处理落在 region 矩形内的
+        // 消费者（★4）。max 为**包含**（`<= region.max`，严格复刻组件字面语义）。
+        if e.cell_x < bounds.min_x as u16
+            || e.cell_y < bounds.min_y as u16
+            || e.cell_x > bounds.max_x as u16
+            || e.cell_y > bounds.max_y as u16
+        {
+            continue;
+        }
         let radius = e.max_depth as usize;
         let elem = match e.configuration {
             0 => Some(e.element_idx),
@@ -2714,7 +2726,8 @@ mod tests {
         }
         process_element_consumer_messages(&mut frame, &mut sd);
         // 逐帧消费：10 × 0.2s = 2kg
-        process_element_consumers(&mut sd);
+        let b = crate::d1_activity::full_grid_bounds(&sd);
+        process_element_consumers(&mut sd, b);
         unsafe {
             let updated = &*sd.updated_cells.ptr;
             assert!(
