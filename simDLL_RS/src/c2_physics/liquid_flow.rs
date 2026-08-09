@@ -1300,8 +1300,15 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
 /// 原版 LCG 伪随机数（L1786/L2474/L2746）：`seed = seed * 0x343fd + 0x269ec3`，
 /// 返回 `((seed >> 16) & 0x7fff) * 3.051851e-05`，∈ [0, 1)。
 fn next_random(sim: &mut SimData) -> f32 {
-    sim.random_seed = sim.random_seed.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
-    ((sim.random_seed >> 16) & 0x7fff) as f32 * 3.051851e-05
+    // T4 路由：区域 RNG 存在（d3 并行）→ 用区域持久种子；无 → sim 全局（串行不变）。
+    if let Some(rng) = crate::c2_physics::region_rng::region_rng_ptr() {
+        let rng = unsafe { &mut *rng };
+        rng.random_seed = rng.random_seed.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+        ((rng.random_seed >> 16) & 0x7fff) as f32 * 3.051851e-05
+    } else {
+        sim.random_seed = sim.random_seed.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+        ((sim.random_seed >> 16) & 0x7fff) as f32 * 3.051851e-05
+    }
 }
 
 /// CellSOA::ClearCell（原版 11_msvcrt_ignored.c L23677-23723）。
@@ -3102,9 +3109,18 @@ pub fn post_process_cell(sim: &mut SimData, cell: usize) {
 
     // ===== 气体（原版 L2381-2531）=====
     if state3 == 1 {
-        // 原版 L2382-2384：displacementDirection 每格交替反转
-        let dir = sim.displacement_direction;
-        sim.displacement_direction = -dir;
+        // 原版 L2382-2384：displacementDirection 每格交替反转。
+        // T4 路由：区域 RNG 存在 → 用区域方向；无 → sim 全局（串行不变）。
+        let dir = if let Some(rng) = crate::c2_physics::region_rng::region_rng_ptr() {
+            let rng = unsafe { &mut *rng };
+            let d = rng.displacement_direction;
+            rng.displacement_direction = -d;
+            d
+        } else {
+            let d = sim.displacement_direction;
+            sim.displacement_direction = -d;
+            d
+        };
         let mass_cell = {
             let updated = unsafe { &*sim.updated_cells.ptr };
             updated.mass.get(cell)

@@ -14,6 +14,7 @@ pub mod gas_flow;
 pub mod radiation;
 pub mod disease;
 pub mod region_events;
+pub mod region_rng;
 
 /// SimBase::UpdateData 的桩实现。
 ///
