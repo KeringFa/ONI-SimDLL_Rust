@@ -1063,12 +1063,14 @@ pub(crate) fn push_substance_change(sim: &mut crate::a_framework::sim_data::SimD
     let internal = sim_cell as i32;
     let game_cell = (internal % width - 1) + (internal / width - 1) * game_w;
     if game_cell >= 0 && game_cell < sim.num_game_cells {
-        let events = unsafe { &mut *sim.sim_events.ptr };
-        events.substance_change_info.push(SubstanceChangeInfo {
-            cell_idx: game_cell,
-            old_element_idx: 0xFFFF,
-            new_element_idx: 0xFFFF,
-        });
+        crate::c2_physics::region_events::emit_substance_change(
+            sim,
+            SubstanceChangeInfo {
+                cell_idx: game_cell,
+                old_element_idx: 0xFFFF,
+                new_element_idx: 0xFFFF,
+            },
+        );
     }
     if !sim.timers.ptr.is_null() {
         unsafe {
@@ -1129,16 +1131,18 @@ pub(crate) fn spawn_falling_liquid(
     if sim.sim_events.ptr.is_null() {
         return false;
     }
-    let events = unsafe { &mut *sim.sim_events.ptr };
-    events.spawn_liquid_info.push(crate::a_framework::game_data::SpawnFallingLiquidInfo {
-        cell_idx: callback,
-        element_idx: elem_idx,
-        disease_idx,
-        pad: 0,
-        mass,
-        temperature,
-        disease_count,
-    });
+    crate::c2_physics::region_events::emit_spawn_liquid(
+        sim,
+        crate::a_framework::game_data::SpawnFallingLiquidInfo {
+            cell_idx: callback,
+            element_idx: elem_idx,
+            disease_idx,
+            pad: 0,
+            mass,
+            temperature,
+            disease_count,
+        },
+    );
     true
 }
 
@@ -1369,12 +1373,14 @@ pub(crate) fn push_spawn_fx(sim: &mut SimData, sim_cell: usize, fx_id: i32, rota
     let internal = sim_cell as i32;
     let game_cell = (internal % width - 1) + (internal / width - 1) * game_w;
     if game_cell >= 0 && game_cell < sim.num_game_cells {
-        let events = unsafe { &mut *sim.sim_events.ptr };
-        events.spawn_fx_info.push(SpawnFXInfo {
-            cell_idx: game_cell,
-            fx_id,
-            rotation,
-        });
+        crate::c2_physics::region_events::emit_spawn_fx(
+            sim,
+            SpawnFXInfo {
+                cell_idx: game_cell,
+                fx_id,
+                rotation,
+            },
+        );
     }
 }
 
@@ -1671,16 +1677,18 @@ fn push_unstable_cell_info(sim: &mut SimData, src_cell: usize, pos_cell: usize, 
     if src_cell >= updated.element_idx.len() || src_cell >= updated.mass.len() {
         return;
     }
-    let events = unsafe { &mut *sim.sim_events.ptr };
-    events.unstable_cell_info.push(UnstableCellInfo {
-        cell_idx: game_cell,
-        elem_idx: updated.element_idx.get(src_cell),
-        falling_info: 0,
-        disease_idx: updated.disease_idx.get(src_cell),
-        mass: updated.mass.get(src_cell) * weight,
-        temperature: updated.temperature.get(src_cell),
-        disease_count: (updated.disease_count.get(src_cell) as f32 * weight) as i32,
-    });
+    crate::c2_physics::region_events::emit_unstable_cell(
+        sim,
+        UnstableCellInfo {
+            cell_idx: game_cell,
+            elem_idx: updated.element_idx.get(src_cell),
+            falling_info: 0,
+            disease_idx: updated.disease_idx.get(src_cell),
+            mass: updated.mass.get(src_cell) * weight,
+            temperature: updated.temperature.get(src_cell),
+            disease_count: (updated.disease_count.get(src_cell) as f32 * weight) as i32,
+        },
+    );
 }
 
 /// DoUnstableCheckBasic（原版 05_liquid_flow.c L1841-1937）——不稳定方块塌方（基本变体）。
@@ -3025,11 +3033,13 @@ fn push_world_damage(sim: &mut SimData, cell: usize, offset: isize, solid_count:
         let p = pos as usize;
         let game_cell = ((p % width) as i32 - 1) + ((p / width) as i32 - 1) * game_w;
         if game_cell >= 0 && game_cell < sim.num_game_cells {
-            let events = unsafe { &mut *sim.sim_events.ptr };
-            events.world_damage_info.push(crate::a_framework::game_data::WorldDamageInfo {
-                cell_idx: game_cell,
-                damage_source_cell_idx: src_game,
-            });
+            crate::c2_physics::region_events::emit_world_damage(
+                sim,
+                crate::a_framework::game_data::WorldDamageInfo {
+                    cell_idx: game_cell,
+                    damage_source_cell_idx: src_game,
+                },
+            );
         }
     }
 }

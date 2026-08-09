@@ -45,16 +45,18 @@ pub(crate) fn spawn_ore(
             return false;
         }
     }
-    let events = unsafe { &mut *sim.sim_events.ptr };
-    events.spawn_ore_info.push(SpawnOreInfo {
-        cell_idx: game_cell,
-        elem_idx,
-        disease_idx,
-        pad: 0,
-        mass,
-        temperature,
-        disease_count,
-    });
+    crate::c2_physics::region_events::emit_spawn_ore(
+        sim,
+        SpawnOreInfo {
+            cell_idx: game_cell,
+            elem_idx,
+            disease_idx,
+            pad: 0,
+            mass,
+            temperature,
+            disease_count,
+        },
+    );
     true
 }
 
@@ -459,8 +461,10 @@ pub(crate) fn do_state_transition(
         if updated.properties.get(cell) & 0x40 != 0 {
             let gc = game_cell_of(cell);
             if gc >= 0 && gc < sim.num_game_cells {
-                let events = unsafe { &mut *sim.sim_events.ptr };
-                events.cell_melted_info.push(CellMeltedInfo { game_cell: gc as u32 });
+                crate::c2_physics::region_events::emit_cell_melted(
+                    sim,
+                    CellMeltedInfo { game_cell: gc as u32 },
+                );
                 if !sim.timers.ptr.is_null() {
                     unsafe {
                         (*sim.timers.ptr.offset(cell as isize)).stable_cell_ticks |= 0x1F;
@@ -539,16 +543,18 @@ pub(crate) fn do_state_transition(
                     // Rust 却保格换元素（质量不清、无液滴）。2026-08-07 CRITICAL-2 修复。
                     let new_t = updated.temperature.get(cell);
                     if elem.low_temp - 3.0 <= new_t && new_t <= elem.high_temp + 3.0 {
-                        let events = unsafe { &mut *sim.sim_events.ptr };
-                        events.spawn_liquid_info.push(SpawnFallingLiquidInfo {
-                            cell_idx: gc,
-                            element_idx: etd.low_temp_transition_idx,
-                            disease_idx: updated.disease_idx.get(cell),
-                            pad: 0,
-                            mass: updated.mass.get(cell),
-                            temperature: updated.temperature.get(cell),
-                            disease_count: updated.disease_count.get(cell),
-                        });
+                        crate::c2_physics::region_events::emit_spawn_liquid(
+                            sim,
+                            SpawnFallingLiquidInfo {
+                                cell_idx: gc,
+                                element_idx: etd.low_temp_transition_idx,
+                                disease_idx: updated.disease_idx.get(cell),
+                                pad: 0,
+                                mass: updated.mass.get(cell),
+                                temperature: updated.temperature.get(cell),
+                                disease_count: updated.disease_count.get(cell),
+                            },
+                        );
                         clear_cell(sim, updated, cell);
                         push_substance_change(sim, cell);
                         return true;
@@ -795,10 +801,12 @@ pub(crate) fn update_temperature_for_backwall(sim: &mut SimData, cell: usize) {
                 let game_cell =
                     ((cell / w) as i32 - 1) * (w as i32 - 2) + (cell % w) as i32 - 1;
                 if game_cell >= 0 && game_cell < sim.num_game_cells {
-                    let events = unsafe { &mut *sim.sim_events.ptr };
-                    events.backwall_should_transition_info.push(BackwallShouldTransitionInfo {
-                        game_cell: game_cell as u32,
-                    });
+                    crate::c2_physics::region_events::emit_backwall_should_transition(
+                        sim,
+                        BackwallShouldTransitionInfo {
+                            game_cell: game_cell as u32,
+                        },
+                    );
                 }
             }
         }
