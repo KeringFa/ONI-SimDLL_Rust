@@ -2281,13 +2281,14 @@ pub fn displace_liquid(sim: &mut SimData, cell: usize, elem: u16) -> bool {
 /// 异元素液体）内容移到目标格（dst_cell）：
 /// - dst 为气体 → DisplaceGas 挤走气体后 SwapCells(src, dst)（液体整体搬入）；
 /// - dst 为真空 → DisplaceGas 因质量 0 失败 → 返回 false（原版怪癖，真空 beyond 挤不动）；
-/// - dst 为液体 → 邻格内容合并进 dst（AddMassAndUpdateTemperature + ClearCell）；
+/// - dst 为液体 → **仅当 src 与 dst 同元素**才合并进 dst
+///   （原版 L146461-146464：`updated[src] != updated[dst] → false`；
+///   否则污染水小格会被挤进水格 → 质量变水消失）；
 /// - dst 为固体 → false。
 fn displace_liquid_directional(
     sim: &mut SimData,
     src_cell: usize,
     dst_cell: usize,
-    dst_elem: u16,
 ) -> bool {
     let updated = unsafe { &mut *sim.updated_cells.ptr };
     if src_cell >= updated.mass.len() || dst_cell >= updated.mass.len() {
@@ -2320,8 +2321,9 @@ fn displace_liquid_directional(
     if dst_state != 2 {
         return false; // dst 为固体
     }
-    // dst 为液体（异元素）：邻格内容合并进 dst（原版 L43306-43323）
-    if updated.element_idx.get(src_cell) != dst_elem {
+    // dst 为液体（异元素）：仅当邻格与 dst 同元素才合并（原版 L146461-146464）。
+    // 旧实现误用邻格自身快照元素 → 污染水被挤进水格后质量变水消失。
+    if updated.element_idx.get(src_cell) != updated.element_idx.get(dst_cell) {
         return false;
     }
     let (mass, temp, d_idx, d_count) = (
@@ -2332,7 +2334,8 @@ fn displace_liquid_directional(
     );
     add_mass_and_update_temperature(updated, dst_cell, mass, temp, d_idx, d_count);
     clear_cell(sim, updated, src_cell);
-    push_substance_change(sim, dst_cell);
+    // 原版 L146481：合并路径只对 src（被清空的邻格）发 ChangeSubstance。
+    push_substance_change(sim, src_cell);
     true
 }
 
@@ -2405,7 +2408,7 @@ pub(crate) fn do_liquid_pressure_displacement(
     if cells.mass.get(beyond_cell) + cells.mass.get(dst_cell) >= f15 {
         return 0.0;
     }
-    if !displace_liquid_directional(sim, dst_cell, beyond_cell, dst_elem_cells) {
+    if !displace_liquid_directional(sim, dst_cell, beyond_cell) {
         return 0.0;
     }
     f15 *= 0.125;
@@ -3926,6 +3929,201 @@ mod tests {
         let mut reader = BinaryBufferReader::new(&data);
         let result = CreateElementsTable(&mut reader);
         assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// 无 off-gas 的密度分层表：0=真空、1=重液(molar 200)、2=轻液(molar 18)、3=气体、4=固体。
+    /// sublimate_probability 默认 0 → 重液不会 off-gas，聚焦质量消失 bug。
+    fn create_clean_density_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(5);
+        let elems = [
+            Element::default(),
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.molar_mass = 200.0;
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 2;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.molar_mass = 18.0;
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 3;
+                e.state = 1;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 4;
+                e.state = 3;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+        ];
+        for elem in &elems {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..5 {
+            w.write_int(0); // 空名称
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    /// 回归：DisplaceLiquidDirectional 合并分支必须要求 src 与 dst（beyond）**同元素**
+    /// （原版 L146461-146464）。旧实现误用 src 自身快照元素 → 污染水小格被水挤压时
+    /// 并进水格（add_mass 不改元素）→ 污染水质量变水消失。
+    #[test]
+    fn displace_liquid_directional_merge_requires_same_element() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_clean_density_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                buf.element_idx.set(13, 1); // 被挤压格：重液（污染水）
+                buf.mass.set(13, 100.0);
+                buf.temperature.set(13, 300.0);
+                buf.element_idx.set(12, 2); // beyond：轻液（水）
+                buf.mass.set(12, 100.0);
+                buf.temperature.set(12, 300.0);
+            }
+        }
+        // 异元素 beyond → 不得合并（旧实现会合并 → 污染水变水）
+        let ok = displace_liquid_directional(&mut sd, 13, 12);
+        assert!(!ok, "beyond 为水时不得把污染水并入");
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.element_idx.get(13), 1, "污染水应留在原格");
+            assert!((u.mass.get(13) - 100.0).abs() < 1e-3);
+            assert_eq!(u.element_idx.get(12), 2, "水格元素不变");
+            assert!((u.mass.get(12) - 100.0).abs() < 1e-3);
+        }
+        // 同元素 beyond → 正常合并（污染水并入污染水）
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(12, 1);
+            u.mass.set(12, 50.0);
+        }
+        let ok2 = displace_liquid_directional(&mut sd, 13, 12);
+        assert!(ok2, "beyond 同为污染水时应合并");
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            assert_eq!(u.element_idx.get(12), 1);
+            assert!((u.mass.get(12) - 150.0).abs() < 1e-3, "100+50 合并进 beyond");
+            assert_eq!(u.element_idx.get(13), 0, "被挤压格清空为真空");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 回归：污染水（重液）从高空落入大水池，扩散出的薄格被水压力挤压时
+    /// 不再消失（旧 bug：被挤进水格 → 质量变水）。seed=17 曾丢失 950kg。
+    /// 400 tick 后污染水总质量必须守恒为 1000kg。
+    #[test]
+    fn polluted_sinking_conserves_mass() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        create_clean_density_table();
+        let mut sd = SimData::new_for_allocate(20, 14, 17, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let cells = &mut *sd.cells.ptr;
+            let updated = &mut *sd.updated_cells.ptr;
+            for buf in [&mut *cells, &mut *updated] {
+                for i in 0..280usize {
+                    buf.element_idx.set(i, 0);
+                    buf.mass.set(i, 0.0);
+                    buf.temperature.set(i, 300.0);
+                }
+                // 固体底 row1 cols 3..16
+                for c in 3..17usize {
+                    let idx = 1 * 20 + c;
+                    buf.element_idx.set(idx, 4);
+                    buf.mass.set(idx, 1000.0);
+                }
+                // 水池 rows 2..8 cols 3..16（水面 row8）
+                for r in 2..9usize {
+                    for c in 3..17usize {
+                        let idx = r * 20 + c;
+                        buf.element_idx.set(idx, 2);
+                        buf.mass.set(idx, 1000.0);
+                    }
+                }
+                // 污染水 row10 col9（idx 209）；row9 col9（idx 189）真空间隔
+                buf.element_idx.set(209, 1);
+                buf.mass.set(209, 1000.0);
+            }
+        }
+        let bounds = crate::d1_activity::full_grid_bounds(&sd);
+        let mut min_pt = 1000.0f32;
+        for _tick in 0..400 {
+            unsafe {
+                crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd);
+            }
+            update_liquid_loop(&mut sd, bounds);
+            run_liquid_displacement_task(&mut sd, bounds);
+            unsafe {
+                crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd);
+            }
+            post_process_loop(&mut sd, bounds);
+            unsafe {
+                let u = &*sd.updated_cells.ptr;
+                let mut pt = 0.0f32;
+                for i in 0..280usize {
+                    if u.element_idx.get(i) == 1 {
+                        pt += u.mass.get(i);
+                    }
+                }
+                min_pt = min_pt.min(pt);
+            }
+        }
+        assert!(
+            min_pt >= 999.5,
+            "污染水总质量不应丢失（最小 {min_pt}，seed=17 旧实现会掉到 50）"
+        );
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            let mut pt = 0.0f32;
+            for i in 0..280usize {
+                if u.element_idx.get(i) == 1 {
+                    pt += u.mass.get(i);
+                }
+            }
+            assert!(
+                (pt - 1000.0).abs() < 0.2,
+                "400 tick 后污染水应守恒为 1000kg，got {pt}"
+            );
+        }
+        DestroyElementsTable();
     }
 
     /// DoLiquidPressureDisplacement 核心（beyond 为液体合并路径）：
