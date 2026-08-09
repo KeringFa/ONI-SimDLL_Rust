@@ -32,27 +32,32 @@ pub fn update_data(sim_data: &mut SimData) {
     // 温度任务 → CopyFrom → 压力 → 液体 → 太空真空 → PostProcess。
     // 无活动区域时回退整张内部网格（测试环境无区域数据；原版此时区域循环不执行，
     // 但生产环境始终 ≥1 个已发现世界，回退不会改变生产行为）。
-    let (region_bounds, region_cosmic): (Vec<crate::d1_activity::RegionBounds>, Vec<f32>) = {
+    let region_bounds: Vec<(
+        crate::d1_activity::RegionBounds,
+        crate::d1_activity::RegionBounds,
+        f32,
+    )> = {
         let regions = sim_data.active_regions.as_slice();
         if regions.is_empty() {
-            (
-                vec![crate::d1_activity::full_grid_bounds(sim_data)],
-                vec![0.0],
-            )
+            vec![(
+                crate::d1_activity::full_grid_bounds(sim_data),
+                crate::d1_activity::full_grid_bounds(sim_data),
+                0.0,
+            )]
         } else {
-            (
-                regions
-                    .iter()
-                    .map(|r| crate::d1_activity::compute_region_bounds(sim_data, r))
-                    .collect(),
-                regions
-                    .iter()
-                    .map(|r| r.current_cosmic_radiation_intensity)
-                    .collect(),
-            )
+            regions
+                .iter()
+                .map(|r| {
+                    (
+                        crate::d1_activity::compute_region_bounds(sim_data, r),
+                        crate::d1_activity::compute_post_process_bounds(sim_data, r),
+                        r.current_cosmic_radiation_intensity,
+                    )
+                })
+                .collect()
         }
     };
-    for (bounds, cosmic_intensity) in region_bounds.into_iter().zip(region_cosmic.into_iter()) {
+    for (bounds, pp_bounds, cosmic_intensity) in region_bounds {
         if bounds.is_empty() {
             continue;
         }
@@ -143,7 +148,7 @@ pub fn update_data(sim_data: &mut SimData) {
         // 之前（★5：此前误放在辐射前）。
         crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, bounds);
         // PostProcessCell（原版 L43023：挤压/密度分层/升华）
-        crate::c2_physics::liquid_flow::post_process_loop(sim_data, bounds);
+        crate::c2_physics::liquid_flow::post_process_loop(sim_data, pp_bounds);
         // 病菌阶段 2（2026-08-05）：原版 L145539 病菌生长（PostProcess，
         // 置于 PostProcessCell 之后：温度因子 + 种群因子 + 辐射杀伤 + tick 递增）。
         crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);

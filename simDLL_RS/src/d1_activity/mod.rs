@@ -65,6 +65,38 @@ pub fn compute_region_bounds(sim: &SimData, region: &ActiveRegion) -> RegionBoun
     }
 }
 
+/// PostProcess 专用边界（原版 SimDLL_Source.c L145435-145460）。
+///
+/// 原版仅 PostProcessCell 循环用此边界，其余阶段（温度/气体/液体/辐射）用原始
+/// 区域矩形（compute_region_bounds）。公式：
+/// ```text
+/// x_min' = max(min_x, floor((min_x-1)/32)*32 + 1)   // 恒等于 min_x（no-op）
+/// x_max' = min(w-1, floor((max_x+30)/32)*32 + 1, max_x + 1)  // max+1 怪癖
+/// ```
+/// max+1：原版 PostProcess 会处理区域右/下边界外的 1 格（★3 复刻）。
+pub fn compute_post_process_bounds(sim: &SimData, region: &ActiveRegion) -> RegionBounds {
+    let w = sim.width as i64;
+    let h = sim.height as i64;
+    if w < 3 || h < 3 {
+        return RegionBounds { min_x: 1, min_y: 1, max_x: 0, max_y: 0 };
+    }
+    let floor_div32 = |x: i64| x.div_euclid(32);
+    let min_x = region.min_x as i64;
+    let min_y = region.min_y as i64;
+    let max_x = region.max_x as i64;
+    let max_y = region.max_y as i64;
+    let x_min = min_x.max(floor_div32(min_x - 1) * 32 + 1);
+    let y_min = min_y.max(floor_div32(min_y - 1) * 32 + 1);
+    let x_max = (floor_div32(max_x + 30) * 32 + 1).min(max_x + 1).min(w - 1);
+    let y_max = (floor_div32(max_y + 30) * 32 + 1).min(max_y + 1).min(h - 1);
+    RegionBounds {
+        min_x: x_min.max(1) as usize,
+        min_y: y_min.max(1) as usize,
+        max_x: x_max as usize,
+        max_y: y_max as usize,
+    }
+}
+
 /// 整张内部网格的边界（测试/诊断用，等价于 D1 之前的全网格遍历）。
 pub fn full_grid_bounds(sim: &SimData) -> RegionBounds {
     RegionBounds {
@@ -137,6 +169,37 @@ mod tests {
         assert_eq!(b.max_x, 9);
         assert_eq!(b.max_y, 9);
         assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn post_process_bounds_match_original_formula() {
+        let sd = test_sim(40, 40);
+        // max≡1 mod 32 → 块项生效：x_max = max（非 max+1）
+        let r = ActiveRegion {
+            min_x: 1,
+            min_y: 1,
+            max_x: 33,
+            max_y: 33,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        };
+        let b = compute_post_process_bounds(&sd, &r);
+        assert_eq!(b.min_x, 1);
+        assert_eq!(b.max_x, 33, "max≡1 mod 32 时块项 min(33,34)=33");
+        assert_eq!(b.max_y, 33);
+
+        // 其他 max → max+1 怪癖：x_max = max+1
+        let r2 = ActiveRegion {
+            min_x: 1,
+            min_y: 1,
+            max_x: 34,
+            max_y: 34,
+            current_sunlight_intensity: 0.0,
+            current_cosmic_radiation_intensity: 0.0,
+        };
+        let b2 = compute_post_process_bounds(&sd, &r2);
+        assert_eq!(b2.max_x, 35, "max+1 怪癖：min(39,65,35)=35");
+        assert_eq!(b2.max_y, 35);
     }
 }
 
