@@ -10,6 +10,8 @@ pub mod c_simulation;
 pub mod c2_physics;
 pub mod d1_activity;
 pub mod d2_thread;
+#[cfg(feature = "d3-rayon")]
+pub mod d3_rayon;
 
 pub mod globals {
     //! 全局静态变量，对应原版 simDLL 的全局状态。
