@@ -181,17 +181,12 @@ pub fn sim_main_loop(sim_ptr: *mut Sim) {
                         unsafe { c2_physics::update_data(&mut *sim_data_ptr); }
                     }
 
-                    // 帧末同步 updated_cells → cells（对照原版 SimBase::UpdateData
-                    // 内部多处的 CellSOA::CopyFrom(cells, updatedCells)，
-                    // 见 11_msvcrt_ignored.c L41903/42036/42392/42557）。
-                    // C2 update_data 目前是空桩，若不在此同步，Start 之后所有写入
-                    // updated_cells 的修改（worldgen 模板 ModifyCell、游戏内 dig/沙盒）
-                    // 永远不会进入 cells，而 BeginSave 序列化的是 cells ——
-                    // 导致 worldgen 第 498 步的 POI 模板方块（氧石/中子质基座/空间）
-                    // 丢失、POI 被自然方块掩埋（2026-08-01 实测问题 2）。
-                    unsafe {
-                        sim_data_ops::copy_updated_cells_to_cells(&mut *sim_data_ptr);
-                    }
+                    // 帧末**不再**额外 CopyUpdatedCellsToCells（★15）：
+                    // 原版 Sim::Main（SimDLL_Source.c L132707-132748）在 UpdateData
+                    // 子步循环后无 CopyFrom；C2 update_data 内部已按原版多处
+                    // CellSOA::CopyFrom(cells, updatedCells) 同步（L41903/42036/42392/42557），
+                    // 且 BeginSave/CopySimDataToGame 序列化的都是 updated_cells。
+                    // 早期为补偿 C2 空桩加的本同步已冗余，移除。
                 }
             }
         }
