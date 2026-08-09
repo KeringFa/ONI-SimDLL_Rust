@@ -441,6 +441,14 @@ impl ElementEmitterManager {
                         rec.blocked_state = 0;
                         if cb != 0xFFFFFFFF {
                             let events = unsafe { &mut *sim.sim_events.ptr };
+                            // 诊断：记录 unblocked 回调值（C# 以 callbackIdx 查句柄池，
+                            // -1/超限会 ArgumentOutOfRangeException——新建游戏 EMBARK 后偶发崩溃嫌疑）
+                            tracing::info!(
+                                cb = cb,
+                                cb_signed = cb as i32,
+                                event = "element_emitter_unblocked_callback",
+                                "element emitter callback_info push"
+                            );
                             // 原版 ElementEmitter::Update（SimDLL_Source.c L141577-141610）：
                             // blocked/unblocked 回调推送到 **callbackInfo**（simEvents+0x120，
                             // 4B CallbackInfo），C# 只登记不 Release（Game.cs L1135-1144
@@ -457,6 +465,13 @@ impl ElementEmitterManager {
                     rec.blocked_state = 1;
                     if cb != 0xFFFFFFFF {
                         let events = unsafe { &mut *sim.sim_events.ptr };
+                        // 诊断：记录 blocked 回调值
+                        tracing::info!(
+                            cb = cb,
+                            cb_signed = cb as i32,
+                            event = "element_emitter_blocked_callback",
+                            "element emitter callback_info push"
+                        );
                         events.callback_info.push(CallbackInfo {
                             callback_idx: cb as i32,
                         });

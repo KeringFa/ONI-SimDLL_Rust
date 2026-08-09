@@ -660,6 +660,11 @@ pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
 
     // L820-827: callbackInfo (CallbackInfo, 4B, >>2)
     gdu.num_callback_info = game_data.callback_info.len() as i32;
+    // 诊断：记录本帧 callbackInfo 总量（C# StepTheSim 遍历，越界崩溃排查用）
+    tracing::info!(
+        count = gdu.num_callback_info,
+        "PrepareGameData callback_info count"
+    );
     gdu.callback_info = if game_data.callback_info.is_empty() {
         std::ptr::null()
     } else {
