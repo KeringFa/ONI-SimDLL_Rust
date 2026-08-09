@@ -41,8 +41,8 @@ use super::sysinfo;
 #[no_mangle]
 pub extern "C" fn SIM_Initialize(handler: Option<GameMessageHandler>) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        // 初始化日志
-        let _ = logger::init();
+        // 初始化日志（仅当接口 mod 启用了日志；默认关闭 → 不创建日志文件）
+        logger::ensure_init_if_enabled();
         // 初始化崩溃处理
         crashdump::init();
 

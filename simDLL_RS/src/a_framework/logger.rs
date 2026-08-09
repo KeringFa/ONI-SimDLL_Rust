@@ -6,6 +6,7 @@
 use once_cell::sync::OnceCell;
 use std::ffi::{c_char, CStr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::reload;
@@ -20,6 +21,9 @@ struct LoggerState {
 static LOGGER: OnceCell<Mutex<LoggerState>> = OnceCell::new();
 /// 运行时日志级别控制句柄（logger 初始化后可用；RS_SetLogLevel 动态更新）。
 static RELOAD_HANDLE: OnceCell<reload::Handle<EnvFilter, Registry>> = OnceCell::new();
+/// 日志启用标志：由 RS_SetLogLevel 设置（off → false，其余级别 → true）。
+/// SIM_Initialize 等入口据此决定是否创建日志文件——默认关闭时完全不生成日志。
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// 把字符串级别解析为 EnvFilter（off/error/warn/info/debug/trace）。
 fn parse_level(level: &str) -> Option<EnvFilter> {
@@ -51,6 +55,7 @@ pub extern "C" fn RS_SetLogLevel(level: *const c_char) -> i32 {
     }
     let level = unsafe { CStr::from_ptr(level) }.to_string_lossy().into_owned();
     let normalized = level.trim().to_ascii_lowercase();
+    LOG_ENABLED.store(normalized != "off", Ordering::Relaxed);
     // 日志默认关闭且从未初始化：不创建日志文件（默认不启用日志），视为成功。
     if normalized == "off" && LOGGER.get().is_none() {
         return 1;
@@ -63,6 +68,14 @@ pub extern "C" fn RS_SetLogLevel(level: *const c_char) -> i32 {
         1
     } else {
         0
+    }
+}
+
+/// 按启用标志初始化日志：仅当日志已启用（RS_SetLogLevel 设置过非 off 级别）且
+/// 尚未初始化时才创建日志文件；默认关闭 → 不生成任何日志文件。
+pub fn ensure_init_if_enabled() {
+    if LOG_ENABLED.load(Ordering::Relaxed) && LOGGER.get().is_none() {
+        let _ = init();
     }
 }
 
