@@ -125,7 +125,7 @@ pub fn update_data(sim_data: &mut SimData) {
         // 太空真空特判（原版 L145466-145520：worldZones==-1 且背墙真空 → 液体/气体
         // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
         // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
-        crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, bounds);
+        // （★5：太空真空已移至 UpdateComponents 之后，见下方。）
         // 辐射模拟（原版 L42594-42914：UpdateComponents 前；radiationEnabled 门控，
         // 单星零执行；cosmic_intensity = 当前区域 currentCosmicRadiationIntensity）
         crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
@@ -138,6 +138,10 @@ pub fn update_data(sim_data: &mut SimData) {
         // 病菌阶段 3（2026-08-05）：DiseaseEmitter 组件 Update（原版 L145434
         // UpdateComponents 位置：辐射任务后、太空真空前）。
         crate::c_simulation::disease_component::update_disease_emitters(sim_data, 0.2, bounds);
+        // 太空真空特判（原版 L145466-145520）：worldZones==-1 且背墙真空 → 液体/气体
+        // 持续删除至空 + flow 重置。原版顺序在 UpdateComponents 之后、PostProcessCell
+        // 之前（★5：此前误放在辐射前）。
+        crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, bounds);
         // PostProcessCell（原版 L43023：挤压/密度分层/升华）
         crate::c2_physics::liquid_flow::post_process_loop(sim_data, bounds);
         // 病菌阶段 2（2026-08-05）：原版 L145539 病菌生长（PostProcess，
