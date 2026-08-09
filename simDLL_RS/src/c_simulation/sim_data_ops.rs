@@ -642,6 +642,7 @@ mod tests {
 
     #[test]
     fn copy_sim_data_to_game_swaps_events_and_updates_frame_count() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 
@@ -691,6 +692,7 @@ mod tests {
     /// 验证 game_data.cells 中对应位置的数据正确，且尺寸不会被错误扩展。
     #[test]
     fn copy_sim_data_to_game_strips_border_correctly() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 
@@ -734,6 +736,7 @@ mod tests {
     /// GameData: 4×4（不含边界）→ game 坐标 row=0..3, col=0..3
     #[test]
     fn copy_sim_data_to_game_copies_accumulated_flow_stripped() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         reset_accumulated_flow_reset_count_for_tests();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
@@ -761,6 +764,7 @@ mod tests {
     /// 此前 game.flow 恒 null；此测试验证去边界拷贝。
     #[test]
     fn copy_sim_data_to_game_copies_flow_stripped() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 
@@ -822,6 +826,7 @@ mod tests {
     /// 第 16 次调用起 GameData 读到 0 —— 即 C# 显示只维持一个窗口。
     #[test]
     fn copy_sim_data_to_game_resets_accumulated_flow_after_15_calls() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         reset_accumulated_flow_reset_count_for_tests();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
@@ -903,6 +908,7 @@ mod tests {
     /// 并回填 old/new 元素索引。
     #[test]
     fn post_process_derives_solid_events_for_dug_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         // 准备元素状态表：idx 100 = 固体(3)，idx 1 = 真空(0)
         {
             let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
@@ -955,6 +961,7 @@ mod tests {
     /// 防止事件乒乓重复投递。
     #[test]
     fn copy_sim_data_to_game_clears_event_source() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 

@@ -175,6 +175,7 @@ mod tests {
         table.pressure_data.clear();
         table.post_process_data.clear();
         table.temperature_data.clear();
+        table.radiation_data.clear();
         for (id, state) in [(0i32, 0u8), (1i32, 2u8), (2i32, 1u8), (3i32, 3u8)] {
             let mut elem = Element::default();
             elem.id = id;
@@ -198,6 +199,11 @@ mod tests {
                 low_temp: 0.0,
                 high_temp: 10000.0,
                 ..Default::default()
+            });
+            // 辐射数据：固体（state3）factor=0.5，其余 0（真空/液体/气体不遮挡）。
+            table.radiation_data.push(crate::b_elements::element::ElementRadiationData {
+                factor: if state == 3 { 0.5 } else { 0.0 },
+                rads_per_1000: 0.0,
             });
         }
     }
@@ -342,6 +348,75 @@ mod tests {
             (mp - 200.0).abs() < 0.5,
             "并行液体应守恒 200kg，got {mp}"
         );
+        crate::b_elements::elements_table::DestroyElementsTable();
+    }
+
+    /// d3 并行回归：宇宙辐射遮挡在并行路径下必须与串行一致。此前 run_radiation_task
+    /// 对 SimData 共享字段 cosmic_radiation_occlusion 执行 resize+全填 1.0，多 region
+    /// 线程并发写同一缓冲会互相覆盖（一个线程的"填 1.0"抹掉另一线程已算好的遮挡），
+    /// 导致宇宙辐射间歇性穿透方块照全图。修复后 occlusion 为区域局部缓冲，本测试
+    /// 验证并行结果与串行逐格一致：region0 顶行固体（factor 0.5）→ occlusion 0.5 →
+    /// cosmic 50；region1 全真空顶行 → occlusion 1.0 → cosmic 100。
+    #[test]
+    fn parallel_radiation_occlusion_matches_serial() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let fill_solid = |sd: &mut SimData| unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            for x in 1..6 {
+                u.element_idx.set(4 * 14 + x, 3);
+                u.mass.set(4 * 14 + x, 2000.0);
+            }
+        };
+        let mut sd_s = make_two_region_sim();
+        fill_solid(&mut sd_s);
+        let bounds: Vec<RegionBounds> = sd_s
+            .active_regions
+            .as_slice()
+            .iter()
+            .map(|r| crate::d1_activity::compute_region_bounds(&sd_s, r))
+            .collect();
+        let pp: Vec<RegionBounds> = sd_s
+            .active_regions
+            .as_slice()
+            .iter()
+            .map(|r| crate::d1_activity::compute_post_process_bounds(&sd_s, r))
+            .collect();
+        let cosmic = vec![110.0f32; 2];
+        // —— 串行路径（一帧）——
+        for i in 0..2 {
+            crate::c2_physics::run_region_physics_a(&mut sd_s, bounds[i], cosmic[i], false);
+            crate::c2_physics::run_region_emitters(&mut sd_s, bounds[i]);
+            crate::c2_physics::run_region_physics_c(&mut sd_s, bounds[i], pp[i]);
+        }
+        // —— 并行路径（一帧，独立 sim）——
+        let mut sd_p = make_two_region_sim();
+        fill_solid(&mut sd_p);
+        run_parallel_pipeline(&mut sd_p, bounds.clone(), pp.clone(), cosmic.clone());
+        // —— 断言：串行/并行逐格一致 ——
+        unsafe {
+            let us = &*sd_s.updated_cells.ptr;
+            let up = &*sd_p.updated_cells.ptr;
+            for x in 1..6 {
+                let cell = 4 * 14 + x;
+                let rs = us.radiation.get(cell);
+                let rp = up.radiation.get(cell);
+                assert!((rs - 50.0).abs() < 1.0, "串行 region0 固体行 cosmic 50，got {rs}");
+                assert!((rp - 50.0).abs() < 1.0, "并行 region0 固体行 cosmic 50，got {rp}");
+            }
+            for x in 7..12 {
+                let cell = 4 * 14 + x;
+                let rs = us.radiation.get(cell);
+                let rp = up.radiation.get(cell);
+                assert!(
+                    (rs - 100.0).abs() < 1.0,
+                    "串行 region1 顶行 cosmic 100，got {rs}"
+                );
+                assert!(
+                    (rp - 100.0).abs() < 1.0,
+                    "并行 region1 顶行 cosmic 100，got {rp}"
+                );
+            }
+        }
         crate::b_elements::elements_table::DestroyElementsTable();
     }
 }

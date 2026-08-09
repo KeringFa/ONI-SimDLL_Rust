@@ -56,7 +56,6 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
     if w < 3 || h < 3 || sim.updated_cells.ptr.is_null() {
         return;
     }
-    let total = w * h;
     let (min_x, min_y, max_x, max_y) = (bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y);
     if min_x > max_x || min_y > max_y || max_x >= w || max_y >= h {
         return;
@@ -77,11 +76,17 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
         }
     };
 
-    // occlusion 缓冲：全网格填 1.0（原版 L42688 resize 初值 1.0）
-    sim.cosmic_radiation_occlusion.resize(total, 1.0);
-    for i in 0..total {
-        sim.cosmic_radiation_occlusion.set(i, 1.0);
-    }
+    // 区域局部 occlusion 缓冲（d3 并行安全）。原版 L42688 对 SimData 全局字段
+    // cosmicRadiationOcclusion 执行 resize(total, 1.0)，随后在 active region 循环内
+    // 自顶向下填充 region 矩形——原版单线程串行，字段复用无竞争；并行路径下多个
+    // region 线程同时对该共享字段 resize/全填会产生数据竞争：一个线程的"填 1.0"
+    // 会覆盖另一线程已算好的遮挡，导致宇宙辐射间歇性穿透方块（全图照射）。
+    // 改为区域局部缓冲：region 顶行以上视为 1.0（原版 `iVar17 < fStack_1fc` 检查，
+    // region 顶行 y+1 == max_y 不满足 < max_y → 1.0），region 内自顶向下传播，
+    // 逐格语义与原版一致，且零共享、天然并行安全。
+    let rw = max_x - min_x;
+    let rh = max_y - min_y;
+    let mut occlusion = vec![1.0f32; rw * rh];
 
     // —— 第一遍：top→bottom（y 从 max_y 递减，上方格 cell+width 先算）——
     // occlusion + 衰减
@@ -108,8 +113,10 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
                 (mass / max_mass) * factor * dens_w + factor * base_w
             };
             let block = block.clamp(0.0, 1.0);
-            let above_occ = if cell + w < total {
-                sim.cosmic_radiation_occlusion.get(cell + w)
+            // 原版 L42760：`iVar17 = y + 1; if (iVar17 < region.max_y)` 才读上方格
+            // occlusion，否则视为 1.0（区域顶行及以上独立于区域外格子）。
+            let above_occ = if y + 1 < max_y {
+                occlusion[(y + 1 - min_y) * rw + (x - min_x)]
             } else {
                 1.0
             };
@@ -118,7 +125,7 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
             if occ < 0.01 {
                 occ = 0.0;
             }
-            sim.cosmic_radiation_occlusion.set(cell, occ);
+            occlusion[(y - min_y) * rw + (x - min_x)] = occ;
 
             // 衰减（原版 L42785-42810）
             let f = rad / linger;
@@ -173,7 +180,7 @@ pub fn run_radiation_task(sim: &mut SimData, bounds: RegionBounds, cosmic_intens
                 }
             }
             // 宇宙辐射应用（原版 L42875-42884）
-            let occ = sim.cosmic_radiation_occlusion.get(cell);
+            let occ = occlusion[(y - min_y) * rw + (x - min_x)];
             if occ > 0.0 {
                 let u = unsafe { &mut *sim.updated_cells.ptr };
                 u.radiation.set(cell, u.radiation.get(cell) + (cosmic_intensity / linger) * occ);
@@ -524,7 +531,6 @@ mod tests {
         unsafe {
             assert_eq!((*sd.updated_cells.ptr).radiation.get(14), 5.0, "单星门控：辐射不变");
         }
-        assert_eq!(sd.cosmic_radiation_occlusion.len(), 0, "门控：occlusion 缓冲不被填");
         DestroyElementsTable();
     }
 
@@ -596,14 +602,60 @@ mod tests {
         });
         let b = crate::d1_activity::full_grid_bounds(&sd);
         run_radiation_task(&mut sd, b, 110.0);
-        assert_eq!(
-            sd.cosmic_radiation_occlusion.get(13),
-            0.0,
-            "occlusion <0.01 应清零"
-        );
         unsafe {
             let u = &*sd.updated_cells.ptr;
             assert_eq!(u.radiation.get(13), 0.0, "occlusion=0 → 不累加 cosmic");
+        }
+        DestroyElementsTable();
+    }
+
+    /// 任务 3f：区域遮挡隔离（d3 并行根因回归）——垂直堆叠的两个 region 各自独立，
+    /// 下方 region 顶行即使上方存在别的 region 的方块，也视为 1.0（原版
+    /// `iVar17 < fStack_1fc` 区域边界检查，region 顶行及以上独立于区域外格子）。
+    /// 此前实现按全网格边界读取共享 cosmic_radiation_occlusion：先跑上方 region
+    /// （固体遮挡）后，下方 region 顶行会错误继承上方遮挡（cosmic 50 而非 100）；
+    /// 并行下该共享缓冲还会被多 region 线程竞争写，导致宇宙辐射间歇性穿透方块。
+    #[test]
+    fn radiation_task_vertical_regions_occlusion_isolated() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        init_radiation_table();
+        let mut sd = make_sim();
+        // 上方 region B：y 4..7。y=6/y=5 真空，y=4 固体（elem1, mass2000, factor0.5）
+        //   → occlusion：y6=1.0, y5=1.0, y4=0.5
+        // 下方 region A：y 1..4，全真空。A 顶行 y=3 上方是 B 的 y=4（固体 occlusion 0.5）。
+        fill_both(&mut sd, |b| {
+            for x in 1..7 {
+                b.element_idx.set(4 * 8 + x, 1);
+                b.mass.set(4 * 8 + x, 2000.0);
+            }
+        });
+        let b_top = RegionBounds { min_x: 1, min_y: 4, max_x: 7, max_y: 7 };
+        let b_bot = RegionBounds { min_x: 1, min_y: 1, max_x: 7, max_y: 4 };
+        // 先跑上方 region（旧实现会留下 occlusion 残留），再跑下方 region。
+        run_radiation_task(&mut sd, b_top, 110.0);
+        run_radiation_task(&mut sd, b_bot, 110.0);
+        unsafe {
+            let u = &*sd.updated_cells.ptr;
+            // B 顶行 y=6 真空：occlusion=1 → 100
+            assert!(
+                (u.radiation.get(6 * 8 + 1) - 100.0).abs() < 1e-3,
+                "上方 region 顶行 cosmic 应 100"
+            );
+            // B 底部 y=4 固体：occlusion=0.5 → 50
+            assert!(
+                (u.radiation.get(4 * 8 + 1) - 50.0).abs() < 1e-3,
+                "上方 region 固体行 cosmic 应 50"
+            );
+            // A 顶行 y=3 真空：独立于上方遮挡 → 100（旧实现错误继承 0.5 → 50）
+            assert!(
+                (u.radiation.get(3 * 8 + 1) - 100.0).abs() < 1e-3,
+                "下方 region 顶行 cosmic 应 100"
+            );
+            // A 内部 y=1 真空 → 100
+            assert!(
+                (u.radiation.get(1 * 8 + 1) - 100.0).abs() < 1e-3,
+                "下方 region 内部 cosmic 应 100"
+            );
         }
         DestroyElementsTable();
     }

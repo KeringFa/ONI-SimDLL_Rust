@@ -2435,6 +2435,7 @@ mod tests {
 
     #[test]
     fn process_dig_points_clears_solid_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2482,6 +2483,7 @@ mod tests {
 
     #[test]
     fn process_dig_points_skips_non_solid() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2512,6 +2514,7 @@ mod tests {
 
     #[test]
     fn process_dig_points_with_callback_pushes_callback_info() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2904,6 +2907,7 @@ mod tests {
 
     #[test]
     fn process_cell_modifications_replace_vacuum_destroys_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2946,6 +2950,7 @@ mod tests {
 
     #[test]
     fn process_cell_modifications_replace_solid_spawns_cell() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
