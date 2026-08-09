@@ -100,11 +100,6 @@ pub fn assign_groups(world_tiles: &[u64], topo: &CpuTopology) -> Option<Vec<Affi
 
 impl CpuTopology {
     pub fn query() -> Self {
-        use windows::Win32::System::SystemInformation::{
-            GetLogicalProcessorInformation, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
-        };
-
-        // 回退：枚举失败/异常时按 available_parallelism 保守处理（视为无 HT）。
         let fallback = || {
             let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
             CpuTopology {
@@ -114,33 +109,55 @@ impl CpuTopology {
             }
         };
 
+        // 用 GetLogicalProcessorInformationEx（RelationProcessorCore）+ 手写偏移读取，
+        // 与 C# CpuInfo 一致——旧 API GetLogicalProcessorInformation 在本机
+        // （Win11/部分环境）返回全 Group（无 ProcessorCore 条目），检测恒 false。
         unsafe {
-            let mut needed: u32 = 0;
-            // 第一次调用只取所需缓冲大小（预期 ERROR_INSUFFICIENT_BUFFER）。
-            if GetLogicalProcessorInformation(None, &mut needed).is_err() || needed == 0 {
+            let mut len: u32 = 0;
+            // 第一次调用查询所需缓冲区大小（预期失败，len 被设置）。
+            let _ = windows::Win32::System::SystemInformation::GetLogicalProcessorInformationEx(
+                windows::Win32::System::SystemInformation::RelationProcessorCore,
+                None,
+                &mut len,
+            );
+            if len == 0 {
                 return fallback();
             }
-            let count =
-                (needed as usize) / std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>();
-            if count == 0 {
+            let mut buf = vec![0u8; len as usize];
+            if windows::Win32::System::SystemInformation::GetLogicalProcessorInformationEx(
+                windows::Win32::System::SystemInformation::RelationProcessorCore,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut len,
+            )
+            .is_err()
+            {
                 return fallback();
             }
-            let mut buf = vec![SYSTEM_LOGICAL_PROCESSOR_INFORMATION::default(); count];
-            if GetLogicalProcessorInformation(Some(buf.as_mut_ptr()), &mut needed).is_err() {
-                return fallback();
-            }
-
             let mut physical = 0usize;
             let mut logical_total = 0usize;
             let mut per_core = Vec::new();
-            for info in buf.iter() {
-                if info.Relationship == RelationProcessorCore {
-                    // ProcessorMask 的置位位数 = 该物理核的逻辑处理器数。
-                    let n = info.ProcessorMask.count_ones() as usize;
+            let mut offset = 0usize;
+            while offset + 8 <= buf.len() {
+                // Windows ABI：条目 Relationship@0、Size@4；
+                // RelationProcessorCore 的 Flags@8、GROUP_AFFINITY.Mask@32。
+                let relationship = u32::from_le_bytes(
+                    buf[offset..offset + 4].try_into().unwrap(),
+                );
+                let size =
+                    u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
+                if relationship == 0 {
+                    let mask = u64::from_le_bytes(
+                        buf[offset + 32..offset + 40].try_into().unwrap(),
+                    );
+                    let n = mask.count_ones() as usize;
                     physical += 1;
                     logical_total += n;
                     per_core.push(n);
                 }
+                if size == 0 {
+                    break;
+                }
+                offset += size as usize;
             }
             if physical == 0 {
                 return fallback();
