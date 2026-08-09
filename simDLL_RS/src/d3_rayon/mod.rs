@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 pub mod affinity;
 pub mod bin_pack;
 pub mod d1_pipeline;
+pub mod perf_probe;
 pub mod pipeline;
 pub mod scheduler;
 

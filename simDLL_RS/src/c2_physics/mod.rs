@@ -178,6 +178,7 @@ pub fn update_data(sim_data: &mut SimData) {
     // d3 并行分支（feature "d3-rayon" 门控）：多区域 → 三段式并行；否则串行。
     #[cfg(feature = "d3-rayon")]
     {
+        let _perf_t0 = std::time::Instant::now();
         use crate::d3_rayon::scheduler::SchedulerMode;
         match crate::d3_rayon::scheduler::current_mode() {
             SchedulerMode::D2 => {
@@ -228,6 +229,16 @@ pub fn update_data(sim_data: &mut SimData) {
                 }
             }
         }
+        let perf_mode = match crate::d3_rayon::scheduler::current_mode() {
+            SchedulerMode::Auto => 0,
+            SchedulerMode::D2 => 1,
+            SchedulerMode::D1 => 2,
+        };
+        crate::d3_rayon::perf_probe::frame_done(
+            region_count,
+            perf_mode,
+            _perf_t0.elapsed().as_micros() as u64,
+        );
     }
     #[cfg(not(feature = "d3-rayon"))]
     {
