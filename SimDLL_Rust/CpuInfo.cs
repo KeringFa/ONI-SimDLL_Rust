@@ -28,10 +28,14 @@ namespace SimDLL_Rust
             try
             {
                 uint len = 0;
-                if (!GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, IntPtr.Zero, ref len)
-                    || len == 0)
+                // 第一次调用：查询所需缓冲区大小。预期返回 false
+                // （ERROR_INSUFFICIENT_BUFFER），len 被设置为所需字节数——
+                // 此时不能把 false 当失败。
+                GetLogicalProcessorInformationEx(
+                    RELATION_PROCESSOR_CORE, IntPtr.Zero, ref len);
+                if (len == 0)
                 {
-                    Debug.Log("[SimDLL_Rust] CpuInfo: first call failed (len=" + len + ")");
+                    Debug.Log("[SimDLL_Rust] CpuInfo: query length failed (len=0)");
                     return false;
                 }
                 IntPtr buffer = Marshal.AllocHGlobal((int)len);
