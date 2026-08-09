@@ -16,6 +16,118 @@ pub mod disease;
 pub mod region_events;
 pub mod region_rng;
 
+/// 阶段 A：区域网格物理（d3 三段式；parallel=true 时温度内联 + 区域局部 CopyFrom）。
+/// 串行路径（parallel=false）行为与原版/现状逐字节一致。
+pub(crate) fn run_region_physics_a(
+    sim_data: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+    cosmic_intensity: f32,
+    parallel: bool,
+) {
+    if bounds.is_empty() {
+        return;
+    }
+    if parallel {
+        // d3 并行路径：温度在区域任务内联整区（不经全局共享队列，避免嵌套并行争抢）。
+        crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+    } else {
+        // 串行路径：按 worker 数切行带提交到 ParallelTaskQueue（原版 L144430-144527），
+        // 队列未初始化（测试环境）时内联整区执行。
+        let queue_ptr = crate::globals::G_PARALLEL_TASK_QUEUE.lock().0;
+        if !queue_ptr.is_null() {
+            let queue = unsafe { &*queue_ptr };
+            let n_workers = queue.worker_count().max(1);
+            let total_rows = bounds.max_y - bounds.min_y;
+            let base = total_rows / n_workers;
+            let extra = total_rows % n_workers;
+            let mut row = bounds.min_y;
+            let mut submitted = 0usize;
+            for i in 0..n_workers {
+                let band_rows = base + if i < extra { 1 } else { 0 };
+                if band_rows == 0 {
+                    break;
+                }
+                let row_end = row + band_rows;
+                let ptr = crate::globals::SendSyncPtr(sim_data as *mut SimData);
+                let b = bounds;
+                queue.submit(Box::new(move || {
+                    crate::c2_physics::temperature::run_temperature_band_task(ptr, b, row, row_end);
+                }));
+                row = row_end;
+                submitted += 1;
+            }
+            if submitted > 0 {
+                queue.wait_all();
+            }
+        } else {
+            crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+        }
+    }
+    if parallel {
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
+    } else {
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+    }
+    crate::c2_physics::gas_flow::run_gas_pressure_task(sim_data, bounds);
+    crate::c2_physics::gas_flow::run_gas_displacement_task(sim_data, bounds);
+    if parallel {
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
+    } else {
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+    }
+    crate::c2_physics::liquid_flow::update_liquid_loop(sim_data, bounds);
+    crate::c2_physics::liquid_flow::run_liquid_displacement_task(sim_data, bounds);
+    if parallel {
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
+    } else {
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+    }
+    crate::c2_physics::disease::run_disease_diffusion_task(sim_data, bounds);
+    crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
+}
+
+/// 阶段 B：区域组件（★4 注册顺序；串行。d3 并行路径也按区域序串行执行，
+/// 事件直接写全局，不经过区域 sink）。
+pub(crate) fn run_region_emitters(
+    sim_data: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
+    if bounds.is_empty() {
+        return;
+    }
+    crate::c_simulation::frame_processor::process_element_consumers(sim_data, bounds);
+    crate::c_simulation::element_emitter::update_element_emitters(
+        sim_data,
+        0.2,
+        sim_data.width,
+        bounds,
+    );
+    crate::c_simulation::radiation_emitter::update_radiation_emitters_global(sim_data, 0.2, bounds);
+    crate::c_simulation::element_chunk::update_element_chunks(
+        sim_data,
+        0.2,
+        sim_data.width,
+        bounds,
+    );
+    crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data, bounds);
+    crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2, bounds);
+    crate::c_simulation::disease_component::update_disease_emitters(sim_data, 0.2, bounds);
+}
+
+/// 阶段 C：区域收尾（太空真空 → PostProcess → 病菌生长）。
+pub(crate) fn run_region_physics_c(
+    sim_data: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+    pp_bounds: crate::d1_activity::RegionBounds,
+) {
+    if bounds.is_empty() {
+        return;
+    }
+    crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, bounds);
+    crate::c2_physics::liquid_flow::post_process_loop(sim_data, pp_bounds);
+    crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);
+}
+
 /// SimBase::UpdateData 的桩实现。
 ///
 /// 对照源码 11_msvcrt_ignored.c L41811。
@@ -63,116 +175,9 @@ pub fn update_data(sim_data: &mut SimData) {
         if bounds.is_empty() {
             continue;
         }
-        // 温度任务（原版 L144430-144548：读 cells 稳定缓冲、写 updatedCells 增量；
-        // 含背墙换热、右/下邻换热、逐格 DoStateTransition）。
-        // D2：按 worker 数切行带提交到 ParallelTaskQueue（原版 L144430-144527），
-        // 等待全部完成后再继续；队列未初始化（测试环境）时内联整区执行。
-        let queue_ptr = crate::globals::G_PARALLEL_TASK_QUEUE.lock().0;
-        if !queue_ptr.is_null() {
-            let queue = unsafe { &*queue_ptr };
-            let n_workers = queue.worker_count().max(1);
-            let total_rows = bounds.max_y - bounds.min_y;
-            let base = total_rows / n_workers;
-            let extra = total_rows % n_workers;
-            let mut row = bounds.min_y;
-            let mut submitted = 0usize;
-            for i in 0..n_workers {
-                let band_rows = base + if i < extra { 1 } else { 0 };
-                if band_rows == 0 {
-                    break;
-                }
-                let row_end = row + band_rows;
-                let ptr = crate::globals::SendSyncPtr(sim_data as *mut SimData);
-                let b = bounds;
-                // 温度任务只写各自行带内的 updatedCells/背墙，行带互不重叠；
-                // 1 worker 串行执行（原版即 1 worker），原始指针模型与原版一致。
-                queue.submit(Box::new(move || {
-                    crate::c2_physics::temperature::run_temperature_band_task(
-                        ptr, b, row, row_end,
-                    );
-                }));
-                row = row_end;
-                submitted += 1;
-            }
-            if submitted > 0 {
-                queue.wait_all();
-            }
-        } else {
-        crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
-        }
-        // 原版 L144548：温度后 CopyFrom，供后续压力/液体阶段读取新温度
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
-
-        // 气体流动（原版 L144590-144950，温度任务与液体压力之间）：
-        // 1) 同元素气体/真空压力均衡（iterateDirection 扫描）；2) 异元素气体置换。
-        crate::c2_physics::gas_flow::run_gas_pressure_task(sim_data, bounds);
-        crate::c2_physics::gas_flow::run_gas_displacement_task(sim_data, bounds);
-        // 原版气体阶段后 CopyFrom（L144950），液体压力读更新后的 cells
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
-
-        // 原版压力循环（11_msvcrt_ignored.c L42030-42320）**只处理气体/真空源格**
-        // （源格 pressure state & 3 < 2，L42092 `local_1a8 < 2`）——液体源不进压力
-        // 循环；液体↔真空/气体由 update_liquid 的分支处理（下落/水平扩散/上推）。
-        // 2026-08-06 移除 run_pressure_task（液体源→真空压力转移，非原版）：
-        // 它会在 update_liquid 之前把液体邻格的真空填成液体，破坏分支 3 角落判定
-        // （用户实测：液2 位置为真空时气体不应被转移，此前真空被提前填满 → 误交换）。
-
-        // C2 阶段实现：液体流动（原版 L42408+）
-        crate::c2_physics::liquid_flow::update_liquid_loop(sim_data, bounds);
-        // 液体压力位移（原版 11_msvcrt_ignored.c L42480-42557：UpdateLiquid 之后、
-        // CopyFrom 之前）——液体↔液体挤压（DoLiquidPressureDisplacement）。
-        // 2026-08-06 补齐：此前缺失 → 异元素液体邻格不会被压力挤开。
-        crate::c2_physics::liquid_flow::run_liquid_displacement_task(sim_data, bounds);
-        // 病菌阶段 2（2026-08-05）：原版 L145069 液体阶段后 CopyFrom
-        // （病菌扩散读 cells 稳定缓冲）→ L145088 病菌扩散（右/下邻）。
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
-        crate::c2_physics::disease::run_disease_diffusion_task(sim_data, bounds);
-        // 原版 L145106-145464：辐射病菌贡献（RadiationSickness，hash 0xd49f77d6，
-        // +count×0.001）已实现（radiation.rs run_radiation_task 内，2026-08-05 c04664b）。
-        // 太空真空特判（原版 L145466-145520：worldZones==-1 且背墙真空 → 液体/气体
-        // 持续删除至空 + flow 重置）。2026-08-04 实现：位于 UpdateLiquid 之后、
-        // PostProcessCell 之前（原版顺序），此前缺失 → 太空暴露不删除。
-        // （★5：太空真空已移至 UpdateComponents 之后，见下方。）
-        // 辐射模拟（原版 L42594-42914：UpdateComponents 前；radiationEnabled 门控，
-        // 单星零执行；cosmic_intensity = 当前区域 currentCosmicRadiationIntensity）
-        crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
-        // 原版 L145434 SimData::UpdateComponents(sim, 0.2, region)：所有 SimComponent
-        // 在区域内按 region 裁剪分派（辐射后、太空真空前）。★4：此前 5 个组件在区域
-        // 循环外全局遍历、无 bounds → 未发现世界/区域外对象也被模拟，且组件时序
-        // 落到 PostProcess 之后（发射物 1 帧延迟）。调用顺序按原版 SimData 构造的
-        // 注册顺序（SimDLL_Source.c L121784-121875）：ElementConsumer → ElementEmitter
-        // → RadiationEmitter → ElementChunk → BuildingHeatExchange → BuildingToBuilding
-        // → DiseaseEmitter（原版第 8 的 DiseaseConsumer 无 C# 发送方，Rust 未实现）。
-        crate::c_simulation::frame_processor::process_element_consumers(sim_data, bounds);
-        crate::c_simulation::element_emitter::update_element_emitters(
-            sim_data,
-            0.2,
-            sim_data.width,
-            bounds,
-        );
-        crate::c_simulation::radiation_emitter::update_radiation_emitters_global(
-            sim_data,
-            0.2,
-            bounds,
-        );
-        crate::c_simulation::element_chunk::update_element_chunks(
-            sim_data,
-            0.2,
-            sim_data.width,
-            bounds,
-        );
-        crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data, bounds);
-        crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2, bounds);
-        crate::c_simulation::disease_component::update_disease_emitters(sim_data, 0.2, bounds);
-        // 太空真空特判（原版 L145466-145520）：worldZones==-1 且背墙真空 → 液体/气体
-        // 持续删除至空 + flow 重置。原版顺序在 UpdateComponents 之后、PostProcessCell
-        // 之前（★5：此前误放在辐射前）。
-        crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, bounds);
-        // PostProcessCell（原版 L43023：挤压/密度分层/升华）
-        crate::c2_physics::liquid_flow::post_process_loop(sim_data, pp_bounds);
-        // 病菌阶段 2（2026-08-05）：原版 L145539 病菌生长（PostProcess，
-        // 置于 PostProcessCell 之后：温度因子 + 种群因子 + 辐射杀伤 + tick 递增）。
-        crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);
+        run_region_physics_a(sim_data, bounds, cosmic_intensity, false);
+        run_region_emitters(sim_data, bounds);
+        run_region_physics_c(sim_data, bounds, pp_bounds);
     }
 }
 
