@@ -8,6 +8,8 @@ pub struct SliceBounds {
     /// 全局序号（区域序 → 行优先），用于事件定序合并。
     pub index: usize,
     /// 所属区域在 `active_regions` 中的下标，用于事件定序合并。
+    /// 语义是 `regions.iter().enumerate()` 的**原始下标**，包含被跳过的空区域 ——
+    /// 不可当作「第几个非空区域」使用。
     pub region_index: usize,
     pub min_x: usize,
     pub min_y: usize,
@@ -62,7 +64,10 @@ impl SliceGrid {
 }
 
 /// 切片缓存：仅在签名（区域列表 + 切片尺寸 + 网格尺寸）变化时重建，
-/// 避免每帧分配。
+/// 避免每帧重建切片表 —— 省下的是大对象（整张约 147 项 `SliceBounds` 的 `Vec`）。
+///
+/// 注意：`get()` 为比对签名，每次调用仍会做一次 `regions.to_vec()` 小堆分配。
+/// 本缓存省的是大对象，**不是零分配**。
 #[derive(Default)]
 pub struct SliceCache {
     signature: Option<(Vec<RegionBounds>, usize, usize, usize)>,
@@ -150,7 +155,7 @@ mod tests {
     /// 切片不得跨区域，全局序号跨区域连续递增。
     #[test]
     fn grid_keeps_slices_within_their_own_region() {
-        // 两个不相交区域：a=40x40，b=10x10（间隔 ≥2 格）
+        // 两个不相交区域：a=40x40（y 1..41），b=10x10（y 60..70），y 方向相隔 19 格
         let a = RegionBounds { min_x: 1, min_y: 1, max_x: 41, max_y: 41 };
         let b = RegionBounds { min_x: 10, min_y: 60, max_x: 20, max_y: 70 };
         let g = SliceGrid::build(&[a, b], 32);
@@ -170,7 +175,8 @@ mod tests {
         assert_eq!(g.slices[4].region_index, 1, "第 5 片应属于第 2 个区域");
     }
 
-    /// 空区域（min >= max）不产生任何切片 —— 退化区域由循环自然跳过。
+    /// 空区域（min >= max）不产生任何切片 —— 由 `build` 内 `is_empty()` 的
+    /// 显式 `continue` 跳过（外层 `while` 的循环条件只是另一层兜底）。
     #[test]
     fn grid_skips_empty_regions() {
         let empty = RegionBounds { min_x: 1, min_y: 1, max_x: 0, max_y: 0 };
@@ -179,6 +185,41 @@ mod tests {
         assert_eq!(g.slices.len(), 1, "空区域应被跳过");
         assert_eq!(g.slices[0].region_index, 1, "唯一切片属于第 2 个区域");
         assert!(SliceGrid::build(&[empty], 32).slices.is_empty());
+    }
+
+    /// `size = 0` 由 `build` 内 `size.max(1)` 兜住：去掉该守卫会让
+    /// `x_end == x` 恒成立 → 内层 `while` 死循环并 OOM。
+    /// 这里验证不挂起，且退化出的 1x1 网格仍完整覆盖区域。
+    #[test]
+    fn grid_clamps_zero_size_to_one() {
+        let b = RegionBounds { min_x: 1, min_y: 1, max_x: 5, max_y: 4 };
+        let g = SliceGrid::build(&[b], 0);
+        // 4x3 = 12 个 1x1 切片
+        assert_eq!(g.slices.len(), 12, "size=0 应钳到 1，4x3 切出 12 片");
+        assert_eq!(
+            (
+                g.slices[0].min_x,
+                g.slices[0].min_y,
+                g.slices[0].max_x,
+                g.slices[0].max_y
+            ),
+            (1, 1, 2, 2),
+            "每个切片应为 1x1"
+        );
+        let mut covered = vec![false; 8 * 8];
+        for s in &g.slices {
+            for y in s.min_y..s.max_y {
+                for x in s.min_x..s.max_x {
+                    assert!(!covered[y * 8 + x], "格 ({x},{y}) 被重复覆盖");
+                    covered[y * 8 + x] = true;
+                }
+            }
+        }
+        for y in b.min_y..b.max_y {
+            for x in b.min_x..b.max_x {
+                assert!(covered[y * 8 + x], "格 ({x},{y}) 未被覆盖");
+            }
+        }
     }
 
     #[test]
@@ -215,5 +256,13 @@ mod tests {
         let b3 = RegionBounds { min_x: 1, min_y: 1, max_x: 71, max_y: 51 };
         let n3 = cache.get(&[b3], 32, 80, 60).slices.len();
         assert_eq!(n3, 6, "70x50 按 32 切应为 3x2=6 片（y 两段 32+18）");
+
+        // 反假绿：上面三个期望值全是 6 —— 一个「签名变了只涨 generation、
+        // 却忘了重建 grid」的坏缓存，前三条断言同样全绿。
+        // 追加一个切片数会变的区域：100x100 按 32 切 = 4 列 x 4 行 = 16 片
+        // （列 [1,33) [33,65) [65,97) [97,101)），返回陈旧网格（6 片）必红。
+        let b4 = RegionBounds { min_x: 1, min_y: 1, max_x: 101, max_y: 101 };
+        let n4 = cache.get(&[b4], 32, 110, 110).slices.len();
+        assert_eq!(n4, 16, "100x100 按 32 切应为 4x4=16 片");
     }
 }
