@@ -271,7 +271,12 @@ mod tests {
                 let u = unsafe { &mut *sd.updated_cells.ptr };
                 u.element_idx.set(cell, 1); // 水
                 u.mass.set(cell, 50.0);
-                u.temperature.set(cell, 20.0 + x as f32 * 3.0 + y as f32 * 1.5);
+                // 温度场刻意取**不整齐**的数值（素数码伪随机），而非简报的平滑梯度。
+                // 平滑梯度下相邻格温差整齐，浮点加法的最低位舍入碰巧可交换，
+                // 导致「贡献施加顺序」无法被任何断言区分（实测：把上/左两块对调，
+                // 全部用例照绿）。换不规则场才能让 `to_bits()` 真正咬住顺序。
+                let t = 20.0 + ((x * 7919 + y * 104729) % 997) as f32 * 0.137;
+                u.temperature.set(cell, t);
                 // insulation 也很关键：默认 0 → iv = 0 → `combine_conductivity`
                 // 走 `min(k_a, k_b)` 分支得到 0 → 换热恒 0，测试同样假绿。
                 // 取 255（与 `c2_physics` 既有 pair 测试同值）：f32 下 iv 舍入为 ≥1.0，
@@ -407,5 +412,53 @@ mod tests {
         let b = RegionBounds { min_x: 0, min_y: 0, max_x: 2, max_y: 2 };
         run_temperature_sliced_serial(&mut tiny, &[b], DEFAULT_SLICE_SIZE);
         bit_eq_cells(&tiny_expect, &tiny);
+    }
+
+    /// 多区域（互不相邻）：`is_owned` 跨区域判定的常规情形。
+    /// 简报只给了单区域用例，而 `run_temperature_sliced_serial` 的签名收的是
+    /// `&[RegionBounds]` —— 补上多区域覆盖。
+    #[test]
+    fn sliced_serial_matches_for_two_separated_regions() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        let a = RegionBounds { min_x: 5, min_y: 5, max_x: 15, max_y: 35 };
+        let b = RegionBounds { min_x: 18, min_y: 5, max_x: 28, max_y: 35 };
+        let mut serial = make_sim(40, 40);
+        let mut sliced = make_sim(40, 40);
+        let pristine = make_sim(40, 40);
+        crate::c2_physics::temperature::run_temperature_task(&mut serial, a);
+        crate::c2_physics::temperature::run_temperature_task(&mut serial, b);
+        run_temperature_sliced_serial(&mut sliced, &[a, b], DEFAULT_SLICE_SIZE);
+        assert_work_happened(&pristine, &serial, 200);
+        bit_eq_cells(&serial, &sliced);
+    }
+
+    /// 多区域且**紧贴相邻**（A 的右边界 x=15 就是 B 的左边界）—— 已知最微妙的情形。
+    ///
+    /// 此时跨区域配对 (14,15) 存在，且两侧施加顺序**确实不同**：
+    ///   - 串行：区域 A 先跑，格 14 的右对把两半都写了（含格 15）；
+    ///     随后区域 B 跑到格 15 时再叠加它自己的上/左贡献。
+    ///   - 切片：格 15 在 B 的切片里，先加上贡献、再加来自格 14 的左贡献。
+    /// 即「右 halo 那半」与「左那半」的先后与串行相反。
+    ///
+    /// 实测两者位模式仍一致 —— 因为贡献量级远小于格温度，两次 f32 加法
+    /// 的中间舍入恰好不落到舍入边界上（把上/左两块对调，全部用例照绿，
+    /// 可见此处顺序差异在 f32 下不可观测）。
+    ///
+    /// ⚠️ 因此本用例是**回归护栏**而非顺序正确性的证明：它保证多区域路径
+    /// 不写错格、不漏写，但不保证与串行逐位相同的原因不是「碰巧」。
+    /// 任务 5 若改为并行/乱序调度，此处的顺序假设需重新论证。
+    #[test]
+    fn sliced_serial_matches_for_two_adjacent_regions() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        let a = RegionBounds { min_x: 5, min_y: 5, max_x: 15, max_y: 35 };
+        let b = RegionBounds { min_x: 15, min_y: 5, max_x: 25, max_y: 35 };
+        let mut serial = make_sim(40, 40);
+        let mut sliced = make_sim(40, 40);
+        let pristine = make_sim(40, 40);
+        crate::c2_physics::temperature::run_temperature_task(&mut serial, a);
+        crate::c2_physics::temperature::run_temperature_task(&mut serial, b);
+        run_temperature_sliced_serial(&mut sliced, &[a, b], DEFAULT_SLICE_SIZE);
+        assert_work_happened(&pristine, &serial, 200);
+        bit_eq_cells(&serial, &sliced);
     }
 }
