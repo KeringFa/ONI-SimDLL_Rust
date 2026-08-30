@@ -12,6 +12,8 @@ pub mod d1_activity;
 pub mod d2_thread;
 #[cfg(feature = "d3-rayon")]
 pub mod d3_rayon;
+#[cfg(feature = "d4-slice")]
+pub mod d4_slice;                 // 新增
 
 pub mod globals {
     //! 全局静态变量，对应原版 simDLL 的全局状态。

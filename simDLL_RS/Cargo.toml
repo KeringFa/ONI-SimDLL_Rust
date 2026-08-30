@@ -33,6 +33,9 @@ rayon = { version = "1", optional = true }
 [features]
 default = []
 d3-rayon = ["dep:rayon"]
+# d4-slice 依赖 d3-rayon：两条路线共用同一个 rayon 持久池，
+# 避免各建一个池造成嵌套池争抢（项目既有设计目标）。
+d4-slice = ["d3-rayon"]
 
 [profile.release]
 panic = "abort"
