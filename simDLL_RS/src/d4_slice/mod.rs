@@ -3,13 +3,10 @@
 //! feature "d4-slice" 门控；不带 feature 编译即 v1 稳定版。
 //! 设计规格见 simDLL_RS/docs/superpowers/specs/2026-08-30-d4-slice-design.md。
 
-// ⚠️ 本任务**不要**在这里写 `pub mod temperature;`。
-// 该文件由任务 4 创建，届时由它在本文件补一行声明
-// （脚手架折进需要它的那个任务，避免提交空占位文件）。
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod slice_grid;
+pub mod temperature;
 
 /// 启用切片所需的最小物理核数。低于此值自动回退现有路径。
 pub const MIN_SLICE_CORES: usize = 4;
