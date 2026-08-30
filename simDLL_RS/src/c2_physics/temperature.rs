@@ -640,46 +640,74 @@ fn surface_multiplier_backwall(this: &ElementTemperatureData, other_state: u8) -
 }
 
 /// UpdateTemperature（原版 L133737-134004）：读 `cells` 稳定缓冲，写 `updatedCells` 增量 + [1,10000] 钳制。
+///
+/// 现为 [`compute_pair_delta`] + [`apply_delta`] 的薄封装（D4 拆分，行为不变）。
 pub(crate) fn update_temperature_pair(sim: &mut SimData, cell_a: usize, cell_b: usize) {
-    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
-        return;
+    // 原函数不判边界门控（由调用方 `run_temperature_band` 的 col+1/row+1 判断负责），
+    // 此处沿用：boundary_ok = true。
+    if let Some((da, db)) = compute_pair_delta(sim, cell_a, cell_b, true) {
+        apply_delta(sim, cell_a, da);
+        apply_delta(sim, cell_b, db);
     }
+}
+
+/// 计算一对格子间的温度交换增量。**只读 `sim.cells` 不可变快照**，无副作用。
+///
+/// `boundary_ok` 由调用方传入 —— 边界门控按方向而异，不能统一套用；
+/// `|ΔT| >= 1` 与 `pair_allowed` 两道数值门控在本函数内部判定。
+///
+/// 返回 `(delta_a, delta_b)`；门控不通过返回 `None`。
+pub(crate) fn compute_pair_delta(
+    sim: &SimData,
+    a: usize,
+    b: usize,
+    boundary_ok: bool,
+) -> Option<(f32, f32)> {
+    if !boundary_ok {
+        return None;
+    }
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return None;
+    }
+    if !pair_allowed(sim, a, b) {
+        return None;
+    }
+
     let (t_a, t_b, hc_a, hc_b, k_total) = {
         let c = unsafe { &*sim.cells.ptr };
-        if cell_a >= c.temperature.len() || cell_b >= c.temperature.len() {
-            return;
+        if a >= c.temperature.len() || b >= c.temperature.len() {
+            return None;
         }
-        let (elem_a, elem_b) = (c.element_idx.get(cell_a), c.element_idx.get(cell_b));
+        let (t_a, t_b) = (c.temperature.get(a), c.temperature.get(b));
+        if (t_a - t_b).abs() < 1.0 {
+            return None;
+        }
+        let (elem_a, elem_b) = (c.element_idx.get(a), c.element_idx.get(b));
         let (Some(etd_a), Some(etd_b)) = (
             get_element_temperature_data(elem_a),
             get_element_temperature_data(elem_b),
         ) else {
-            return;
+            return None;
         };
         let (hc_a, hc_b) = (
-            c.mass.get(cell_a) * etd_a.specific_heat_capacity,
-            c.mass.get(cell_b) * etd_b.specific_heat_capacity,
+            c.mass.get(a) * etd_a.specific_heat_capacity,
+            c.mass.get(b) * etd_b.specific_heat_capacity,
         );
         if hc_a <= 0.0 || hc_b <= 0.0 {
-            return;
+            return None;
         }
         let k = combine_conductivity(
-            c.insulation.get(cell_a),
+            c.insulation.get(a),
             etd_a.thermal_conductivity,
-            c.insulation.get(cell_b),
+            c.insulation.get(b),
             etd_b.thermal_conductivity,
         );
         let mult_a = surface_multiplier_pair(&etd_a, etd_b.state);
         let mult_b = surface_multiplier_pair(&etd_b, etd_a.state);
-        (
-            c.temperature.get(cell_a),
-            c.temperature.get(cell_b),
-            hc_a,
-            hc_b,
-            k * mult_a * mult_b,
-        )
+        (t_a, t_b, hc_a, hc_b, k * mult_a * mult_b)
     };
-    // 原版约定：冷侧在前（T_a ≤ T_b）调用 precise；否则 swapped 后映射回 (new_cell, new_neighbor)
+
+    // 原版约定：冷侧在前（T_a ≤ T_b）调用 precise；否则 swapped 后映射回
     let (new_a, new_b) = if t_a <= t_b {
         calculate_temperature_exchange_precise(0.25, k_total, 0.2, t_a, hc_a, t_b, hc_b)
     } else {
@@ -687,15 +715,26 @@ pub(crate) fn update_temperature_pair(sim: &mut SimData, cell_a: usize, cell_b: 
             calculate_temperature_exchange_precise(0.25, k_total, 0.2, t_b, hc_b, t_a, hc_a);
         (na, nb)
     };
+
+    let c = unsafe { &*sim.cells.ptr };
+    Some((new_a - c.temperature.get(a), new_b - c.temperature.get(b)))
+}
+
+/// 把 `delta` 累加进**一个**格子。调用方保证该格子归自己所有。
+///
+/// 钳制 `[1.0, 10000.0]` 与串行版 `update_temperature_pair` 的逐次钳制一致
+/// （串行也是每次应用后钳制，不是累加完再钳）。
+pub(crate) fn apply_delta(sim: &mut SimData, cell: usize, delta: f32) {
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
+    }
     unsafe {
         let u = &mut *sim.updated_cells.ptr;
-        let c = &*sim.cells.ptr;
-        let mut va = (new_a - c.temperature.get(cell_a)) + u.temperature.get(cell_a);
-        va = va.max(1.0).min(10000.0);
-        u.temperature.set(cell_a, va);
-        let mut vb = (new_b - c.temperature.get(cell_b)) + u.temperature.get(cell_b);
-        vb = vb.max(1.0).min(10000.0);
-        u.temperature.set(cell_b, vb);
+        if cell >= u.temperature.len() {
+            return;
+        }
+        let v = delta + u.temperature.get(cell);
+        u.temperature.set(cell, v.max(1.0).min(10000.0));
     }
 }
 
@@ -1549,6 +1588,75 @@ mod tests {
         let d2 = unsafe { (*sd2.updated_cells.ptr).temperature.get(14) } - 300.0;
         assert!(d1 > 0.0 && d2 > 0.0);
         assert!((d2 / d1 - 10.0).abs() < 0.5, "倍率未生效：d1={d1} d2={d2}");
+    }
+
+    /// 成对换热等价性测试用的格号（6×6 世界内部格，与上面两个 pair 测试同格）。
+    const CELL: usize = 14;
+
+    /// 构造一份「格 14 = 液态水 300℃、格 15 = 固态砖 400℃、ins=255」的 sim。
+    /// 会重置全局元素表（其他测试可能改过倍率），保证入参确定。
+    fn make_temperature_pair_sim() -> SimData {
+        init_pair_table();
+        let mut sd = make_sim();
+        fill_pair_cells(
+            &mut sd,
+            &[(CELL, 1, 100.0, 300.0, 255), (CELL + 1, 2, 200.0, 400.0, 255)],
+        );
+        sd
+    }
+
+    #[test]
+    fn split_pair_helpers_match_original() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        let mut a = make_temperature_pair_sim();
+        let mut b = make_temperature_pair_sim();
+
+        // 原函数
+        update_temperature_pair(&mut a, CELL, CELL + 1);
+
+        // 拆分后等价
+        if let Some((da, db)) = compute_pair_delta(&b, CELL, CELL + 1, true) {
+            apply_delta(&mut b, CELL, da);
+            apply_delta(&mut b, CELL + 1, db);
+        }
+
+        let ua = unsafe { &*a.updated_cells.ptr };
+        let ub = unsafe { &*b.updated_cells.ptr };
+        assert_eq!(
+            ua.temperature.get(CELL).to_bits(),
+            ub.temperature.get(CELL).to_bits()
+        );
+        assert_eq!(
+            ua.temperature.get(CELL + 1).to_bits(),
+            ub.temperature.get(CELL + 1).to_bits()
+        );
+
+        // 防假绿：两侧同时变成空操作时上面两条也会"相等"，此处确认确实发生了换热
+        let t0 = unsafe { (*a.cells.ptr).temperature.get(CELL) };
+        let t1 = unsafe { (*a.updated_cells.ptr).temperature.get(CELL) };
+        assert_ne!(t0.to_bits(), t1.to_bits(), "未发生换热，等价性比对无意义");
+    }
+
+    /// `apply_delta` 必须是「每次应用后钳制」，不是「累加完再钳」。
+    /// 上面的等价性用例（300/400℃）碰不到钳制边界，这里单独锁死该语义。
+    #[test]
+    fn apply_delta_clamps_on_every_application() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_pair_table();
+        let mut sd = make_sim();
+        fill_pair_cells(
+            &mut sd,
+            &[(20, 1, 100.0, 500.0, 255), (21, 1, 100.0, 500.0, 255)],
+        );
+        // 格 20：+20000 → 20500 钳到 10000；再 -20000 → -10000 钳到 1.0。
+        // 若改成"累加完再钳"，这里会得到 500.0（未越界），从而暴露回归。
+        apply_delta(&mut sd, 20, 20000.0);
+        assert_eq!(unsafe { (*sd.updated_cells.ptr).temperature.get(20) }, 10000.0);
+        apply_delta(&mut sd, 20, -20000.0);
+        assert_eq!(unsafe { (*sd.updated_cells.ptr).temperature.get(20) }, 1.0);
+        // 格 21：单次大幅降温，下界钳制
+        apply_delta(&mut sd, 21, -20000.0);
+        assert_eq!(unsafe { (*sd.updated_cells.ptr).temperature.get(21) }, 1.0);
     }
 
     #[test]
