@@ -141,8 +141,30 @@ fn process_cell(
 
 /// 切片化的温度阶段（**串行执行版**，用于验证逻辑复刻正确性）。
 ///
-/// 与 `run_temperature_task(sim, region)` 逐位等价；任务 5 接并行时只改外层调度，
-/// `process_cell` 不用动。
+/// 与 `run_temperature_task(sim, region)` 逐位等价。
+///
+/// # 唯一写入者，及其不覆盖的两件事（任务 5 接并行前必读，详见报告 §8）
+///
+/// 对任意格 Y，可能的写入者只有 Y 自己、L=Y-1、U=Y-w 三处：
+/// Y 被拥有时 L/U 都跳过（只有 Y 自己写）；Y 未被拥有时，若 L 与 U 同时落在某区域内，
+/// 取交集可推出 Y 也在区域内，与前提矛盾 → L、U 至多一个写入者。
+/// 角格 (max_x, max_y) 无人写，与串行一致。而且格 X 的五笔贡献全部在 X 自己的
+/// `process_cell` 调用内完成、值全部来自不可变快照，halo 只被写一次 ——
+/// 所以**连切片执行顺序都不重要**（`SliceGrid::build` 换成列主序也不改变任何一格的写入序列）。
+///
+/// 因此 `process_cell` 本身不用改，只改外层调度即可。但上述论证**没有**覆盖：
+///
+/// **(a) `sim_events` 是共享副作用汇。** 本函数守卫特意查了它的空指针，正是因为背墙换热
+/// （`emit_backwall_should_transition`）与状态转换（`push_substance_change` /
+/// `emit_cell_melted`）都会往里追加。并行后多线程并发追加 = 数据竞争；
+/// 即便加锁，**事件顺序**也会随调度变化，而顺序是下游可观测的
+/// （`SimEvents` 各字段是只增长的 `MsvcVector`，不是环形缓冲）。
+/// 建议：切片内先缓冲，再按 `SliceBounds::index` 定序合并。
+///
+/// **(b) 区域必须两两不交。** 上面的证明依赖这一点：区域一旦重叠，重叠格同时「被拥有」，
+/// 两个切片会各自 `process_cell` 它 → 两个写入者 → 竞争。
+/// 而 `regions: &[RegionBounds]` 收什么照单全收、`is_owned` 用的是 `.any()`，
+/// 不会自己发现重叠。本函数**不做**去重也不做断言，契约由调用方保证。
 pub fn run_temperature_sliced_serial(
     sim: &mut SimData,
     regions: &[RegionBounds],
@@ -271,10 +293,14 @@ mod tests {
                 let u = unsafe { &mut *sd.updated_cells.ptr };
                 u.element_idx.set(cell, 1); // 水
                 u.mass.set(cell, 50.0);
-                // 温度场刻意取**不整齐**的数值（素数码伪随机），而非简报的平滑梯度。
-                // 平滑梯度下相邻格温差整齐，浮点加法的最低位舍入碰巧可交换，
-                // 导致「贡献施加顺序」无法被任何断言区分（实测：把上/左两块对调，
-                // 全部用例照绿）。换不规则场才能让 `to_bits()` 真正咬住顺序。
+                // 温度场刻意取**不整齐**的数值（素数码伪随机），而非简报的平滑梯度：
+                // 平滑梯度下水平 ΔT 恒为 3.0、垂直恒为 1.5，配上全域统一的质量与元素，
+                // 整张图只有两种 delta 量级，数值路径覆盖极窄。换不规则场是为了
+                // 扩大数值路径覆盖。
+                //
+                // ⚠️ 但**施加顺序仍未被任何断言区分**：换场之后把上/左两块对调，
+                // 全部用例照样照绿（见报告 §7.1）。顺序正确性由 §2 的推导保证，
+                // 而非由测试保证 —— 别以为这里测过了。
                 let t = 20.0 + ((x * 7919 + y * 104729) % 997) as f32 * 0.137;
                 u.temperature.set(cell, t);
                 // insulation 也很关键：默认 0 → iv = 0 → `combine_conductivity`
@@ -282,6 +308,20 @@ mod tests {
                 // 取 255（与 `c2_physics` 既有 pair 测试同值）：f32 下 iv 舍入为 ≥1.0，
                 // 走几何平均分支，导率非零。
                 u.insulation.set(cell, 255);
+
+                // 背墙层：不设就是又一个静默空转口袋。
+                // `BackwallSOA::with_size` 把 mass / temperature 全零初始化
+                // （`a_framework/sim_data.rs:162-163`），而 `process_cell` 的背墙门控
+                // 要求 `bw.mass > 0` —— 不设的话背墙分支在全部用例里一次都不会进，
+                // 而 `assert_work_happened` 靠配对换热就能达标，检测不到它。
+                {
+                    let bw = unsafe { &mut *sd.backwall.ptr };
+                    bw.element_idx.set(cell, 2); // 冰（非真空/void，否则门控内直接 return）
+                    bw.mass.set(cell, 200.0);
+                    // 背墙温度取与水温不同的一套伪随机值，保证 |ΔT| 显著、换热非零
+                    bw.temperature
+                        .set(cell, 5.0 + ((x * 6151 + y * 8191) % 631) as f32 * 0.173);
+                }
             }
         }
         // 温度阶段读 `cells`（不可变快照），必须先同步一次
@@ -289,7 +329,12 @@ mod tests {
         sd
     }
 
-    /// 逐位比对两个 SimData 的 `updated_cells`（温度阶段只写这里）。
+    /// 逐位比对温度阶段的**全部**可观测输出。
+    ///
+    /// 温度阶段不只写 `updated_cells`，还会写 `backwall.temperature`，
+    /// 并往共享的 `sim_events` 队列追加条目 —— 三者都要比，
+    /// 否则少比的那一项就是又一个静默空转口袋（背墙正是这么漏掉的，见报告 §I-2）。
+    ///
     /// `f32` 一律走 `to_bits()` —— 浮点加法不可结合，任何一次写入顺序或
     /// 归属判定的偏差都会在某个格子上暴露成位模式差异。
     fn bit_eq_cells(a: &SimData, b: &SimData) {
@@ -314,6 +359,116 @@ mod tests {
                 ub.disease_count.get(i),
                 "disease_count 第 {i} 格"
             );
+        }
+        bit_eq_backwall(a, b);
+        // 顺序不比 —— 归属任务 6，见 `bit_eq_events` 的 doc 与
+        // `event_order_matches_serial_pending_task6`。
+        bit_eq_events(a, b, false);
+    }
+
+    /// 背墙层：`update_temperature_for_backwall` 直接写 `backwall.temperature`
+    /// （不是增量，是覆盖），`updated_cells` 比对覆盖不到它。
+    fn bit_eq_backwall(a: &SimData, b: &SimData) {
+        let ba = unsafe { &*a.backwall.ptr };
+        let bb = unsafe { &*b.backwall.ptr };
+        let n = ba.temperature.len();
+        assert_eq!(n, bb.temperature.len(), "backwall 尺寸不同");
+        for i in 0..n {
+            assert_eq!(
+                ba.temperature.get(i).to_bits(),
+                bb.temperature.get(i).to_bits(),
+                "backwall.temperature 第 {i} 格不一致"
+            );
+            assert_eq!(
+                ba.mass.get(i).to_bits(),
+                bb.mass.get(i).to_bits(),
+                "backwall.mass 第 {i} 格不一致"
+            );
+            assert_eq!(
+                ba.element_idx.get(i),
+                bb.element_idx.get(i),
+                "backwall.element_idx 第 {i} 格不一致"
+            );
+        }
+    }
+
+    /// 共享事件队列（对应报告 §I-3(a)）。
+    ///
+    /// 温度阶段会往 `sim_events` 追加三类条目：`substance_change_info`
+    /// （`do_state_transition` → `push_substance_change`）、`cell_melted_info`、
+    /// `backwall_should_transition_info`（背墙越界）。
+    /// `SimEvents` 各字段是**只增长的 MsvcVector**，不是环形缓冲 ——
+    /// 所以条数与**顺序**都可观测。
+    ///
+    /// # `check_order` 为什么是参数，而不是恒为 true
+    ///
+    /// 事件的**内容**（哪些格发了什么）是本任务的职责，恒被严格守住（集合相等：
+    /// 不能多也不能少）。而事件的**追加顺序**当前**必然**与串行不同，且这不是缺陷：
+    ///
+    /// - 串行版 `run_temperature_band` 按行主序扫全区域 → 事件按 `cell_idx` 递增追加
+    /// - 切片版按「切片序 × 切片内行主序」 → 跨切片边界的格整批延后
+    ///
+    /// 实测（40 宽网格、切片 32）：`x >= 33` 的格（cell 35/36/37/74/75/113…）
+    /// 被堆到序列末尾，**内容逐条一致、位置不同**。
+    ///
+    /// 这正是任务 6「事件缓冲与定序合并」要解决的问题（每切片一份 `RegionEvents`，
+    /// 按 `SliceBounds::index` 定序 `merge_into`）。所以顺序断言归属任务 6，
+    /// 由 `event_order_matches_serial_pending_task6` 承载（当前 `#[ignore]`）。
+    ///
+    /// 条目类型只 derive 了 `Clone/Copy/Default`（无 `PartialEq`），
+    /// 故逐字段取值后再比。
+    fn bit_eq_events(a: &SimData, b: &SimData, check_order: bool) {
+        let ea = unsafe { &*a.sim_events.ptr };
+        let eb = unsafe { &*b.sim_events.ptr };
+
+        let subst = |e: &crate::a_framework::sim_events::SimEvents| {
+            (0..e.substance_change_info.len())
+                .map(|i| {
+                    let s = e.substance_change_info.get(i);
+                    (s.cell_idx, s.old_element_idx, s.new_element_idx)
+                })
+                .collect::<Vec<_>>()
+        };
+        let melted = |e: &crate::a_framework::sim_events::SimEvents| {
+            (0..e.cell_melted_info.len())
+                .map(|i| e.cell_melted_info.get(i).game_cell)
+                .collect::<Vec<_>>()
+        };
+        let bw_tr = |e: &crate::a_framework::sim_events::SimEvents| {
+            (0..e.backwall_should_transition_info.len())
+                .map(|i| e.backwall_should_transition_info.get(i).game_cell)
+                .collect::<Vec<_>>()
+        };
+
+        if check_order {
+            // 严格序列相等：条数、内容、**顺序**全都要一致。任务 6 完成后才应成立。
+            assert_eq!(subst(ea), subst(eb), "substance_change_info 序列不一致（含顺序）");
+            assert_eq!(melted(ea), melted(eb), "cell_melted_info 序列不一致（含顺序）");
+            assert_eq!(
+                bw_tr(ea),
+                bw_tr(eb),
+                "backwall_should_transition_info 序列不一致（含顺序）"
+            );
+        } else {
+            // 集合相等：条数与内容严格一致，仅容忍追加顺序不同。
+            // 排序后比对**不会**放过「多一条」「少一条」「某条字段不同」——
+            // 只放过「同一批条目的排列不同」这一种差异。
+            // 用宏而非闭包：三类条目的元素类型各不相同，闭包无法泛型。
+            macro_rules! set_eq {
+                ($x:expr, $y:expr, $what:literal) => {{
+                    let (mut xs, mut ys) = ($x, $y);
+                    xs.sort();
+                    ys.sort();
+                    assert_eq!(
+                        xs,
+                        ys,
+                        concat!($what, " 内容不一致（已按内容排序，与顺序无关）")
+                    );
+                }};
+            }
+            set_eq!(subst(ea), subst(eb), "substance_change_info");
+            set_eq!(melted(ea), melted(eb), "cell_melted_info");
+            set_eq!(bw_tr(ea), bw_tr(eb), "backwall_should_transition_info");
         }
     }
 
@@ -353,6 +508,42 @@ mod tests {
 
         assert_work_happened(&pristine, &serial, 500);
         bit_eq_cells(&serial, &sliced);
+    }
+
+    /// 任务 6 的验收契约，**先写后启用**。
+    ///
+    /// 本任务（5）只保证事件**内容**与串行一致（`bit_eq_events(_, _, false)`，
+    /// 集合相等）。事件的**追加顺序**当前必然不同：串行按行主序追加，
+    /// 切片版按「切片序 × 切片内行主序」追加，跨切片边界的格整批延后
+    /// （实测 40 宽网格、切片 32：cell 35/36/37/74/75/113… 被堆到末尾）。
+    ///
+    /// 任务 6「事件缓冲与定序合并」要让这一条也成立：每切片一份 `RegionEvents`，
+    /// 按 `SliceBounds::index` 定序 `merge_into` 共享队列。
+    ///
+    /// 现在就把断言写死并 `#[ignore]`，是为了不让这个契约靠记忆传递 ——
+    /// 任务 6 完成后**删掉 `#[ignore]` 必须直接变绿**，那才算真做完。
+    /// 验证方式：`cargo test --release --features d4-slice -- --ignored --test-threads=1`
+    #[test]
+    #[ignore = "任务 6（事件缓冲与定序合并）完成后移除本 ignore；当前顺序必然不同，见函数 doc"]
+    fn event_order_matches_serial_pending_task6() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        let mut serial = make_sim(40, 40);
+        let mut sliced = make_sim(40, 40);
+        let pristine = make_sim(40, 40);
+        let bounds = RegionBounds { min_x: 1, min_y: 1, max_x: 39, max_y: 39 };
+
+        crate::c2_physics::temperature::run_temperature_task(&mut serial, bounds);
+        run_temperature_sliced_serial(&mut sliced, &[bounds], DEFAULT_SLICE_SIZE);
+
+        // 反假绿：若这一趟没产生任何事件，顺序断言恒真 —— 那本用例毫无意义。
+        let ev = unsafe { &*serial.sim_events.ptr };
+        assert!(
+            ev.substance_change_info.len() > 0,
+            "串行侧未产生 substance_change_info，本用例退化为空断言"
+        );
+
+        assert_work_happened(&pristine, &serial, 500);
+        bit_eq_events(&serial, &sliced, true);
     }
 
     /// 参数化：切片尺寸 16 / 32 / 64 各跑一遍逐位一致，
