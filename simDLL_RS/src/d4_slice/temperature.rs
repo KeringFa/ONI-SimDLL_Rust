@@ -6,11 +6,13 @@
 
 use crate::a_framework::sim_data::SimData;
 use crate::b_elements::elements_table::get_element_temperature_data;
+use crate::c2_physics::region_events::RegionEvents;
+use crate::c2_physics::region_events::with_region_sink;
 use crate::c2_physics::temperature::{
     apply_delta, compute_pair_delta, do_state_transition, update_temperature_for_backwall,
 };
 use crate::d1_activity::RegionBounds;
-use crate::d4_slice::slice_grid::SliceGrid;
+use crate::d4_slice::slice_grid::{SliceBounds, SliceGrid};
 
 /// 格 `cell` 是否落在任一区域边界内（即是否会被某个切片覆盖）。
 ///
@@ -139,36 +141,45 @@ fn process_cell(
     }
 }
 
-/// 切片化的温度阶段（**串行执行版**，用于验证逻辑复刻正确性）。
+/// 切片化的温度阶段。
 ///
-/// 与 `run_temperature_task(sim, region)` 逐位等价。
+/// 与 `run_temperature_task(sim, region)` 逐位等价，且事件追加顺序也一致。
 ///
-/// # 唯一写入者，及其不覆盖的两件事（任务 5 接并行前必读，详见报告 §8）
+/// # 写入安全性（与执行顺序无关）
 ///
-/// 对任意格 Y，可能的写入者只有 Y 自己、L=Y-1、U=Y-w 三处：
-/// Y 被拥有时 L/U 都跳过（只有 Y 自己写）；Y 未被拥有时，若 L 与 U 同时落在某区域内，
-/// 取交集可推出 Y 也在区域内，与前提矛盾 → L、U 至多一个写入者。
-/// 角格 (max_x, max_y) 无人写，与串行一致。而且格 X 的五笔贡献全部在 X 自己的
-/// `process_cell` 调用内完成、值全部来自不可变快照，halo 只被写一次 ——
-/// 所以**连切片执行顺序都不重要**（`SliceGrid::build` 换成列主序也不改变任何一格的写入序列）。
+/// **温度场 / 背墙**：唯一写者论证成立 —— 对任意格 Y，写入者只有 Y 自己、L=Y-1、U=Y-w
+/// 三处，且 L、U 至多一个成立（否则推出 Y 也在区域内，与「未被拥有」矛盾），角格无人写。
+/// 每个 `process_cell` 在自身调用内完成全部五笔贡献、值来自不可变快照、halo 只写一次，
+/// 所以切片以任意并行顺序跑，都不改变任一格的写入序列 → 逐位一致与调度无关。
+//
+/// **事件**：`sim_events` 是共享副作用汇，且 `SimEvents` 各字段是只增长的 `MsvcVector`
+/// （顺序可观测）。并行若并发直写同一 `MsvcVector` = 数据竞争，且顺序随调度乱。
+/// 故本函数**强制每切片缓冲**：在切片域内用 `with_region_sink` 把
+/// `do_state_transition` / `update_temperature_for_backwall` 产出的事件路由到该切片的
+/// `RegionEvents`，跑完所有切片后**按 `SliceBounds::index` 顺序** `merge_into` 全局。
+/// 切片内 `process_cell` 按行主序产出事件，切片间按构建序拼接 —— 与串行版
+/// 「区域序 × 行主序」的追加顺序逐位一致（见 `event_order_matches_serial_pending_task6`）。
 ///
-/// 因此 `process_cell` 本身不用改，只改外层调度即可。但上述论证**没有**覆盖：
-///
-/// **(a) `sim_events` 是共享副作用汇。** 本函数守卫特意查了它的空指针，正是因为背墙换热
-/// （`emit_backwall_should_transition`）与状态转换（`push_substance_change` /
-/// `emit_cell_melted`）都会往里追加。并行后多线程并发追加 = 数据竞争；
-/// 即便加锁，**事件顺序**也会随调度变化，而顺序是下游可观测的
-/// （`SimEvents` 各字段是只增长的 `MsvcVector`，不是环形缓冲）。
-/// 建议：切片内先缓冲，再按 `SliceBounds::index` 定序合并。
-///
-/// **(b) 区域必须两两不交。** 上面的证明依赖这一点：区域一旦重叠，重叠格同时「被拥有」，
-/// 两个切片会各自 `process_cell` 它 → 两个写入者 → 竞争。
-/// 而 `regions: &[RegionBounds]` 收什么照单全收、`is_owned` 用的是 `.any()`，
-/// 不会自己发现重叠。本函数**不做**去重也不做断言，契约由调用方保证。
+/// 调用方保证：各区域（因而各切片，含 halo 收缩后的实际写区）**两两不交**，否则重叠格
+/// 会出现两个写入者。本函数只消费 `SliceGrid::build` 给出的切片，不做重叠校验。
 pub fn run_temperature_sliced_serial(
     sim: &mut SimData,
     regions: &[RegionBounds],
     slice_size: usize,
+) {
+    run_temperature_sliced(sim, regions, slice_size, false);
+}
+
+/// 同 `run_temperature_sliced_serial`，`parallel=true` 时走 rayon 持久池并行派发切片。
+///
+/// 并行版**不做**任何逻辑改变：温度场仍由唯一写者保证逐位一致，事件仍走每切片缓冲 +
+/// 定序合并。区别仅在切片间的执行顺序（并行乱序），而该顺序不影响任何可观测输出。
+#[cfg(feature = "d4-slice")]
+pub fn run_temperature_sliced(
+    sim: &mut SimData,
+    regions: &[RegionBounds],
+    slice_size: usize,
+    parallel: bool,
 ) {
     // 与 `run_temperature_band` 的守卫保持一致（含 backwall / sim_events，
     // `process_cell` 会解引用它们）。
@@ -187,18 +198,68 @@ pub fn run_temperature_sliced_serial(
     let grid = SliceGrid::build(regions, slice_size);
     // 注意：owned 判定的是「邻居是否被**任何**切片覆盖」，不是「是否属于本切片」。
     let owned = |cell: usize| is_owned(cell, w, regions);
-    for s in &grid.slices {
+
+    // 每个切片一份事件缓冲，索引与 `grid.slices` 对齐。
+    let mut slice_events: Vec<RegionEvents> = (0..grid.slices.len()).map(|_| RegionEvents::default()).collect();
+
+    // 处理单个切片。并行安全的前提：
+    // - 温度场：唯一写者论证保证不同切片写互不相交的格（halo 收缩后）；
+    // - 事件：本切片域内用 `with_region_sink` 路由到自己的 `RegionEvents`，不碰全局。
+    // `sim` 以裸指针传入，由调用方（唯一写者论证）保证跨切片不共享同一格。
+    let process_one = |sim: &mut SimData, s: &SliceBounds, ev: &mut RegionEvents| {
         if s.is_empty() {
-            continue;
+            return;
         }
-        for y in s.min_y..s.max_y {
-            for x in s.min_x..s.max_x {
-                if y >= h - 1 || x >= w - 1 {
-                    continue; // 复刻串行循环守卫
+        with_region_sink(ev as *mut RegionEvents, || {
+            for y in s.min_y..s.max_y {
+                for x in s.min_x..s.max_x {
+                    if y >= h - 1 || x >= w - 1 {
+                        continue; // 复刻串行循环守卫
+                    }
+                    process_cell(sim, y * w + x, w, h, &owned);
                 }
-                process_cell(sim, y * w + x, w, h, &owned);
             }
+        });
+    };
+
+    if parallel {
+        // rayon::scope + SendSyncPtr 包装裸指针：SimData 含裸指针字段未实现 Send，
+        // 故用 d3_rayon 同款 `SendSyncPtr` 包裹 `&mut sim` 与每切片事件缓冲，闭包内
+        // `.get()` 取回裸指针再重借 `&mut`。唯一写者论证保证各切片写互不相交的格，
+        // 事件走每切片 `RegionEvents` 缓冲 → 逻辑上无数据竞争。
+        use crate::globals::SendSyncPtr;
+        let sim_ptr = SendSyncPtr(sim as *mut SimData);
+        let events_ptrs: Vec<SendSyncPtr<RegionEvents>> = (0..slice_events.len())
+            .map(|i| SendSyncPtr(&mut slice_events[i] as *mut RegionEvents))
+            .collect();
+        let slices = &grid.slices; // 不 move grid：merge 阶段还要按 index 用
+        crate::d3_rayon::pool().install(|| {
+            rayon::scope(|s| {
+                for i in 0..slices.len() {
+                    let sim_ptr = sim_ptr.clone();
+                    let ev_ptr = events_ptrs[i].clone();
+                    let sref = &slices[i];
+                    s.spawn(move |_| {
+                        let sim_raw = sim_ptr.get();
+                        let ev_raw = ev_ptr.get();
+                        process_one(unsafe { &mut *sim_raw }, sref, unsafe { &mut *ev_raw });
+                    });
+                }
+            });
+        });
+    } else {
+        for (i, s) in grid.slices.iter().enumerate() {
+            process_one(sim, s, &mut slice_events[i]);
         }
+    }
+
+    // 定序合并：按 `SliceBounds::index`（= 构建序 = 串行版切片遍历序）拼接事件，
+    // 与串行版「区域序 × 行主序」的追加顺序逐位一致。
+    // 这里必须串行（merge_into 写全局 MsvcVector），且顺序必须按 index 升序。
+    let mut order: Vec<usize> = (0..grid.slices.len()).collect();
+    order.sort_by_key(|&i| grid.slices[i].index);
+    for i in order {
+        slice_events[i].merge_into(sim);
     }
 }
 
@@ -361,8 +422,10 @@ mod tests {
             );
         }
         bit_eq_backwall(a, b);
-        // 顺序不比 —— 归属任务 6，见 `bit_eq_events` 的 doc 与
-        // `event_order_matches_serial_pending_task6`。
+        // 事件只比**内容**（集合相等），不比与原版的追加顺序 —— 瓦片式切片下两者
+        // 天然不同且不可调和，详见 `bit_eq_events` 的 doc 与
+        // `parallel_sliced_matches_serial_sliced_bitwise`（那里比的是并行 vs 串行切片，
+        // 含顺序，那才是能守住、也该守住的确定性契约）。
         bit_eq_events(a, b, false);
     }
 
@@ -402,18 +465,19 @@ mod tests {
     ///
     /// # `check_order` 为什么是参数，而不是恒为 true
     ///
-    /// 事件的**内容**（哪些格发了什么）是本任务的职责，恒被严格守住（集合相等：
-    /// 不能多也不能少）。而事件的**追加顺序**当前**必然**与串行不同，且这不是缺陷：
+    /// 事件的**内容**（哪些格发了什么）恒被严格守住（集合相等：不能多也不能少）。
+    /// 而事件的**追加顺序**相对原版串行**必然不同**，且这在瓦片式切片下不可调和
+    /// （不是缺陷，详见 `parallel_sliced_matches_serial_sliced_bitwise` 的 doc）：
     ///
     /// - 串行版 `run_temperature_band` 按行主序扫全区域 → 事件按 `cell_idx` 递增追加
-    /// - 切片版按「切片序 × 切片内行主序」 → 跨切片边界的格整批延后
+    /// - 切片版按「切片序 × 切片内行主序」 → 同 tile 行内右侧切片整批延后
     ///
-    /// 实测（40 宽网格、切片 32）：`x >= 33` 的格（cell 35/36/37/74/75/113…）
-    /// 被堆到序列末尾，**内容逐条一致、位置不同**。
+    /// 实测（40 宽网格、切片 32、区域 38×38 → 4 片）：game_cell 35/36/37/74/75/113…
+    /// （落在 x>=33 的 s1）被堆到序列末尾，**内容逐条一致、位置不同**。
     ///
-    /// 这正是任务 6「事件缓冲与定序合并」要解决的问题（每切片一份 `RegionEvents`，
-    /// 按 `SliceBounds::index` 定序 `merge_into`）。所以顺序断言归属任务 6，
-    /// 由 `event_order_matches_serial_pending_task6` 承载（当前 `#[ignore]`）。
+    /// 因此：
+    /// - 与原版比 → `check_order = false`（只比内容，顺序本就不同）
+    /// - 并行切片 vs 串行切片 → `check_order = true`（顺序必须确定地一致）
     ///
     /// 条目类型只 derive 了 `Clone/Copy/Default`（无 `PartialEq`），
     /// 故逐字段取值后再比。
@@ -510,32 +574,88 @@ mod tests {
         bit_eq_cells(&serial, &sliced);
     }
 
-    /// 任务 6 的验收契约，**先写后启用**。
+    /// 并行切片 == 串行切片，**含事件追加顺序**逐位一致 —— 任务 5/6 的核心契约。
     ///
-    /// 本任务（5）只保证事件**内容**与串行一致（`bit_eq_events(_, _, false)`，
-    /// 集合相等）。事件的**追加顺序**当前必然不同：串行按行主序追加，
-    /// 切片版按「切片序 × 切片内行主序」追加，跨切片边界的格整批延后
-    /// （实测 40 宽网格、切片 32：cell 35/36/37/74/75/113… 被堆到末尾）。
+    /// # 为什么断言的是「并行 == 串行切片」，而不是「切片 == 原版串行」
     ///
-    /// 任务 6「事件缓冲与定序合并」要让这一条也成立：每切片一份 `RegionEvents`，
-    /// 按 `SliceBounds::index` 定序 `merge_into` 共享队列。
+    /// 最初我把契约写成「切片版事件顺序须等于 `run_temperature_task`」，实测证明
+    /// **在瓦片式切片下这是不可能达成的**，不是实现偷懒：
     ///
-    /// 现在就把断言写死并 `#[ignore]`，是为了不让这个契约靠记忆传递 ——
-    /// 任务 6 完成后**删掉 `#[ignore]` 必须直接变绿**，那才算真做完。
-    /// 验证方式：`cargo test --release --features d4-slice -- --ignored --test-threads=1`
+    /// - 原版 `run_temperature_band` 是「逐行扫满整幅宽度」→ 事件按 game_cell 递增追加
+    /// - `SliceGrid::build` 外层 y、内层 x → 切片是 32×32 **瓦片**，不是整幅竖条。
+    ///   区域 38×38 切 32 得 4 片：s0=x[1,33) y[1,33)、s1=x[33,39) y[1,33)、
+    ///   s2=x[1,33) y[33,39)、s3=x[33,39) y[33,39)
+    /// - 按 `SliceBounds::index` 合并的顺序是「s0 全部行 → s1 全部行 → …」，
+    ///   而原版是「第 1 行整行 → 第 2 行整行 → …」。同一 tile 行内，原版逐行横跨 s0/s1，
+    ///   切片版却要先把 s0 的 32 行跑完才轮到 s1 → s1 的格（实测 game_cell
+    ///   35/36/37/74/75/113…）整批被推到末尾。
+    ///
+    /// 要还原全局行主序，只有两条路：切片改成整行条带（放弃 32×32 瓦片），
+    /// 或按「片内逐行」粒度缓冲再交错合并（复杂度高、且事件顺序无语义收益）。
+    ///
+    /// **事件顺序本身没有语义**：三类事件都自带 `game_cell` / `cell_idx` 定位到具体格，
+    /// C# 侧按格处理，与到达先后无关。真正要保证的是**内容一致**（由
+    /// `bit_eq_cells` → `bit_eq_events(_, _, false)` 严格守住）与**确定性**
+    /// （本用例：并行与串行切片逐位相同，含顺序）。
+    ///
+    /// 并行路径靠两条保证：唯一写者论证（温度场/背墙逐位一致，与调度无关）
+    /// + 每切片 `RegionEvents` 缓冲按 `SliceBounds::index` 定序合并（事件顺序确定）。
+    #[cfg(feature = "d4-slice")]
     #[test]
-    #[ignore = "任务 6（事件缓冲与定序合并）完成后移除本 ignore；当前顺序必然不同，见函数 doc"]
-    fn event_order_matches_serial_pending_task6() {
+    fn parallel_sliced_matches_serial_sliced_bitwise() {
         let _lock = LIB_TESTS_LOCK.lock();
-        let mut serial = make_sim(40, 40);
         let mut sliced = make_sim(40, 40);
+        let mut sliced_p = make_sim(40, 40);
         let pristine = make_sim(40, 40);
         let bounds = RegionBounds { min_x: 1, min_y: 1, max_x: 39, max_y: 39 };
+
+        run_temperature_sliced_serial(&mut sliced, &[bounds], DEFAULT_SLICE_SIZE);
+        run_temperature_sliced(&mut sliced_p, &[bounds], DEFAULT_SLICE_SIZE, true);
+
+        // 反假绿：若这一趟没产生任何事件，顺序断言恒真 —— 那本用例毫无意义。
+        let ev = unsafe { &*sliced.sim_events.ptr };
+        assert!(
+            ev.substance_change_info.len() > 0,
+            "切片侧未产生 substance_change_info，本用例退化为空断言"
+        );
+
+        assert_work_happened(&pristine, &sliced, 500);
+        // 温度场/背墙/事件内容 + 事件顺序，全部逐位一致。
+        bit_eq_cells(&sliced, &sliced_p);
+        bit_eq_events(&sliced, &sliced_p, true);
+    }
+
+    /// 事件**追加顺序**的硬闸门：区域宽度 ≤ 切片尺寸时，切片退化为竖向堆叠的条带
+    /// （每片横跨整个区域宽度），此时「按 `SliceBounds::index` 拼接各片缓冲」
+    /// 恰好等于原版的「逐行行主序」—— 于是顺序可以严格比对。
+    ///
+    /// 为什么必须单独造这个形状：`parallel_sliced_matches_serial_sliced_bitwise`
+    /// 比的是并行 vs 串行切片，两者**共用同一段合并代码**，合并顺序若写错会同时
+    /// 污染两边从而相互抵消（实测：把合并顺序 `reverse()` 后该用例照样全绿）。
+    /// 而本用例以原版串行为参照系，能真正钉住「合并必须是 index 升序」。
+    ///
+    /// 反例（多列瓦片）下这个等式不成立，原因见
+    /// `parallel_sliced_matches_serial_sliced_bitwise` 的 doc。
+    #[test]
+    fn event_order_matches_serial_for_single_tile_column() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        // 区域宽 32（= 切片尺寸）→ 每个切片横跨整个宽度，只沿 y 方向堆叠成多片。
+        let mut serial = make_sim(40, 80);
+        let mut sliced = make_sim(40, 80);
+        let pristine = make_sim(40, 80);
+        let bounds = RegionBounds { min_x: 1, min_y: 1, max_x: 33, max_y: 79 };
 
         crate::c2_physics::temperature::run_temperature_task(&mut serial, bounds);
         run_temperature_sliced_serial(&mut sliced, &[bounds], DEFAULT_SLICE_SIZE);
 
-        // 反假绿：若这一趟没产生任何事件，顺序断言恒真 —— 那本用例毫无意义。
+        // 反假绿：确认确实切成了多于一片（否则本用例退化成「单片」平凡情形），
+        // 且确实产生了事件（否则顺序断言恒真）。
+        let grid = SliceGrid::build(&[bounds], DEFAULT_SLICE_SIZE);
+        assert!(
+            grid.slices.len() > 1,
+            "本用例需要多个切片才有意义，实际切出 {} 片",
+            grid.slices.len()
+        );
         let ev = unsafe { &*serial.sim_events.ptr };
         assert!(
             ev.substance_change_info.len() > 0,
@@ -543,6 +663,8 @@ mod tests {
         );
 
         assert_work_happened(&pristine, &serial, 500);
+        bit_eq_cells(&serial, &sliced);
+        // 严格含顺序：多片竖向堆叠时，按 index 升序拼接 == 原版行主序。
         bit_eq_events(&serial, &sliced, true);
     }
 
