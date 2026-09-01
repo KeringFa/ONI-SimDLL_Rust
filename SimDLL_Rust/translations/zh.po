@@ -33,6 +33,26 @@ msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.HYPERTHREAD_LABEL"
 msgid "Enable Hyper-Threading Optimization"
 msgstr "启用超线程优化"
 
+#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.RESERVED_CORES_LABEL
+msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.RESERVED_CORES_LABEL"
+msgid "Reserve physical thread count"
+msgstr "预留物理线程数量"
+
+#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_ENABLED_LABEL
+msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_ENABLED_LABEL"
+msgid "Enable Temperature Slicing (Experimental)"
+msgstr "启用温度切片并行（实验性）"
+
+#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_SIZE_LABEL
+msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_SIZE_LABEL"
+msgid "Slice size (8-64)"
+msgstr "切片尺寸（8-64）"
+
+#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_HINT
+msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_HINT"
+msgid "Slices the temperature pass into tiles for multi-core parallelization. Disable it if you observe temperature anomalies."
+msgstr "把温度阶段切成瓦片做多核并行。若观察到温度异常可关闭此选项"
+
 #. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.LOG_PATH_HINT
 msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.LOG_PATH_HINT"
 msgid "Logs are saved in the game installation directory by default."

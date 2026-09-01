@@ -63,9 +63,6 @@ namespace SimDLL_Rust
                             if ((flags & LTP_HYPER_THREADING_PRESENT) != 0)
                             {
                                 htCores++;
-                                Debug.Log("[SimDLL_Rust] CpuInfo: HT present, cores="
-                                    + cores + " flags=" + flags);
-                                return true;
                             }
                         }
                         if (size == 0)
@@ -74,8 +71,16 @@ namespace SimDLL_Rust
                         }
                         offset += (int)size;
                     }
-                    Debug.Log("[SimDLL_Rust] CpuInfo: no HT flags (cores=" + cores + ", htCores="
-                        + htCores + ", len=" + len + ")");
+                    // 完整扫描后输出总物理核数（避免"首个命中核序号"被误读为总核数，
+                    // 2026-08-21 玩家反馈 7800X3D 显示 cores=1 的误导修复）。
+                    if (htCores > 0)
+                    {
+                        Debug.Log("[SimDLL_Rust] CpuInfo: HT present, cores=" + cores
+                            + " htCores=" + htCores);
+                        return true;
+                    }
+                    Debug.Log("[SimDLL_Rust] CpuInfo: no HT flags (cores=" + cores
+                        + ", htCores=" + htCores + ", len=" + len + ")");
                     return false;
                 }
                 finally

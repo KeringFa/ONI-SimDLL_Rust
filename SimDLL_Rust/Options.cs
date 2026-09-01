@@ -98,6 +98,12 @@ namespace SimDLL_Rust
             bool currentHt = ModConfig.HyperThreadOptimizationEnabled;
             bool newHt = currentHt;
             bool htAvailable = CpuInfo.HasHyperThreading();
+            int currentReservedCores = ModConfig.ReservedCores;
+            int newReservedCores = currentReservedCores;
+            bool currentSlice = ModConfig.SliceEnabled;
+            bool newSlice = currentSlice;
+            int currentSliceSize = ModConfig.SliceSize;
+            int newSliceSize = currentSliceSize;
 
             dialog.SetHeader(STRINGS.UI.FRONTEND.MOD_OPTIONS.DIALOG_TITLE);
 
@@ -261,6 +267,204 @@ namespace SimDLL_Rust
                 }
             }
 
+            // ===== InputRow：预留物理线程数（1~4，默认 1）=====
+            var reservedRowObj = NewRow(panelObj, "ReservedCoresRow", 24);
+            if (plainTextPrefab != null)
+            {
+                var reservedLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, reservedRowObj, true);
+                var reservedCsf = reservedLabelObj.GetComponent<ContentSizeFitter>();
+                if (reservedCsf != null) reservedCsf.enabled = false;
+                var reservedLabelText = reservedLabelObj.GetComponentInChildren<LocText>();
+                if (reservedLabelText != null)
+                {
+                    reservedLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.RESERVED_CORES_LABEL;
+                    reservedLabelText.alignment = TextAlignmentOptions.Left;
+                    reservedLabelText.raycastTarget = false;
+                }
+                var reservedLabelLE = reservedLabelObj.GetComponent<LayoutElement>()
+                    ?? reservedLabelObj.AddComponent<LayoutElement>();
+                reservedLabelLE.preferredWidth = 300;
+                reservedLabelLE.flexibleWidth = 1;
+            }
+
+            // 输入框：克隆 RailModUploadMenu 的 modVersion（TMP_InputField），
+            // IntegerNumber + 空值回退默认 + 钳制 1~4（套用 Optimize_Steam_Turbine 写法）。
+            TMP_InputField reservedInput = null;
+            var railMenu = screenPrefabs.RailModUploadMenu;
+            if (railMenu != null)
+            {
+                var versionSource = Traverse.Create(railMenu).Field<TMP_InputField>("modVersion").Value;
+                if (versionSource != null)
+                {
+                    var inputClone = Util.KInstantiateUI(versionSource.gameObject, reservedRowObj, true);
+
+                    var inputLe = inputClone.GetComponent<LayoutElement>();
+                    if (inputLe == null) inputLe = inputClone.AddComponent<LayoutElement>();
+                    inputLe.preferredWidth = 80;
+                    inputLe.minWidth = 60;
+
+                    reservedInput = inputClone.GetComponent<TMP_InputField>();
+                    if (reservedInput != null)
+                    {
+                        reservedInput.contentType = TMP_InputField.ContentType.IntegerNumber;
+                        reservedInput.characterLimit = 1;
+                        reservedInput.text = newReservedCores.ToString();
+
+                        var placeholder = reservedInput.placeholder as TextMeshProUGUI;
+                        if (placeholder != null)
+                            placeholder.text = ModConfig.DEFAULT_RESERVED_CORES.ToString();
+
+                        reservedInput.onEndEdit.AddListener(val =>
+                        {
+                            if (string.IsNullOrEmpty(val))
+                            {
+                                newReservedCores = ModConfig.DEFAULT_RESERVED_CORES;
+                                reservedInput.text = newReservedCores.ToString();
+                            }
+                            else if (int.TryParse(val, out int result))
+                            {
+                                newReservedCores = ModConfig.ClampReservedCores(result);
+                                reservedInput.text = newReservedCores.ToString();
+                            }
+                        });
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning("[SimDLL_Rust] modVersion 不可用，预留线程数输入框不可用");
+                }
+            }
+            else
+            {
+                Debug.LogWarning("[SimDLL_Rust] RailModUploadMenu 不可用，预留线程数输入框不可用");
+            }
+
+            // ===== ToggleRow3：启用 D4 温度切片并行（实验性）=====
+            var sliceRowObj = NewRow(panelObj, "SliceToggleRow", 24);
+            if (plainTextPrefab != null)
+            {
+                var sliceLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, sliceRowObj, true);
+                var sliceCsf = sliceLabelObj.GetComponent<ContentSizeFitter>();
+                if (sliceCsf != null) sliceCsf.enabled = false;
+                var sliceLabelText = sliceLabelObj.GetComponentInChildren<LocText>();
+                if (sliceLabelText != null)
+                {
+                    sliceLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_ENABLED_LABEL;
+                    sliceLabelText.alignment = TextAlignmentOptions.Left;
+                    sliceLabelText.raycastTarget = false;
+                }
+                var sliceLabelLE = sliceLabelObj.GetComponent<LayoutElement>()
+                    ?? sliceLabelObj.AddComponent<LayoutElement>();
+                sliceLabelLE.preferredWidth = 300;
+                sliceLabelLE.flexibleWidth = 1;
+            }
+            MultiToggle sliceToggle = null;
+            GameObject sliceCheckboxPrefab = null;
+            try { sliceCheckboxPrefab = Assets.UIPrefabs.TableScreenWidgets.Checkbox; }
+            catch { sliceCheckboxPrefab = null; }
+            if (sliceCheckboxPrefab != null)
+            {
+                sliceToggle = Util.KInstantiateUI<MultiToggle>(sliceCheckboxPrefab, sliceRowObj, true);
+                var le = sliceToggle.gameObject.GetComponent<LayoutElement>()
+                    ?? sliceToggle.gameObject.AddComponent<LayoutElement>();
+                le.preferredWidth = 20;
+                le.preferredHeight = 20;
+                le.minWidth = 20;
+                le.minHeight = 20;
+
+                var sliceToggleImage = Traverse.Create(sliceToggle).Field<Image>("toggle_image").Value;
+                var sliceStates = sliceToggle.states;
+                var sliceNewStates = new ToggleState[sliceStates.Length];
+                for (int i = 0; i < sliceStates.Length; i++)
+                {
+                    sliceNewStates[i] = sliceStates[i];
+                    sliceNewStates[i].use_rect_margins = false;
+                }
+                sliceToggle.states = sliceNewStates;
+                if (sliceToggleImage != null)
+                {
+                    var tiRect = sliceToggleImage.GetComponent<RectTransform>();
+                    tiRect.anchorMin = new Vector2(0.5f, 0.5f);
+                    tiRect.anchorMax = new Vector2(0.5f, 0.5f);
+                    tiRect.pivot = new Vector2(0.5f, 0.5f);
+                    tiRect.anchoredPosition = Vector2.zero;
+                    tiRect.sizeDelta = new Vector2(16, 16);
+                }
+                sliceToggle.onClick = () =>
+                {
+                    newSlice = !newSlice;
+                    sliceToggle.ChangeState(newSlice ? 1 : 0);
+                };
+                sliceToggle.ChangeState(newSlice ? 1 : 0);
+            }
+
+            // ===== InputRow：切片尺寸（8~64，默认 32）=====
+            var sliceSizeRowObj = NewRow(panelObj, "SliceSizeRow", 24);
+            if (plainTextPrefab != null)
+            {
+                var sliceSizeLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, sliceSizeRowObj, true);
+                var sliceSizeCsf = sliceSizeLabelObj.GetComponent<ContentSizeFitter>();
+                if (sliceSizeCsf != null) sliceSizeCsf.enabled = false;
+                var sliceSizeLabelText = sliceSizeLabelObj.GetComponentInChildren<LocText>();
+                if (sliceSizeLabelText != null)
+                {
+                    sliceSizeLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_SIZE_LABEL;
+                    sliceSizeLabelText.alignment = TextAlignmentOptions.Left;
+                    sliceSizeLabelText.raycastTarget = false;
+                }
+                var sliceSizeLabelLE = sliceSizeLabelObj.GetComponent<LayoutElement>()
+                    ?? sliceSizeLabelObj.AddComponent<LayoutElement>();
+                sliceSizeLabelLE.preferredWidth = 300;
+                sliceSizeLabelLE.flexibleWidth = 1;
+            }
+            TMP_InputField sliceSizeInput = null;
+            if (railMenu != null)
+            {
+                var versionSource = Traverse.Create(railMenu).Field<TMP_InputField>("modVersion").Value;
+                if (versionSource != null)
+                {
+                    var inputClone = Util.KInstantiateUI(versionSource.gameObject, sliceSizeRowObj, true);
+                    var inputLe = inputClone.GetComponent<LayoutElement>();
+                    if (inputLe == null) inputLe = inputClone.AddComponent<LayoutElement>();
+                    inputLe.preferredWidth = 80;
+                    inputLe.minWidth = 60;
+
+                    sliceSizeInput = inputClone.GetComponent<TMP_InputField>();
+                    if (sliceSizeInput != null)
+                    {
+                        sliceSizeInput.contentType = TMP_InputField.ContentType.IntegerNumber;
+                        sliceSizeInput.characterLimit = 2;
+                        sliceSizeInput.text = newSliceSize.ToString();
+
+                        var placeholder = sliceSizeInput.placeholder as TextMeshProUGUI;
+                        if (placeholder != null)
+                            placeholder.text = ModConfig.DEFAULT_SLICE_SIZE.ToString();
+
+                        sliceSizeInput.onEndEdit.AddListener(val =>
+                        {
+                            if (string.IsNullOrEmpty(val))
+                            {
+                                newSliceSize = ModConfig.DEFAULT_SLICE_SIZE;
+                                sliceSizeInput.text = newSliceSize.ToString();
+                            }
+                            else if (int.TryParse(val, out int result))
+                            {
+                                newSliceSize = ModConfig.ClampSliceSize(result);
+                                sliceSizeInput.text = newSliceSize.ToString();
+                            }
+                        });
+                    }
+                }
+                else
+                {
+                    Debug.LogWarning("[SimDLL_Rust] modVersion 不可用，切片尺寸输入框不可用");
+                }
+            }
+            else
+            {
+                Debug.LogWarning("[SimDLL_Rust] RailModUploadMenu 不可用，切片尺寸输入框不可用");
+            }
+
             // ===== 下划线 + 提示 =====
             var dividerObj = new GameObject("Divider", typeof(RectTransform));
             dividerObj.transform.SetParent(panelObj.transform, false);
@@ -302,7 +506,23 @@ namespace SimDLL_Rust
                 htHintLE.flexibleWidth = 1;
             }
 
-            // 提示3（红色）：修改设置后需重启游戏生效
+            // 提示3（白色）：D4 温度切片说明
+            if (plainTextPrefab != null)
+            {
+                var sliceHintObj = Util.KInstantiateUI(plainTextPrefab.gameObject, panelObj, true);
+                var sliceHintCsf = sliceHintObj.GetComponent<ContentSizeFitter>();
+                if (sliceHintCsf != null) sliceHintCsf.enabled = false;
+                var sliceHintText = sliceHintObj.GetComponentInChildren<LocText>();
+                if (sliceHintText != null)
+                {
+                    sliceHintText.alignment = TextAlignmentOptions.Left;
+                    sliceHintText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_HINT;
+                }
+                var sliceHintLE = sliceHintObj.GetComponent<LayoutElement>() ?? sliceHintObj.AddComponent<LayoutElement>();
+                sliceHintLE.flexibleWidth = 1;
+            }
+
+            // 提示4（红色）：修改设置后需重启游戏生效
             if (plainTextPrefab != null)
             {
                 var restartObj = Util.KInstantiateUI(plainTextPrefab.gameObject, panelObj, true);
@@ -323,9 +543,14 @@ namespace SimDLL_Rust
             // ===== OK / CANCEL =====
             dialog.AddOption(global::STRINGS.UI.CONFIRMDIALOG.OK, d =>
             {
-                bool changed = newEnabled != currentEnabled || newHt != currentHt;
+                bool changed = newEnabled != currentEnabled || newHt != currentHt
+                    || newReservedCores != currentReservedCores
+                    || newSlice != currentSlice || newSliceSize != currentSliceSize;
                 if (newEnabled != currentEnabled) ModConfig.SetLogEnabled(newEnabled);
                 if (newHt != currentHt) ModConfig.SetHyperThreadOptimizationEnabled(newHt);
+                if (newReservedCores != currentReservedCores) ModConfig.SetReservedCores(newReservedCores);
+                if (newSlice != currentSlice) ModConfig.SetSliceEnabled(newSlice);
+                if (newSliceSize != currentSliceSize) ModConfig.SetSliceSize(newSliceSize);
                 if (changed) ModConfig.Save();
                 d.Deactivate();
                 if (changed)

@@ -22,6 +22,19 @@ namespace SimDLL_Rust
         [DllImport("SimDLL_RS.sim")]
         internal static extern int RS_SetSchedulerMode(int mode);
 
+        /// 设置预留物理线程数（1~4）：留给游戏主线程/系统，D1/D2 并行路径通用。
+        /// 返回实际生效值；非法输入返回 -1。
+        [DllImport("SimDLL_RS.sim")]
+        internal static extern int RS_SetReservedCores(int cores);
+
+        /// 设置 D4 切片并行开关（实验性）。返回 1。
+        [DllImport("SimDLL_RS.sim")]
+        internal static extern int RS_SetSliceEnabled(bool enabled);
+
+        /// 设置 D4 切片边长（8~64，默认 32）。返回实际生效值；非法输入返回 -1。
+        [DllImport("SimDLL_RS.sim")]
+        internal static extern int RS_SetSliceSize(int size);
+
         // ===== Sim API（9）=====
         [DllImport("SimDLL_RS.sim")]
         internal static extern void SIM_Initialize(Sim.GAME_MessageHandler callback);
