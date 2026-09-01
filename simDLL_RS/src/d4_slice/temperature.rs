@@ -12,7 +12,8 @@ use crate::c2_physics::temperature::{
     apply_delta, compute_pair_delta, do_state_transition, update_temperature_for_backwall,
 };
 use crate::d1_activity::RegionBounds;
-use crate::d4_slice::slice_grid::{SliceBounds, SliceGrid};
+use crate::d4_slice::slice_grid::{SliceBounds, SliceCache, SliceGrid};
+use std::cell::RefCell;
 
 /// 处理完某一行时，`RegionEvents` 各向量的长度快照。
 ///
@@ -57,7 +58,6 @@ impl RowMarks {
 ///
 /// 之所以记长度而不是给每行建一个 `RegionEvents`：后者是 8 个 `MsvcVector` 头，
 /// 一个大区域能轻松堆到上百 KB 且每帧重建。长度快照每只行 64 字节。
-/// （TODO: 与 `SliceCache` 一并缓存，彻底消除每帧分配 —— 归任务 7。）
 struct SliceEventBuf {
     events: RegionEvents,
     /// 第 k 项 = 处理完本切片第 k 行（`min_y + k`）后的长度快照。
@@ -67,6 +67,31 @@ struct SliceEventBuf {
 impl SliceEventBuf {
     fn new(rows: usize) -> Self {
         Self { events: RegionEvents::default(), row_marks: Vec::with_capacity(rows) }
+    }
+
+    /// 帧间复用：清空逻辑状态但**保留容量**，供 `SliceEventPool` 缓存复用。
+    ///
+    /// - 事件向量：`clear_keep_capacity`（end = begin，内存保留）—— 与原版
+    ///   `Start` 对 sim_events 的 20 个 vector 的清法一致；
+    /// - 行标记：`Vec::clear` 只清 len，保留 allocation。
+    ///
+    /// ⚠️ 必须在 `acquire`（帧开始）时调用，绝不能在帧末调用：合并阶段
+    /// （`merge_row_into`）还要读 `row_marks` / `events`，提前清空会丢数据。
+    fn reset(&mut self) {
+        macro_rules! seg {
+            ($f:ident) => {
+                self.events.$f.clear_keep_capacity();
+            };
+        }
+        seg!(substance_change_info);
+        seg!(spawn_liquid_info);
+        seg!(spawn_ore_info);
+        seg!(unstable_cell_info);
+        seg!(cell_melted_info);
+        seg!(spawn_fx_info);
+        seg!(world_damage_info);
+        seg!(backwall_should_transition_info);
+        self.row_marks.clear();
     }
 
     /// 把本切片第 `row` 行（相对 `min_y` 的偏移）产出的事件追加进 `dst`。
@@ -256,6 +281,80 @@ pub fn run_temperature_sliced_serial(
     run_temperature_sliced(sim, regions, slice_size, false);
 }
 
+/// 切片工作缓冲池：同时缓存 `SliceGrid` 与每切片事件缓冲，**只缓存容量、不缓存逻辑状态**。
+///
+/// 背景：
+/// 1. `SliceGrid::build` 每帧重建会分配整张切片表（~147 项 `SliceBounds` 的 `Vec`）；
+/// 2. `SliceEventBuf` 的 `RegionEvents`（8 个 `MsvcVector`）与 `row_marks` 每帧重建
+///    会反复分配（大区域单切片就能到上百 KB）。
+///
+/// 本池把两者合并缓存：签名（区域 + 切片尺寸 + 网格尺寸）不变 → 全部复用；
+/// 变化 → grid 与缓冲一起重建。
+///
+/// # 安全性（为什么不会引入逻辑 bug）
+///
+/// 1. **容量 vs 状态分离**：缓存持有的是 allocation，不是逻辑状态。
+///    `acquire` 每次把 8 个事件向量 `clear_keep_capacity()`（end = begin）、
+///    `row_marks.clear()` —— 逻辑状态与新建完全一致，`row_marks` 从空开始重新
+///    push，行区间 `prev..cur` 以本轮实际 push 长度为准，跨帧不可能残留。
+/// 2. **签名重建**：签名与 `SliceGrid::build` 的输入完全一致。区域/尺寸/网格变化
+///    → 切片数变化 → 缓冲池按新切片数重建，旧缓冲不残留。
+/// 3. **并行安全**：rayon 各任务写各自的 `SliceEventBuf`（索引与 `grid.slices`
+///    一一对应），`acquire` 在并行派发之前完成，无并发借用。
+///
+/// 调用方负责在帧末 drop 本池持锁的守卫（`run_temperature_sliced_collect` 结束即
+/// 释放），因此同一时刻只有一个执行流在使用缓冲。
+#[derive(Default)]
+pub struct SliceEventPool {
+    signature: Option<(Vec<RegionBounds>, usize, usize, usize)>,
+    cache: SliceCache,
+    pool: Vec<SliceEventBuf>,
+}
+
+impl SliceEventPool {
+    /// 取回本帧的切片网格 + 每切片事件缓冲（已 reset，可直接使用）。
+    ///
+    /// 返回的 `&SliceGrid` 与 `&mut Vec<SliceEventBuf>` 借用自 `self` 的不同字段，
+    /// 可同时存活；调用方用完即可，池随锁守卫 drop 而让出。
+    pub fn acquire(
+        &mut self,
+        regions: &[RegionBounds],
+        slice_size: usize,
+        width: usize,
+        height: usize,
+    ) -> (&SliceGrid, &mut Vec<SliceEventBuf>) {
+        let sig = (regions.to_vec(), slice_size, width, height);
+        let changed = self
+            .signature
+            .as_ref()
+            .map(|s| *s != sig)
+            .unwrap_or(true);
+        if changed {
+            // 切片数随签名变化 → 缓冲池按新切片数重建（grid 由 cache 管理）。
+            let n = SliceGrid::build(regions, slice_size).slices.len();
+            self.pool = (0..n).map(|_| SliceEventBuf::new(0)).collect();
+            self.signature = Some(sig);
+        }
+        // grid：签名不变则不重建（SliceCache 内部判定）。
+        let grid = self.cache.get(regions, slice_size, width, height);
+        // 帧间复用：清逻辑状态、留容量。必须在任何写入/合并之前执行。
+        for buf in self.pool.iter_mut() {
+            buf.reset();
+        }
+        (grid, &mut self.pool)
+    }
+}
+
+/// 线程本地切片工作缓冲池（`run_temperature_sliced_collect` 跨帧复用）。
+///
+/// 为什么用 `thread_local` 而不是全局 `static`：`SliceEventBuf` 含裸指针
+/// （`MsvcVector` 的 `*mut T`），不是 `Send`，无法放进 `static Mutex`；
+/// 而 sim 是单线程驱动，每线程一个池天然无锁、且避免跨帧全局锁竞争。
+/// 与 `region_events::REGION_EVENTS_SINK` 同款 thread_local 模式。
+thread_local! {
+    static SLICE_EVENT_POOL: RefCell<SliceEventPool> = RefCell::new(SliceEventPool::default());
+}
+
 /// 同 `run_temperature_sliced_serial`，`parallel=true` 时走 rayon 持久池并行派发切片。
 ///
 /// 并行版**不做**任何逻辑改变：温度场仍由唯一写者保证逐位一致，事件仍走每切片缓冲 +
@@ -308,16 +407,29 @@ pub fn run_temperature_sliced_collect(
     if w < 3 || h < 3 {
         return empty();
     }
-    let grid = SliceGrid::build(regions, slice_size);
+    // 取线程本地池（grid + 每切片事件缓冲）。签名不变 → 复用容量；变化 → 重建。
+    // 借用贯穿整个主体（含并行派发与合并），保证缓冲只被本帧一个执行流使用。
+    SLICE_EVENT_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        let (grid, slice_events) = pool.acquire(regions, slice_size, w, h);
+        run_temperature_sliced_collect_with(sim, regions, parallel, grid, slice_events, w, h)
+    })
+}
+
+/// `run_temperature_sliced_collect` 的主体（线程本地池借用已就绪）。
+/// `grid` / `slice_events` 由池提供（签名匹配、容量复用），本函数只消费不持有。
+#[cfg(feature = "d4-slice")]
+fn run_temperature_sliced_collect_with(
+    sim: &mut SimData,
+    regions: &[RegionBounds],
+    parallel: bool,
+    grid: &SliceGrid,
+    slice_events: &mut Vec<SliceEventBuf>,
+    w: usize,
+    h: usize,
+) -> Vec<RegionEvents> {
     // 注意：owned 判定的是「邻居是否被**任何**切片覆盖」，不是「是否属于本切片」。
     let owned = |cell: usize| is_owned(cell, w, regions);
-
-    // 每个切片一份「事件缓冲 + 行边界」，索引与 `grid.slices` 对齐。
-    let mut slice_events: Vec<SliceEventBuf> = grid
-        .slices
-        .iter()
-        .map(|s| SliceEventBuf::new(s.max_y.saturating_sub(s.min_y)))
-        .collect();
 
     // 处理单个切片。并行安全的前提：
     // - 温度场：唯一写者论证保证不同切片写互不相交的格（halo 收缩后）；
@@ -425,6 +537,69 @@ mod tests {
     use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
     use crate::d4_slice::DEFAULT_SLICE_SIZE;
     use crate::LIB_TESTS_LOCK;
+
+    /// 池缓存语义：同签名复用同一份缓冲（容量保留），`reset` 清空逻辑状态。
+    /// 变异对照：若 `reset` 漏清 `row_marks` / 事件向量，第二次 `acquire` 会残留
+    /// 上一帧的行区间 → 合并阶段 `prev..cur` 区间错位 → 事件重复/错位（见下）。
+    #[test]
+    fn pool_reuses_capacity_and_resets_state() {
+        let mut pool = SliceEventPool::default();
+        let regions = [RegionBounds { min_x: 1, min_y: 1, max_x: 71, max_y: 41 }];
+
+        // 第一帧：写一些事件 + 行标记（模拟一帧真实使用）
+        {
+            let (_grid, bufs) = pool.acquire(&regions, DEFAULT_SLICE_SIZE, 80, 50);
+            // 6 片（70x40 → 3x2）；给第 0 片塞 2 行标记与事件
+            assert_eq!(bufs.len(), 6, "70x40 按 32 切应为 6 片");
+            // 先读 events 长度、再 push 行标记 —— 避免同下标同时可变/不可变借用
+            let mark0 = RowMarks::of(&bufs[0].events);
+            let mark1 = RowMarks::of(&bufs[0].events);
+            bufs[0].row_marks.push(mark0);
+            bufs[0].row_marks.push(mark1);
+            unsafe {
+                bufs[0].events.substance_change_info.push(
+                    crate::a_framework::game_data::SubstanceChangeInfo::default(),
+                );
+            }            assert_eq!(bufs[0].row_marks.len(), 2, "第一帧应记 2 行标记");
+            assert_eq!(bufs[0].events.substance_change_info.len(), 1);
+        }
+
+        // 第二帧：同签名 → 复用同一份缓冲（地址稳定），但逻辑状态被清空
+        let (_grid, bufs) = pool.acquire(&regions, DEFAULT_SLICE_SIZE, 80, 50);
+        assert_eq!(bufs.len(), 6);
+        for b in bufs.iter() {
+            assert_eq!(b.row_marks.len(), 0, "reset 应清空行标记");
+            assert_eq!(
+                b.events.substance_change_info.len(),
+                0,
+                "reset 应清空事件向量（保留容量）"
+            );
+        }
+        // 容量保留：row_marks 的 allocation 应仍在（len 0 但 capacity ≥ 2）
+        // 直接验证复用：同一帧连续两次 acquire 不应重建（签名未变）
+        let mut pool2 = SliceEventPool::default();
+        let (_g1, b1) = pool2.acquire(&regions, DEFAULT_SLICE_SIZE, 80, 50);
+        let ptr1 = b1.as_ptr() as usize;
+        let (_g2, b2) = pool2.acquire(&regions, DEFAULT_SLICE_SIZE, 80, 50);
+        let ptr2 = b2.as_ptr() as usize;
+        assert_eq!(ptr1, ptr2, "签名未变应复用同一份缓冲");
+    }
+
+    /// 签名变化（切片数变化）→ 缓冲池重建为新的切片数。
+    #[test]
+    fn pool_rebuilds_when_signature_changes() {
+        let mut pool = SliceEventPool::default();
+        let r_small = [RegionBounds { min_x: 1, min_y: 1, max_x: 41, max_y: 41 }]; // 40x40 → 2x2 = 4 片
+        let r_big = [RegionBounds { min_x: 1, min_y: 1, max_x: 101, max_y: 101 }]; // 100x100 → 4x4 = 16 片
+
+        let (_g, bufs) = pool.acquire(&r_small, DEFAULT_SLICE_SIZE, 110, 110);
+        assert_eq!(bufs.len(), 4);
+        let (_g, bufs) = pool.acquire(&r_big, DEFAULT_SLICE_SIZE, 110, 110);
+        assert_eq!(bufs.len(), 16, "区域变大应重建为 16 片");
+        // 回小：也应重建（签名精确比较，不是只增不减）
+        let (_g, bufs) = pool.acquire(&r_small, DEFAULT_SLICE_SIZE, 110, 110);
+        assert_eq!(bufs.len(), 4, "区域变小应重建回 4 片");
+    }
 
     /// 元素表：dummy(0) / 水(1) / 冰(2) / 蒸汽(3)。
     /// 与 `c2_physics/temperature.rs` 测试中的 `init_phase_table` 一致。

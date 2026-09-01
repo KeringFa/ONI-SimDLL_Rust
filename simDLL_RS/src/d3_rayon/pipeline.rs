@@ -295,6 +295,8 @@ mod tests {
             .map(|r| crate::d1_activity::compute_post_process_bounds(&sd, r))
             .collect();
         let cosmic = vec![0.0f32; 2];
+        // 事件合并前基线：合并是 append，各字段只增不减。
+        let baseline_len = unsafe { &*sd.sim_events.ptr }.substance_change_info.len();
         run_parallel_pipeline(&mut sd, bounds, pp, cosmic, &[], false);
         // 不 panic；液体总质量守恒（两个 100kg 可能在区域内流动，但总量不变）
         unsafe {
@@ -313,11 +315,13 @@ mod tests {
                 "液体总量应守恒 200kg，got {total}"
             );
         }
-        // 事件按区域序合并进全局（可能有 substance_change 事件）
+        // 事件按区域序合并进全局（可能有 substance_change 事件）。
+        // 合并是 append → 各字段只增不减；恒真断言 `len() >= 0` 是假绿（usize 恒 ≥0），
+        // 改为「不倒退」基线对比：若合并路径清空/破坏全局缓冲，此处必红。
         let events = unsafe { &*sd.sim_events.ptr };
         assert!(
-            events.substance_change_info.len() >= 0,
-            "事件合并不应破坏全局缓冲"
+            events.substance_change_info.len() >= baseline_len,
+            "事件合并不应破坏全局缓冲（应只增不减）"
         );
         crate::b_elements::elements_table::DestroyElementsTable();
     }

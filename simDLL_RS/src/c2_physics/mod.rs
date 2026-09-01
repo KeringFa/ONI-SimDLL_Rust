@@ -227,7 +227,7 @@ pub fn update_data(sim_data: &mut SimData) {
             let events = crate::d4_slice::temperature::run_temperature_sliced_collect(
                 sim_data,
                 &bounds_list,
-                crate::d4_slice::DEFAULT_SLICE_SIZE,
+                crate::d4_slice::current_slice_size(),
                 true,
             );
             (true, events)

@@ -3,7 +3,7 @@
 //! feature "d4-slice" 门控；不带 feature 编译即 v1 稳定版。
 //! 设计规格见 simDLL_RS/docs/superpowers/specs/2026-08-30-d4-slice-design.md。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub mod slice_grid;
 pub mod temperature;
@@ -14,8 +14,16 @@ pub const MIN_SLICE_CORES: usize = 4;
 /// 默认切片边长（格）。火箭舱内部世界尺寸同值。
 pub const DEFAULT_SLICE_SIZE: usize = 32;
 
+/// 切片边长允许范围（接口 mod 可配置区间；8..=64 兼顾并行度与任务粒度）。
+pub const MIN_SLICE_SIZE: usize = 8;
+pub const MAX_SLICE_SIZE: usize = 64;
+
 /// 运行时开关。默认 true（实验期），后续接口 mod 适配后改默认 false。
 static SLICE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 运行时切片边长（默认 32，接口 mod 可配置）。用 `AtomicUsize`（非原子 `static mut`），
+/// 与 `SliceEventPool` 的签名比较配合：尺寸变化会自动触发缓冲池重建。
+static SLICE_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_SLICE_SIZE);
 
 pub fn set_slice_enabled(on: bool) -> bool {
     SLICE_ENABLED.store(on, Ordering::Relaxed);
@@ -24,6 +32,22 @@ pub fn set_slice_enabled(on: bool) -> bool {
 
 pub fn slice_enabled() -> bool {
     SLICE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 当前生效的切片边长（clamp 到 `MIN_SLICE_SIZE..=MAX_SLICE_SIZE`）。
+pub fn current_slice_size() -> usize {
+    SLICE_SIZE.load(Ordering::Relaxed).clamp(MIN_SLICE_SIZE, MAX_SLICE_SIZE)
+}
+
+/// 设置切片边长（`MIN_SLICE_SIZE..=MAX_SLICE_SIZE`）。返回实际生效值；非法输入返回 -1。
+/// 供接口 mod 的「切片尺寸」下拉选项调用（实验性，玩家可调）。
+#[no_mangle]
+pub extern "C" fn RS_SetSliceSize(size: i32) -> i32 {
+    if !(MIN_SLICE_SIZE as i32..=MAX_SLICE_SIZE as i32).contains(&size) {
+        return -1;
+    }
+    SLICE_SIZE.store(size as usize, Ordering::Relaxed);
+    size
 }
 
 /// 是否启用切片路径：运行时开关打开 **且** 物理核数达到下限。
@@ -58,5 +82,24 @@ mod tests {
         assert!(!should_slice(8), "开关关闭应回退");
         set_slice_enabled(true);
         assert!(should_slice(8));
+    }
+
+    /// 切片尺寸可配置：默认 32；合法值生效；越界返回 -1 且保持原值。
+    /// 变异对照：若 `current_slice_size` 忘了 clamp，设回 7 后仍会读到 7 → 必红。
+    #[test]
+    fn slice_size_settable_and_clamped() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        assert_eq!(current_slice_size(), DEFAULT_SLICE_SIZE, "默认应为 32");
+        assert_eq!(RS_SetSliceSize(16), 16);
+        assert_eq!(current_slice_size(), 16);
+        assert_eq!(RS_SetSliceSize(64), 64);
+        assert_eq!(current_slice_size(), 64);
+        // 越界：拒绝并保持原值
+        assert_eq!(RS_SetSliceSize(7), -1, "低于 MIN_SLICE_SIZE 应拒绝");
+        assert_eq!(RS_SetSliceSize(65), -1, "高于 MAX_SLICE_SIZE 应拒绝");
+        assert_eq!(current_slice_size(), 64, "非法输入不应改变当前值");
+        // 恢复默认
+        assert_eq!(RS_SetSliceSize(DEFAULT_SLICE_SIZE as i32), DEFAULT_SLICE_SIZE as i32);
+        assert_eq!(current_slice_size(), DEFAULT_SLICE_SIZE);
     }
 }
