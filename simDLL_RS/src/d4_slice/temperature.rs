@@ -69,18 +69,18 @@ impl SliceEventBuf {
         Self { events: RegionEvents::default(), row_marks: Vec::with_capacity(rows) }
     }
 
-    /// 把本切片第 `row` 行（相对 `min_y` 的偏移）产出的事件追加进全局 `sim_events`。
-    fn merge_row_into(&mut self, sim: &mut SimData, row: usize) {
-        if sim.sim_events.ptr.is_null() {
-            return;
-        }
+    /// 把本切片第 `row` 行（相对 `min_y` 的偏移）产出的事件追加进 `dst`。
+    ///
+    /// 目标既可以是全局 `SimEvents` 的逐字段落盘（经 `RegionEvents` 中转），
+    /// 也可以是 D4 收集形态下的区域缓冲 —— 两者的字段名与 `RegionEvents`
+    /// 完全一致，故统一写到 `RegionEvents` 上。
+    fn merge_row_into(&mut self, dst: &mut RegionEvents, row: usize) {
         let prev = if row == 0 { RowMarks::default() } else { self.row_marks[row - 1] };
         let cur = self.row_marks[row];
-        let ev = unsafe { &mut *sim.sim_events.ptr };
         macro_rules! seg {
             ($f:ident) => {
                 for i in prev.$f..cur.$f {
-                    ev.$f.push(self.events.$f.get(i));
+                    dst.$f.push(self.events.$f.get(i));
                 }
             };
         }
@@ -259,7 +259,7 @@ pub fn run_temperature_sliced_serial(
 /// 同 `run_temperature_sliced_serial`，`parallel=true` 时走 rayon 持久池并行派发切片。
 ///
 /// 并行版**不做**任何逻辑改变：温度场仍由唯一写者保证逐位一致，事件仍走每切片缓冲 +
-/// 定序合并。区别仅在切片间的执行顺序（并行乱序），而该顺序不影响任何可观测输出。
+/// 逐行定序合并。区别仅在切片间的执行顺序（并行乱序），而该顺序不影响任何可观测输出。
 #[cfg(feature = "d4-slice")]
 pub fn run_temperature_sliced(
     sim: &mut SimData,
@@ -267,6 +267,33 @@ pub fn run_temperature_sliced(
     slice_size: usize,
     parallel: bool,
 ) {
+    let per_region = run_temperature_sliced_collect(sim, regions, slice_size, parallel);
+    // 按区域序逐个落盘。`collect` 已经把每个区域缓冲内部排成行主序，
+    // 这里按区域先后 append，全局顺序即「区域序 × 行主序」，与直接落盘逐位一致。
+    for mut buf in per_region {
+        buf.merge_into(sim);
+    }
+}
+
+/// 核心实现：跑切片化温度阶段，事件**不落盘**，而是按区域收集后返回。
+///
+/// 返回值下标 = `regions` 的原始下标（`SliceBounds::region_index` 语义一致）；
+/// 没有切片的区域（空区域）对应空缓冲。每个区域缓冲内部已排成
+/// 「tile 行 → 行内切片左→右」的行主序，与串行版区域内的追加顺序逐位一致。
+///
+/// 调用方（`update_data` 的 D4 分支）拿到缓冲后交给既有管线：
+/// 并行路径把 `temp_events[i]` 前置进区域 i 的阶段 A 缓冲（`append_from`），
+/// 串行路径在区域 i 的其余阶段前 `merge_into` 全局 —— 两条路都保证
+/// 「温度事件先于本区域气体/液体事件」，全局顺序与原版一致。
+#[cfg(feature = "d4-slice")]
+pub fn run_temperature_sliced_collect(
+    sim: &mut SimData,
+    regions: &[RegionBounds],
+    slice_size: usize,
+    parallel: bool,
+) -> Vec<RegionEvents> {
+    // 早退也返回与 `regions` 等长的空缓冲，保证调用方按下标取用始终对齐。
+    let empty = || (0..regions.len()).map(|_| RegionEvents::default()).collect();
     // 与 `run_temperature_band` 的守卫保持一致（含 backwall / sim_events，
     // `process_cell` 会解引用它们）。
     if sim.cells.ptr.is_null()
@@ -274,12 +301,12 @@ pub fn run_temperature_sliced(
         || sim.backwall.ptr.is_null()
         || sim.sim_events.ptr.is_null()
     {
-        return;
+        return empty();
     }
     let w = sim.width as usize;
     let h = sim.height as usize;
     if w < 3 || h < 3 {
-        return;
+        return empty();
     }
     let grid = SliceGrid::build(regions, slice_size);
     // 注意：owned 判定的是「邻居是否被**任何**切片覆盖」，不是「是否属于本切片」。
@@ -346,7 +373,7 @@ pub fn run_temperature_sliced(
         }
     }
 
-    // —— 定序合并：还原与串行**完全一致**的追加顺序 ——
+    // —— 定序合并：还原与串行**完全一致**的追加顺序（按区域收集）——
     //
     // 串行版 `run_temperature_task` 的遍历顺序是「区域序 × 区域内行主序」。
     // 故合并也分两层：
@@ -356,9 +383,11 @@ pub fn run_temperature_sliced(
     // 关键就在「逐行」这一层：若改成「切片序整片拼接」，同一 tile 行内右侧切片的事件
     // 会被整批推到左侧切片全部行之后，顺序就与原版不同了（这是本任务实测到的核心问题）。
     //
-    // 必须串行执行（`merge_row_into` 写全局 MsvcVector）。
-    let mut region_ids: Vec<usize> = regions.iter().enumerate().map(|(i, _)| i).collect();
-    for ri in region_ids.drain(..) {
+    // 收集形态下写入各区域的 `RegionEvents`（不下标全局）；`run_temperature_sliced`
+    // 再按区域序 `merge_into` 全局 —— 与直接落盘逐位一致（追加序不因中转而变）。
+    let mut region_out: Vec<RegionEvents> =
+        (0..regions.len()).map(|_| RegionEvents::default()).collect();
+    for ri in 0..regions.len() {
         let mut rs: Vec<usize> = (0..grid.slices.len())
             .filter(|&i| grid.slices[i].region_index == ri && !grid.slices[i].is_empty())
             .collect();
@@ -379,12 +408,13 @@ pub fn run_temperature_sliced(
             for y in y0..y1 {
                 for &si in band {
                     let k = y - grid.slices[si].min_y;
-                    slice_events[si].merge_row_into(sim, k);
+                    slice_events[si].merge_row_into(&mut region_out[ri], k);
                 }
             }
             p = q;
         }
     }
+    region_out
 }
 
 #[cfg(test)]
@@ -719,7 +749,7 @@ mod tests {
 
     #[test]
     fn sliced_serial_matches_original_bitwise() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let mut serial = make_sim(40, 40);
         let mut sliced = make_sim(40, 40);
         let pristine = make_sim(40, 40);
@@ -766,7 +796,7 @@ mod tests {
     #[cfg(feature = "d4-slice")]
     #[test]
     fn parallel_sliced_matches_serial_sliced_bitwise() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let mut sliced = make_sim(40, 40);
         let mut sliced_p = make_sim(40, 40);
         let pristine = make_sim(40, 40);
@@ -799,7 +829,7 @@ mod tests {
     /// （实测：把合并顺序 `reverse()` 后该用例照样全绿）。只有拿原版当参照才能钉住它。
     #[test]
     fn event_order_matches_serial_for_multi_tile_region() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         // 区域 68×68（> 切片尺寸），切片 32 → 3×3 = 9 片瓦片，真实的多行多列形状。
         let mut serial = make_sim(70, 70);
         let mut sliced = make_sim(70, 70);
@@ -839,7 +869,7 @@ mod tests {
     /// 的边界情形，单独留着防止退化解被改坏。
     #[test]
     fn event_order_matches_serial_for_single_tile_column() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         // 区域宽 32（= 切片尺寸）→ 每个切片横跨整个宽度，只沿 y 方向堆叠成多片。
         let mut serial = make_sim(40, 80);
         let mut sliced = make_sim(40, 80);
@@ -873,7 +903,7 @@ mod tests {
     /// 同时覆盖「能被整除」与「不能被整除」两种切片收窄。
     #[test]
     fn sliced_serial_matches_for_all_slice_sizes() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         for size in [16usize, 32, 64] {
             let mut serial = make_sim(70, 70);
             let mut sliced = make_sim(70, 70);
@@ -896,7 +926,7 @@ mod tests {
     /// 缺任何一半，这里必红。
     #[test]
     fn sliced_serial_matches_for_interior_region() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         for size in [16usize, 32] {
             let mut serial = make_sim(40, 40);
             let mut sliced = make_sim(40, 40);
@@ -912,7 +942,7 @@ mod tests {
     /// 空区域与退化尺寸不得 panic，且不得改动任何格子。
     #[test]
     fn sliced_serial_handles_empty_and_tiny_inputs() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         // 空区域：无切片
         let mut sd = make_sim(40, 40);
         let mut expect = make_sim(40, 40);
@@ -933,7 +963,7 @@ mod tests {
     /// `&[RegionBounds]` —— 补上多区域覆盖。
     #[test]
     fn sliced_serial_matches_for_two_separated_regions() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let a = RegionBounds { min_x: 5, min_y: 5, max_x: 15, max_y: 35 };
         let b = RegionBounds { min_x: 18, min_y: 5, max_x: 28, max_y: 35 };
         let mut serial = make_sim(40, 40);
@@ -963,7 +993,7 @@ mod tests {
     /// 任务 5 若改为并行/乱序调度，此处的顺序假设需重新论证。
     #[test]
     fn sliced_serial_matches_for_two_adjacent_regions() {
-        let _lock = LIB_TESTS_LOCK.lock();
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
         let a = RegionBounds { min_x: 5, min_y: 5, max_x: 15, max_y: 35 };
         let b = RegionBounds { min_x: 15, min_y: 5, max_x: 25, max_y: 35 };
         let mut serial = make_sim(40, 40);

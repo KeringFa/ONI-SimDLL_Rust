@@ -34,11 +34,19 @@ fn _min_scope_test(sim: &mut SimData) {
 }
 
 /// 并行路径入口：多区域（多星）时替代串行区域循环。
+///
+/// `temp_events` / `skip_temperature`：D4 切片路径专用（其余调用方传 `&[]` / `false`）。
+/// D4 命中时温度已跨全部区域统一跑完，阶段 A 的区域任务跳过温度与前置 derive，
+/// 只做 copy/气体/液体/病菌/辐射；`temp_events[i]`（区域 i 的温度事件）由任务
+/// **前置**进本区域的阶段 A 缓冲 —— 保证全局事件顺序仍是原版的
+/// 「逐区域：温度事件 → 气体/液体事件」，而非「全部温度事件在最前」。
 pub(crate) fn run_parallel_pipeline(
     sim: &mut SimData,
     region_bounds: Vec<RegionBounds>,
     region_pp_bounds: Vec<RegionBounds>,
     region_cosmic: Vec<f32>,
+    temp_events: &[RegionEvents],
+    skip_temperature: bool,
 ) {
     let n = region_bounds.len();
     if n == 0 {
@@ -55,6 +63,14 @@ pub(crate) fn run_parallel_pipeline(
     let mut region_events: Vec<RegionEvents> = (0..n).map(|_| Default::default()).collect();
     let events_ptrs: Vec<SendSyncPtr<RegionEvents>> = (0..n)
         .map(|i| SendSyncPtr(&mut region_events[i] as *mut RegionEvents))
+        .collect();
+    // D4：温度事件按区域前置进阶段 A 缓冲（见函数 doc）。非 D4 路径为空切片，
+    // 指针置 null，任务里跳过前置（MsvcVector 含裸指针，没有可用的静态空值）。
+    let temp_ptrs: Vec<SendSyncPtr<RegionEvents>> = (0..n)
+        .map(|i| match temp_events.get(i) {
+            Some(te) => SendSyncPtr(te as *const RegionEvents as *mut RegionEvents),
+            None => SendSyncPtr::default(),
+        })
         .collect();
     let pool = crate::d3_rayon::pool();
     // T6.3：LPT 面积装箱——组数 = min(区域数, 线程数)，组内逐区域串行。
@@ -73,6 +89,7 @@ pub(crate) fn run_parallel_pipeline(
             let region_cosmic = region_cosmic.clone();
             let rng_ptrs = rng_ptrs.clone();
             let events_ptrs = events_ptrs.clone();
+            let temp_ptrs = temp_ptrs.clone();
             s.spawn(move |_| {
                 // get() 方法调用强制捕获整个 SendSyncPtr（Rust 2021 disjoint capture
                 // 下 `.0` 字段访问只捕获裸指针本身，绕过 Send）。
@@ -82,8 +99,16 @@ pub(crate) fn run_parallel_pipeline(
                     let cosmic = region_cosmic[i];
                     let rng = rng_ptrs[i];
                     let events = events_ptrs[i];
+                    let temp = temp_ptrs[i];
                     let rng_raw = rng.get();
                     let events_raw = events.get();
+                    let temp_raw = temp.get();
+                    // D4：本区域的温度事件先于气体/液体事件进入同一份区域缓冲，
+                    // 阶段 A 结束后的按区域序合并才能还原原版的事件交错。
+                    // 非 D4 路径 temp_raw 为 null，直接跳过。
+                    if !temp_raw.is_null() {
+                        unsafe { (*events_raw).append_from(&*temp_raw) };
+                    }
                     with_region_rng(rng_raw, move || {
                         with_region_sink(events_raw, move || unsafe {
                             crate::c2_physics::run_region_physics_a(
@@ -91,6 +116,7 @@ pub(crate) fn run_parallel_pipeline(
                                 bounds,
                                 cosmic,
                                 true,
+                                skip_temperature,
                             );
                         });
                     });
@@ -269,7 +295,7 @@ mod tests {
             .map(|r| crate::d1_activity::compute_post_process_bounds(&sd, r))
             .collect();
         let cosmic = vec![0.0f32; 2];
-        run_parallel_pipeline(&mut sd, bounds, pp, cosmic);
+        run_parallel_pipeline(&mut sd, bounds, pp, cosmic, &[], false);
         // 不 panic；液体总质量守恒（两个 100kg 可能在区域内流动，但总量不变）
         unsafe {
             let u = &*sd.updated_cells.ptr;
@@ -318,13 +344,13 @@ mod tests {
         let cosmic = vec![0.0f32; 2];
         // —— 串行路径（一帧）——
         for i in 0..2 {
-            crate::c2_physics::run_region_physics_a(&mut sd_s, bounds[i], cosmic[i], false);
+            crate::c2_physics::run_region_physics_a(&mut sd_s, bounds[i], cosmic[i], false, false);
             crate::c2_physics::run_region_emitters(&mut sd_s, bounds[i]);
             crate::c2_physics::run_region_physics_c(&mut sd_s, bounds[i], pp[i]);
         }
         // —— 并行路径（一帧，独立 sim）——
         let mut sd_p = make_two_region_sim();
-        run_parallel_pipeline(&mut sd_p, bounds.clone(), pp.clone(), cosmic.clone());
+        run_parallel_pipeline(&mut sd_p, bounds.clone(), pp.clone(), cosmic.clone(), &[], false);
         // —— 断言：两版液体总质量守恒 ——
         let mass_of = |sd: &SimData| -> f32 {
             unsafe {
@@ -384,14 +410,14 @@ mod tests {
         let cosmic = vec![110.0f32; 2];
         // —— 串行路径（一帧）——
         for i in 0..2 {
-            crate::c2_physics::run_region_physics_a(&mut sd_s, bounds[i], cosmic[i], false);
+            crate::c2_physics::run_region_physics_a(&mut sd_s, bounds[i], cosmic[i], false, false);
             crate::c2_physics::run_region_emitters(&mut sd_s, bounds[i]);
             crate::c2_physics::run_region_physics_c(&mut sd_s, bounds[i], pp[i]);
         }
         // —— 并行路径（一帧，独立 sim）——
         let mut sd_p = make_two_region_sim();
         fill_solid(&mut sd_p);
-        run_parallel_pipeline(&mut sd_p, bounds.clone(), pp.clone(), cosmic.clone());
+        run_parallel_pipeline(&mut sd_p, bounds.clone(), pp.clone(), cosmic.clone(), &[], false);
         // —— 断言：串行/并行逐格一致 ——
         unsafe {
             let us = &*sd_s.updated_cells.ptr;

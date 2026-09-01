@@ -32,17 +32,23 @@ pub struct AffinityGroup {
     pub affinity_mask: u64,
 }
 
-/// 输入：普通世界 tiles（不含太空员舱集群，集群由 D1 执行器单独合并）、拓扑。
-/// 输出：物理核组（前 physical_cores−1 大，各独占一物理核）+ 超线程组（其余
-/// 两两合并）。无 HT 时返回 None（调用方回退 D2）。
-pub fn assign_groups(world_tiles: &[u64], topo: &CpuTopology) -> Option<Vec<AffinityGroup>> {
+/// 输入：普通世界 tiles（不含太空员舱集群，集群由 D1 执行器单独合并）、拓扑、
+/// 预留物理核数（留给游戏主线程/系统，默认 1，可配置 1..=4）。
+/// 输出：物理核组（前 physical_cores−reserve 大，各独占一物理核）+ 超线程组
+/// （其余两两合并）。无 HT 时返回 None（调用方回退 D2）。
+pub fn assign_groups(
+    world_tiles: &[u64],
+    topo: &CpuTopology,
+    reserve: usize,
+) -> Option<Vec<AffinityGroup>> {
     if !topo.has_hyper_threading() {
         return None;
     }
     if world_tiles.is_empty() {
         return Some(Vec::new());
     }
-    let p = topo.physical_cores.saturating_sub(1).max(1);
+    // 至少保留 1 个物理核给模拟，避免极端配置（如 4 核机 reserve=4）饿死并行。
+    let p = topo.physical_cores.saturating_sub(reserve).max(1);
     if p == 0 {
         return None;
     }
@@ -99,9 +105,20 @@ pub fn assign_groups(world_tiles: &[u64], topo: &CpuTopology) -> Option<Vec<Affi
 }
 
 impl CpuTopology {
+    /// 解析异常时的近似拓扑：逻辑核/2 作为物理核数（默认每核 2 逻辑处理器）。
+    /// 仅用于 `query()` 的加固判定（physical≤1 且 logical≥4）。
+    pub fn approx_topology_for_broken_detection(logical: usize) -> CpuTopology {
+        let physical = (logical / 2).max(1);
+        CpuTopology {
+            physical_cores: physical,
+            logical_cores: logical,
+            logical_per_core: vec![2; physical],
+        }
+    }
+
     pub fn query() -> Self {
+        let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let fallback = || {
-            let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
             CpuTopology {
                 physical_cores: logical,
                 logical_cores: logical,
@@ -162,6 +179,13 @@ impl CpuTopology {
             if physical == 0 {
                 return fallback();
             }
+            // 拓扑加固（2026-08-21，玩家反馈启发）：Ex API 解析"成功"但物理核数
+            // 异常少（≤1）而系统逻辑核 ≥4 时，几乎必然是解析失败/异常环境——按
+            // 逻辑核/2 近似物理核（默认每核 2 逻辑处理器），避免把 CPU 当成 1 核
+            // 而走向错误调度路径。真 1~2 核机器的可用逻辑核 <4，不会误触发。
+            if physical <= 1 && logical >= 4 {
+                return Self::approx_topology_for_broken_detection(logical);
+            }
             CpuTopology {
                 physical_cores: physical,
                 logical_cores: logical_total,
@@ -201,7 +225,7 @@ mod tests {
         // MiniRegolith 9216 / Tundra 8192 / Moo 7680 / Wetland 6144）
         let mut tiles: Vec<u64> = vec![6144; 5];
         tiles.extend([15360, 13920, 9216, 8192, 7680, 6144]);
-        let groups = assign_groups(&tiles, &topo).expect("有 HT 应可分配");
+        let groups = assign_groups(&tiles, &topo, 1).expect("有 HT 应可分配");
 
         // 物理核组 = 7（8−1），每组恰好 1 个 region（最大 7 世界独占）
         let physical: Vec<_> = groups.iter().filter(|g| g.region_indices.len() == 1).collect();
@@ -228,5 +252,72 @@ mod tests {
         all.sort_unstable();
         let expect: Vec<usize> = (0..tiles.len()).collect();
         assert_eq!(all, expect, "分组应覆盖全部世界");
+    }
+
+    /// 回归（2026-08-21）：预留物理核数可配置（1..=4）——reserve 增加时物理核组
+    /// 减少、超线程组对应轮转；覆盖全部 region 且大世界组互不共享物理核。
+    #[test]
+    fn assign_groups_respects_configurable_reserve() {
+        let topo = CpuTopology {
+            physical_cores: 8,
+            logical_cores: 16,
+            logical_per_core: vec![2; 8],
+        };
+        let mut tiles: Vec<u64> = vec![6144; 5];
+        tiles.extend([15360, 13920, 9216, 8192, 7680, 6144]);
+
+        for reserve in 1..=4usize {
+            let groups = assign_groups(&tiles, &topo, reserve).expect("有 HT 应可分配");
+            let expect_p = 8usize.saturating_sub(reserve).max(1);
+            // assign_groups 契约：前 expect_p 组是物理核组（各独占一个物理核，
+            // 每组恰好 1 个 region）；剩余是超线程组（两两合并，可能含单组——
+            // 不能用 region_indices.len()==1 识别物理核组）。
+            assert!(
+                groups.len() >= expect_p,
+                "reserve={reserve} 组数应 ≥ {expect_p}，got {}",
+                groups.len()
+            );
+            let physical = &groups[..expect_p];
+            assert!(
+                physical.iter().all(|g| g.region_indices.len() == 1),
+                "reserve={reserve} 物理核组应每组 1 个 region"
+            );
+            // 物理核组互不共享物理核
+            for (i, a) in physical.iter().enumerate() {
+                for b in physical.iter().skip(i + 1) {
+                    assert_eq!(a.affinity_mask & b.affinity_mask, 0);
+                }
+            }
+            // 覆盖全部 region
+            let mut all: Vec<usize> = groups
+                .iter()
+                .flat_map(|g| g.region_indices.iter().copied())
+                .collect();
+            all.sort_unstable();
+            let expect: Vec<usize> = (0..tiles.len()).collect();
+            assert_eq!(all, expect, "reserve={reserve} 分组应覆盖全部世界");
+        }
+    }
+
+    /// 回归（2026-08-21）：解析异常（physical≤1 且逻辑核≥4）时按逻辑核/2 近似
+    /// 物理核，避免调度路径把 CPU 当成 1 核。
+    #[test]
+    fn broken_topology_fallback_approximates_physical_cores() {
+        // 7800X3D 场景：解析失败到 physical=1，但系统有 16 逻辑核 → 近似 8 物理核
+        let t = CpuTopology::approx_topology_for_broken_detection(16);
+        assert_eq!(t.physical_cores, 8);
+        assert_eq!(t.logical_cores, 16);
+        assert_eq!(t.logical_per_core, vec![2; 8]);
+        assert!(t.has_hyper_threading(), "近似拓扑应视为启用超线程");
+
+        // 奇数逻辑核：向下取整，仍 ≥1
+        let t2 = CpuTopology::approx_topology_for_broken_detection(6);
+        assert_eq!(t2.physical_cores, 3);
+        assert_eq!(t2.logical_cores, 6);
+
+        // 边界：逻辑核 <4 不应走加固（真实 1~2 核机器），此处验证近似下限仍安全
+        let t3 = CpuTopology::approx_topology_for_broken_detection(1);
+        assert_eq!(t3.physical_cores, 1);
+        assert_eq!(t3.logical_per_core, vec![2; 1]);
     }
 }

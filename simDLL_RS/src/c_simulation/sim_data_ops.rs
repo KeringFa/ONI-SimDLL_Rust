@@ -8,6 +8,7 @@
 
 use crate::a_framework::sim_data::SimData;
 use crate::a_framework::game_data::{EmittedMassInfo, GameData};
+use crate::d1_activity::{compute_region_bounds, RegionBounds};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// CopySimDataToGame 内局部静态 tick_count 的镜像（原版 11_msvcrt_ignored.c L32494-32498）：
@@ -86,6 +87,54 @@ pub fn clear_backwall(sim_data: &mut SimData, cell_idx: i32) {
 ///
 /// 对照源码 11_msvcrt_ignored.c。
 /// 用于 elapsed_seconds <= 0 时直接同步双缓冲。
+/// 自然固体 strength_info 运行时推导。
+///
+/// 原版在固体生成/加载后会为自然固体写入质量型抗压字节：
+///   `0x80 | (结构强度系数 × 4 & 0x7F)`
+/// 自然固体的结构强度系数固定为 1.0，因此字节恒为 `0x80 | 4 = 0x84`。
+///
+/// 元素强度（`ElementPostProcessData::strength`，如玄武岩 1.2、火成岩 1.0）不写入此字节，
+/// 而是由 `DoPressureBreak` 单独乘入。若这里写成「元素强度×4」，会在 DoPressureBreak 里
+/// 被二次乘入（变成 strength²），与原版/维基公式不符。
+///
+/// 只覆盖 `strength_info == 0` 的格子：人造砖（0x06）、地基（0x04）等 C# 显式写入的非零值
+/// 不受影响。判定条件与原版压力分支一致：`state & 3 == 3`（固体）且 `mass > 0`。
+pub fn derive_natural_solid_strength(
+    sim_data: &mut SimData,
+    bounds: crate::d1_activity::RegionBounds,
+) {
+    if bounds.is_empty() {
+        return;
+    }
+    if sim_data.updated_cells.ptr.is_null() {
+        return;
+    }
+    let width = sim_data.width as usize;
+    let updated = unsafe { &mut *sim_data.updated_cells.ptr };
+    let len = updated.strength_info.len();
+    for row in bounds.min_y..bounds.max_y {
+        for col in bounds.min_x..bounds.max_x {
+            let cell = row * width + col;
+            if cell >= len {
+                continue;
+            }
+            if updated.strength_info.get(cell) != 0 {
+                continue;
+            }
+            let elem = updated.element_idx.get(cell);
+            let Some(ppd) =
+                crate::b_elements::elements_table::get_element_post_process_data(elem)
+            else {
+                continue;
+            };
+            if (ppd.state & 3) == 3 && updated.mass.get(cell) > 0.0 {
+                // 0x80 = 质量型标志(bit7)；低 7 位 = 1.0×4 = 4。
+                updated.strength_info.set(cell, 0x80u8 | ((1.0f32 * 4.0) as u8 & 0x7f));
+            }
+        }
+    }
+}
+
 pub fn copy_updated_cells_to_cells(sim_data: &mut SimData) {
     if sim_data.cells.ptr.is_null() || sim_data.updated_cells.ptr.is_null() {
         tracing::warn!("copy_updated_cells_to_cells: cells or updated_cells ptr is null");
@@ -160,6 +209,79 @@ pub fn clear_flow(sim_data: &mut SimData) {
     }
     let flow = unsafe { std::slice::from_raw_parts_mut(sim_data.flow.ptr, total) };
     flow.fill(crate::a_framework::vector_math::Vector4f::default());
+}
+
+/// 按区域清零时能走栈缓冲的最大区域数。超过则退回 [`clear_flow`] 全清。
+///
+/// 区域数 = 已发现世界数 + 在飞火箭内部舱数。常规存档远小于此值，
+/// 64 只是保守上限（栈上 64 × 32B = 2KB，不额外分配）。
+const MAX_REGIONS_STACK: usize = 64;
+
+/// 只清零**活动区域**内的 flow（[`clear_flow`] 的按区域版本）。
+///
+/// ## 为什么安全（等价于全网格清零）
+/// 1. `flow` 在 `SimData::new_for_allocate`（AllocateCells）里零初始化，
+///    且**不参与存档读写**（save_load 只处理 `accumulated_flow` 等纹理，
+///    不碰 `sim_data.flow`）；
+/// 2. 物理阶段只在活动区域内写 flow —— 温度/气体/液体/辐射/后处理全部走
+///    `d1_activity::compute_region_bounds` 裁剪后的边界；
+/// 3. 由 1 + 2 推出：**区域外的 flow 恒为 0**，每帧重复清零纯属浪费。
+///
+/// ## 收益
+/// sim 网格含世界装箱间隙，且眼冒金星 DLC 额外预留 136 格宽的太空条带
+/// （`BestFit.BestFitWorlds` 的 `result.x += 136`）。实测 Ceres Spaced Out
+/// 星群网格 736×304 = 223,744 格，其中死区 83,296 格（37.2%）。
+/// 全网格 fill 每帧 3.41 MB → 按区域清只剩约 2.14 MB。
+///
+/// ## 回退
+/// 区域列表为空、或区域数超过 `MAX_REGIONS_STACK` 时，退回 [`clear_flow`]
+/// 全网格清零——保守但行为完全不变。
+pub fn clear_flow_regions(sim_data: &mut SimData) {
+    if sim_data.flow.ptr.is_null() {
+        return;
+    }
+    let w = sim_data.width as usize;
+    let h = sim_data.height as usize;
+    let total = w * h;
+    if total == 0 {
+        return;
+    }
+
+    // 分两步：先借用 active_regions 算出边界，再取 flow 的可变切片。
+    // 两者都来自 sim_data，借用必须错开，否则触发 aliasing 报错。
+    let empty = RegionBounds {
+        min_x: 0,
+        min_y: 0,
+        max_x: 0,
+        max_y: 0,
+    };
+    let mut bounds = [empty; MAX_REGIONS_STACK];
+    let mut n = 0usize;
+    {
+        let regions = sim_data.active_regions.as_slice();
+        if regions.is_empty() || regions.len() > MAX_REGIONS_STACK {
+            clear_flow(sim_data);
+            return;
+        }
+        for r in regions {
+            bounds[n] = compute_region_bounds(sim_data, r);
+            n += 1;
+        }
+    }
+
+    let flow = unsafe { std::slice::from_raw_parts_mut(sim_data.flow.ptr, total) };
+    for b in &bounds[..n] {
+        if b.is_empty() {
+            continue;
+        }
+        for y in b.min_y..b.max_y {
+            let start = y * w + b.min_x;
+            let end = y * w + b.max_x;
+            if end <= total {
+                flow[start..end].fill(crate::a_framework::vector_math::Vector4f::default());
+            }
+        }
+    }
 }
 
 /// SimBase::CopySimDataToGame：将 SimData 拷贝到 GameData。
@@ -642,7 +764,7 @@ mod tests {
 
     #[test]
     fn copy_sim_data_to_game_swaps_events_and_updates_frame_count() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 
@@ -692,7 +814,7 @@ mod tests {
     /// 验证 game_data.cells 中对应位置的数据正确，且尺寸不会被错误扩展。
     #[test]
     fn copy_sim_data_to_game_strips_border_correctly() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 
@@ -736,7 +858,7 @@ mod tests {
     /// GameData: 4×4（不含边界）→ game 坐标 row=0..3, col=0..3
     #[test]
     fn copy_sim_data_to_game_copies_accumulated_flow_stripped() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_accumulated_flow_reset_count_for_tests();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
@@ -764,7 +886,7 @@ mod tests {
     /// 此前 game.flow 恒 null；此测试验证去边界拷贝。
     #[test]
     fn copy_sim_data_to_game_copies_flow_stripped() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 
@@ -820,13 +942,100 @@ mod tests {
         }
     }
 
+    /// 按区域清 flow 的对照基准：先造一份「全脏」的 flow 缓冲。
+    fn make_dirty_flow(sd: &mut SimData) -> crate::a_framework::vector_math::Vector4f {
+        let flow_vec: Vec<crate::a_framework::vector_math::Vector4f> =
+            vec![crate::a_framework::vector_math::Vector4f::default(); 36];
+        sd.flow = UniquePtr {
+            ptr: flow_vec.leak().as_mut_ptr(),
+        };
+        let dirty = crate::a_framework::vector_math::Vector4f {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            w: 4.0,
+        };
+        unsafe {
+            for v in std::slice::from_raw_parts_mut(sd.flow.ptr, 36).iter_mut() {
+                *v = dirty;
+            }
+        }
+        dirty
+    }
+
+    /// clear_flow_regions 只清活动区域内的格子，区域外原样保留。
+    ///
+    /// 这是相对 clear_flow 的核心差异，也是省下死区 memset 的依据：
+    /// 区域外的 flow 恒为 0（分配时零初始化 + 物理只在区域内写），
+    /// 每帧重复清零纯属浪费。
+    ///
+    /// 6×6 网格，区域 (0,0)-(3,3) 经 compute_region_bounds 钳制为
+    /// x∈[1,3)、y∈[1,3) → 索引 7、8、13、14。
+    #[test]
+    fn clear_flow_regions_only_touches_active_region() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        let mut sd = make_test_sim_data();
+        let dirty = make_dirty_flow(&mut sd);
+
+        sd.active_regions.push(crate::a_framework::sim_data::ActiveRegion {
+            min_x: 0,
+            min_y: 0,
+            max_x: 3,
+            max_y: 3,
+            ..Default::default()
+        });
+
+        clear_flow_regions(&mut sd);
+
+        let zero = crate::a_framework::vector_math::Vector4f::default();
+        unsafe {
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 36);
+            for i in [7usize, 8, 13, 14] {
+                assert_eq!(flow[i], zero, "区域内 cell {i} 应被清零");
+            }
+            for i in 0..36 {
+                if matches!(i, 7 | 8 | 13 | 14) {
+                    continue;
+                }
+                assert_eq!(flow[i], dirty, "区域外 cell {i} 不应被动");
+            }
+        }
+    }
+
+    /// 无活动区域（首帧 / 刚 AllocateCells）时退回全网格清零，
+    /// 行为与 clear_flow 完全一致——保证改造不引入行为漂移。
+    #[test]
+    fn clear_flow_regions_falls_back_to_full_clear_without_regions() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        let mut sd = make_test_sim_data();
+        let _dirty = make_dirty_flow(&mut sd);
+
+        assert!(
+            sd.active_regions.is_empty(),
+            "前置条件：本用例的 active_regions 应为空"
+        );
+
+        clear_flow_regions(&mut sd);
+
+        unsafe {
+            let flow = std::slice::from_raw_parts(sd.flow.ptr, 36);
+            for v in flow {
+                assert_eq!(
+                    *v,
+                    crate::a_framework::vector_math::Vector4f::default(),
+                    "无区域时应退回全清"
+                );
+            }
+        }
+    }
+
     /// 验证 accumulated_flow 的 15 帧清零窗口（原版 CopySimDataToGame 局部静态
     /// tick_count：tick_count+1 后 > 0xe 时 memset 清零 SimData 源缓冲）。
     /// 语义：第 15 次调用仍把"窗口内累积量"交给 GameData，随后源归零；
     /// 第 16 次调用起 GameData 读到 0 —— 即 C# 显示只维持一个窗口。
     #[test]
     fn copy_sim_data_to_game_resets_accumulated_flow_after_15_calls() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_accumulated_flow_reset_count_for_tests();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
@@ -865,7 +1074,7 @@ mod tests {
     /// 下一次交换把空向量给 game → GDU emittedMassEntries=null → C# BuildingElementEmitter NRE。
     #[test]
     fn copy_sim_data_to_game_keeps_emitted_mass_vector_length() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         crate::c_simulation::element_emitter::reset_for_test();
         let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -897,6 +1106,7 @@ mod tests {
     /// C1 修复：原 A3 阶段遗漏了 sim_events 分配。
     #[test]
     fn new_for_allocate_allocates_sim_events() {
+        let _lock = LIB_TESTS_LOCK.lock();
         let sd = SimData::new_for_allocate(4, 4, 12345, false, false);
         assert!(!sd.sim_events.ptr.is_null(), "sim_events should be allocated");
         assert!(!sd.updated_cells.ptr.is_null(), "updated_cells should be allocated");
@@ -908,7 +1118,7 @@ mod tests {
     /// 并回填 old/new 元素索引。
     #[test]
     fn post_process_derives_solid_events_for_dug_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 准备元素状态表：idx 100 = 固体(3)，idx 1 = 真空(0)
         {
             let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
@@ -961,7 +1171,7 @@ mod tests {
     /// 防止事件乒乓重复投递。
     #[test]
     fn copy_sim_data_to_game_clears_event_source() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_test_sim_data();
         let mut gd = make_test_game_data();
 

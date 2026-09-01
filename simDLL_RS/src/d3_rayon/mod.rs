@@ -12,8 +12,12 @@ pub mod perf_probe;
 pub mod pipeline;
 pub mod scheduler;
 
-/// 预留给游戏主线程/系统的物理核数（2026-08-08 用户拍板 = 1）。
-pub const RESERVE_CORES: usize = 1;
+/// 预留给游戏主线程/系统的物理核数（默认 1，接口 mod 可配置 1..=4）。
+/// 由 `RS_SetReservedCores` 设置（OnLoad 时，池构建之前）；D1/D2 两条并行
+/// 路径统一读取。曾为写死常量（2026-08-08 用户拍板 = 1），2026-08-21 改为可配置。
+pub fn reserve_cores() -> usize {
+    crate::d3_rayon::scheduler::reserved_cores()
+}
 
 /// 物理核数：统一走 Ex API 拓扑（affinity::CpuTopology）。
 /// 注：旧 API GetLogicalProcessorInformation 在本机返回全 Group → fallback 逻辑核
@@ -37,9 +41,10 @@ pub fn pool() -> &'static rayon::ThreadPool {
     G_RAYON_POOL.get_or_init(|| {
         // 物理核数用 Ex API 拓扑（旧 API 在本机返回全 Group → fallback 逻辑核 16，
         // 导致线程池 15 线程超额订阅）。复用 affinity::CpuTopology。
+        let reserve = reserve_cores();
         let threads = crate::d3_rayon::affinity::CpuTopology::cached()
             .physical_cores
-            .saturating_sub(RESERVE_CORES)
+            .saturating_sub(reserve)
             .max(1);
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("simdll-d3-{i}"))
@@ -67,15 +72,19 @@ mod tests {
 
     #[test]
     fn pool_size_is_physical_minus_reserve() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        // 固定默认预留数，避免与可配置测试并行交错影响池线程数
+        assert_eq!(crate::d3_rayon::scheduler::RS_SetReservedCores(1), 1);
         let p = pool();
         assert_eq!(
             p.current_num_threads(),
-            physical_cores().saturating_sub(RESERVE_CORES).max(1)
+            physical_cores().saturating_sub(reserve_cores()).max(1)
         );
     }
 
     #[test]
     fn pool_builds_once_and_reuses() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
         let p1 = pool();
         let p2 = pool();
         assert!(std::ptr::eq(p1, p2), "线程池应只构建一次并复用");

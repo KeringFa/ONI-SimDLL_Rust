@@ -15,12 +15,34 @@ pub enum SchedulerMode {
 
 static MODE: AtomicI32 = AtomicI32::new(0);
 
+/// 预留给游戏主线程/系统的物理核数（默认 1，范围 1..=4，接口 mod 可配置）。
+/// 同时约束 D1（affinity 分组）与 D2/D6（rayon 池线程数）两条并行路径。
+static RESERVED_CORES: AtomicI32 = AtomicI32::new(1);
+
+/// 预留物理核数上限（与 C# ModConfig.MAX_RESERVED_CORES 保持一致）。
+pub const MAX_RESERVED_CORES: i32 = 4;
+
 pub fn current_mode() -> SchedulerMode {
     match MODE.load(Ordering::Relaxed) {
         1 => SchedulerMode::D2,
         2 => SchedulerMode::D1,
         _ => SchedulerMode::Auto,
     }
+}
+
+/// 当前预留物理核数（clamp 后，1..=4）。
+pub fn reserved_cores() -> usize {
+    RESERVED_CORES.load(Ordering::Relaxed).clamp(1, MAX_RESERVED_CORES) as usize
+}
+
+/// 设置预留物理核数（1..=4）。返回实际生效值；非法输入返回 -1。
+#[no_mangle]
+pub extern "C" fn RS_SetReservedCores(cores: i32) -> i32 {
+    if !(1..=MAX_RESERVED_CORES).contains(&cores) {
+        return -1;
+    }
+    RESERVED_CORES.store(cores, Ordering::Relaxed);
+    cores
 }
 
 /// 设置调度模式：0=Auto，1=D2，2=D1。返回实际生效模式：
@@ -61,10 +83,12 @@ mod tests {
     #[cfg(test)]
     pub fn reset_for_tests() {
         MODE.store(0, Ordering::Relaxed);
+        RESERVED_CORES.store(1, Ordering::Relaxed);
     }
 
     #[test]
     fn scheduler_mode_invalid_rejected() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
         reset_for_tests();
         assert_eq!(RS_SetSchedulerMode(99), -1);
         assert_eq!(current_mode(), SchedulerMode::Auto);
@@ -72,6 +96,10 @@ mod tests {
 
     #[test]
     fn scheduler_mode_set_and_query() {
+        // 必须持锁：MODE 是全局静态量，同目录下其他用例（以及 d3_rayon::mod 的
+        // pool_size_is_physical_minus_reserve）会并发读写它。不加锁时本用例在多
+        // 线程模式下与它们抢状态，断言间歇性失败（实测 583 用例中约 1 例挂）。
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
         reset_for_tests();
         assert_eq!(RS_SetSchedulerMode(1), 1);
         assert_eq!(current_mode(), SchedulerMode::D2);
@@ -81,9 +109,34 @@ mod tests {
 
     #[test]
     fn scheduler_d1_accepts_or_falls_back() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
         reset_for_tests();
         let r = RS_SetSchedulerMode(2);
         // 有 HT → 2；无 HT → 回退 1。两者均合法。
         assert!(r == 1 || r == 2, "D1 应接受(2)或回退 D2(1)，got {r}");
+    }
+
+    #[test]
+    fn reserved_cores_defaults_to_one() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        reset_for_tests();
+        assert_eq!(reserved_cores(), 1);
+    }
+
+    #[test]
+    fn reserved_cores_set_and_clamp() {
+        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        reset_for_tests();
+        assert_eq!(RS_SetReservedCores(2), 2);
+        assert_eq!(reserved_cores(), 2);
+        assert_eq!(RS_SetReservedCores(4), 4);
+        assert_eq!(reserved_cores(), 4);
+        // 非法输入拒绝，保持原值
+        assert_eq!(RS_SetReservedCores(0), -1);
+        assert_eq!(RS_SetReservedCores(5), -1);
+        assert_eq!(reserved_cores(), 4);
+        // 恢复默认
+        assert_eq!(RS_SetReservedCores(1), 1);
+        assert_eq!(reserved_cores(), 1);
     }
 }
