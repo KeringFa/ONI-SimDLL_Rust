@@ -397,6 +397,16 @@ pub fn clear_building_temperature() {
     BUILDING_TEMPERATURE_MANAGER.lock().clear();
 }
 
+/// 测试/诊断：当前活跃建筑温度记录数。
+pub fn building_temperature_count() -> usize {
+    BUILDING_TEMPERATURE_MANAGER
+        .lock()
+        .items
+        .iter()
+        .filter(|&&ri| ri >= 0)
+        .count()
+}
+
 /// BuildingHeatExchange::Update（原版 L137362-137633）。每子步由 `update_data` 末尾调用（dt=0.2）。
 ///
 /// 逐建筑、逐格换热：mass>0 才参与（真空跳过）；k = f24×ΔT×元素TC×记录TC×insulation²
@@ -581,6 +591,11 @@ mod tests {
     /// 建最小元素表：elem5 液态 SHC=2.0、TC=4.0、highTemp=5000、lowTemp=200。
     /// 调用方需持 LIB_TESTS_LOCK。
     fn init_temp_table() {
+        // ⚠️ 先清空全局 BUILDING_TEMPERATURE_MANAGER：它是 Lazy 单例，跨用例共享。
+        // 若前一用例断言失败 panic（remove_building 被跳过），handle/记录残留，
+        // 会让本用例的 handle 编号漂移或 record() 读到脏数据 —— 这是该模块
+        // flaky 的历史根因（8-30 记录）。统一在 setup 清空，从干净状态开始。
+        clear_building_temperature();
         let mut table = G_ELEMENTS_TABLE.lock().unwrap();
         table.elements.clear();
         table.element_names.clear();

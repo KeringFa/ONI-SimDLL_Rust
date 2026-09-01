@@ -53,12 +53,12 @@ fn sim_debug_crash_does_not_crash() {
 fn sysinfo_acquire_returns_non_null() {
     let ptr = SYSINFO_Acquire();
     assert!(!ptr.is_null());
-    SYSINFO_Release(ptr);
+    SYSINFO_Release();
 }
 
 #[test]
 fn sysinfo_release_null_is_safe() {
-    SYSINFO_Release(std::ptr::null_mut());
+    SYSINFO_Release();
 }
 
 #[test]

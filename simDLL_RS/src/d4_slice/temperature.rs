@@ -1180,4 +1180,64 @@ mod tests {
         assert_work_happened(&pristine, &serial, 200);
         bit_eq_cells(&serial, &sliced);
     }
+
+    /// 性能对比基准（手动运行：`cargo test --release --features d4-slice -- --ignored
+    /// temperature_slice_speedup_benchmark`）。默认 `#[ignore]` —— 基准依赖
+    /// release 优化、CPU 核数、负载，不该进常规测试（单核/CI 下会误报）。
+    ///
+    /// 用真实起始星尺寸（160×274）的满水网格，对比**温度阶段**串行
+    /// （`run_temperature_task`，内部走 ParallelTaskQueue 行带）vs 切片并行
+    /// （`run_temperature_sliced_collect(parallel=true)`，rayon 持久池）。
+    /// 只打印耗时，不硬断言加速比。
+    ///
+    /// ⚠️ **最坏情况**：`make_sim` 的伪随机温度场 ΔT 很大（~137°C 级），
+    /// `compute_pair_delta` 的 |ΔT|≥1 门控**全部放行**，于是切片版「每格算 4 对」
+    /// （全邻域，为任意切片边界支持）对比串行「每格算 2 对」（半邻域）的 ×2 计算
+    /// 代价全额暴露，实测 speedup 通常 <1（本机 0.07x）。真实游戏温度场接近热平衡
+    /// （ΔT 小 → 门控大量跳过），×2 代价被隐藏，并行度收益才体现出来 —— 用户
+    /// 实测帧数提升即为证。**本基准衡量的是最坏开销，不代表真实场景**。
+    #[test]
+    #[ignore]
+    fn temperature_slice_speedup_benchmark() {
+        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        use std::time::Instant;
+
+        let w = 160i32;
+        let h = 274i32;
+        let bounds = RegionBounds { min_x: 1, min_y: 1, max_x: (w - 1) as usize, max_y: (h - 1) as usize };
+        let frames = 200usize;
+
+        // 预热（JIT/分配器热身）
+        {
+            let mut sd = make_sim(w, h);
+            crate::c2_physics::temperature::run_temperature_task(&mut sd, bounds);
+            let mut sd2 = make_sim(w, h);
+            let _ = run_temperature_sliced_collect(&mut sd2, &[bounds], DEFAULT_SLICE_SIZE, true);
+        }
+
+        // 串行（同一 sim 跑多帧，只测温度阶段；不重建 sim——重建成本不在对比范围）
+        let mut serial = make_sim(w, h);
+        let t0 = Instant::now();
+        for _ in 0..frames {
+            crate::c2_physics::temperature::run_temperature_task(&mut serial, bounds);
+        }
+        let serial_dur = t0.elapsed();
+
+        // 并行（同一 sim 跑多帧，与串行对称；同样不含建 sim 成本）
+        let mut par_sim = make_sim(w, h);
+        let t1 = Instant::now();
+        for _ in 0..frames {
+            let _ = run_temperature_sliced_collect(&mut par_sim, &[bounds], DEFAULT_SLICE_SIZE, true);
+        }
+        let par_dur = t1.elapsed();
+
+        let serial_ms = serial_dur.as_secs_f64() * 1000.0 / frames as f64;
+        let par_ms = par_dur.as_secs_f64() * 1000.0 / frames as f64;
+        let speedup = serial_ms / par_ms;
+        println!(
+            "[d4-bench] 160x274 temperature: serial={serial_ms:.3}ms/frame  sliced-parallel={par_ms:.3}ms/frame  speedup={speedup:.2}x"
+        );
+        // 不硬断言：仅提示。单核/低核环境 speedup 可能 <1（同步开销）。
+        assert!(par_ms > 0.0, "并行耗时应为正");
+    }
 }

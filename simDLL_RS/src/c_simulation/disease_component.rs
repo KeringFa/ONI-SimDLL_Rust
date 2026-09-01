@@ -510,6 +510,12 @@ pub fn process_disease_consumer_messages(
 /// 从 (x,y) 起，深度 < range 的格全部可达（三个 state 过滤 flag 全 false →
 /// 不过滤元素内容）；跳过 x==0/y==0/越界格（原版 L33506-33513 边界检查）。
 /// 返回可达 sim 格索引（BFS 顺序：上、左、右、下）。
+///
+/// # 每帧分配控制
+/// `visited`（width×height 的 `vec![false; ...]`，大网格 218KB）与 `queue`
+/// 改为**线程本地复用缓冲 + 世代戳**：`visited` 存 u32 世代号而非 bool，
+/// 每调用递增 `GEN`，无需清零（世代号 != 当前代即视为未访问）。
+/// 返回值 `reachable` 仍是新建 Vec（调用方持有并迭代，不能返回共享缓冲）。
 pub(crate) fn get_reachable_cells(sim: &SimData, x: usize, y: usize, range: usize) -> Vec<usize> {
     let width = sim.width as usize;
     let height = sim.height as usize;
@@ -517,34 +523,71 @@ pub(crate) fn get_reachable_cells(sim: &SimData, x: usize, y: usize, range: usiz
     if range == 0 || x >= width || y >= height || width == 0 || height == 0 {
         return reachable;
     }
-    let mut visited = vec![false; width * height];
-    let mut queue = std::collections::VecDeque::new();
-    visited[y * width + x] = true;
-    queue.push_back((x, y, 0usize));
-    while let Some((cx, cy, depth)) = queue.pop_front() {
-        if depth >= range {
-            continue;
-        }
-        if cx == 0 || cy == 0 || cx >= width || cy >= height {
-            continue;
-        }
-        reachable.push(cy * width + cx);
-        let neighbors = [
-            (cx, cy.wrapping_sub(1)), // 上
-            (cx.wrapping_sub(1), cy), // 左
-            (cx + 1, cy),             // 右
-            (cx, cy + 1),             // 下
-        ];
-        for (nx, ny) in neighbors {
-            if nx < width && ny < height {
-                let nc = ny * width + nx;
-                if !visited[nc] {
-                    visited[nc] = true;
-                    queue.push_back((nx, ny, depth + 1));
-                }
+    thread_local! {
+        /// 世代戳 visited 缓冲：u32 而非 bool，靠世代号区分"本次已访问"，
+        /// 免去每次 BFS 前 width×height 清零（世代戳在发射器每触发一次的
+        /// 高频路径上是收益大头）。
+        static BFS_SCRATCH: std::cell::RefCell<BfsScratch> =
+            std::cell::RefCell::new(BfsScratch::default());
+    }
+    // 借用检查：BufScratch 的 borrow_mut 要活到 BFS 结束。
+    struct BfsScratch {
+        visited: Vec<u32>,
+        queue: std::collections::VecDeque<(usize, usize, usize)>,
+        generation: u32,
+    }
+    impl Default for BfsScratch {
+        fn default() -> Self {
+            Self {
+                visited: Vec::new(),
+                queue: std::collections::VecDeque::new(),
+                generation: 1,
             }
         }
     }
+    BFS_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let total = width * height;
+        if scratch.visited.len() < total {
+            scratch.visited.resize(total, 0);
+        }
+        let gen = scratch.generation;
+        // 世代号递增（wrapping 防溢出后强制清空重建）
+        scratch.generation = gen.wrapping_add(1);
+        if scratch.generation == 0 {
+            scratch.visited.fill(0);
+            scratch.generation = 1;
+        }
+        let gen = scratch.generation;
+        scratch.queue.clear();
+
+        scratch.visited[y * width + x] = gen;
+        scratch.queue.push_back((x, y, 0usize));
+        while let Some((cx, cy, depth)) = scratch.queue.pop_front() {
+            if depth >= range {
+                continue;
+            }
+            if cx == 0 || cy == 0 || cx >= width || cy >= height {
+                continue;
+            }
+            reachable.push(cy * width + cx);
+            let neighbors = [
+                (cx, cy.wrapping_sub(1)), // 上
+                (cx.wrapping_sub(1), cy), // 左
+                (cx + 1, cy),             // 右
+                (cx, cy + 1),             // 下
+            ];
+            for (nx, ny) in neighbors {
+                if nx < width && ny < height {
+                    let nc = ny * width + nx;
+                    if scratch.visited[nc] != gen {
+                        scratch.visited[nc] = gen;
+                        scratch.queue.push_back((nx, ny, depth + 1));
+                    }
+                }
+            }
+        }
+    });
     reachable
 }
 
