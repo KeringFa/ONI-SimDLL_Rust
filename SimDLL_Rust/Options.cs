@@ -364,7 +364,7 @@ namespace SimDLL_Rust
                 sliceSizeLabelLE.flexibleWidth = 1;
             }
             // 克隆下拉：成功则用下拉选尺寸；失败则回退 TMP 输入框（见下行注释）。
-            Dropdown sliceSizeDropdown = CloneResolutionDropdown(sliceSizeRowObj, out GameObject sliceDropdownGO);
+            Dropdown sliceSizeDropdown = CloneResolutionDropdown(sliceSizeRowObj.transform, out GameObject sliceDropdownGO);
             TMP_InputField sliceSizeInput = null;
             if (sliceSizeDropdown != null)
             {
