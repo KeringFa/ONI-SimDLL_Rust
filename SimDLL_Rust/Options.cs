@@ -339,67 +339,11 @@ namespace SimDLL_Rust
                 Debug.LogWarning("[SimDLL_Rust] RailModUploadMenu 不可用，预留线程数输入框不可用");
             }
 
-            // ===== ToggleRow3：启用 D4 温度切片并行（实验性）=====
-            var sliceRowObj = NewRow(panelObj, "SliceToggleRow", 24);
-            if (plainTextPrefab != null)
-            {
-                var sliceLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, sliceRowObj, true);
-                var sliceCsf = sliceLabelObj.GetComponent<ContentSizeFitter>();
-                if (sliceCsf != null) sliceCsf.enabled = false;
-                var sliceLabelText = sliceLabelObj.GetComponentInChildren<LocText>();
-                if (sliceLabelText != null)
-                {
-                    sliceLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_ENABLED_LABEL;
-                    sliceLabelText.alignment = TextAlignmentOptions.Left;
-                    sliceLabelText.raycastTarget = false;
-                }
-                var sliceLabelLE = sliceLabelObj.GetComponent<LayoutElement>()
-                    ?? sliceLabelObj.AddComponent<LayoutElement>();
-                sliceLabelLE.preferredWidth = 300;
-                sliceLabelLE.flexibleWidth = 1;
-            }
-            MultiToggle sliceToggle = null;
-            GameObject sliceCheckboxPrefab = null;
-            try { sliceCheckboxPrefab = Assets.UIPrefabs.TableScreenWidgets.Checkbox; }
-            catch { sliceCheckboxPrefab = null; }
-            if (sliceCheckboxPrefab != null)
-            {
-                sliceToggle = Util.KInstantiateUI<MultiToggle>(sliceCheckboxPrefab, sliceRowObj, true);
-                var le = sliceToggle.gameObject.GetComponent<LayoutElement>()
-                    ?? sliceToggle.gameObject.AddComponent<LayoutElement>();
-                le.preferredWidth = 20;
-                le.preferredHeight = 20;
-                le.minWidth = 20;
-                le.minHeight = 20;
-
-                var sliceToggleImage = Traverse.Create(sliceToggle).Field<Image>("toggle_image").Value;
-                var sliceStates = sliceToggle.states;
-                var sliceNewStates = new ToggleState[sliceStates.Length];
-                for (int i = 0; i < sliceStates.Length; i++)
-                {
-                    sliceNewStates[i] = sliceStates[i];
-                    sliceNewStates[i].use_rect_margins = false;
-                }
-                sliceToggle.states = sliceNewStates;
-                if (sliceToggleImage != null)
-                {
-                    var tiRect = sliceToggleImage.GetComponent<RectTransform>();
-                    tiRect.anchorMin = new Vector2(0.5f, 0.5f);
-                    tiRect.anchorMax = new Vector2(0.5f, 0.5f);
-                    tiRect.pivot = new Vector2(0.5f, 0.5f);
-                    tiRect.anchoredPosition = Vector2.zero;
-                    tiRect.sizeDelta = new Vector2(16, 16);
-                }
-                sliceToggle.onClick = () =>
-                {
-                    newSlice = !newSlice;
-                    sliceToggle.ChangeState(newSlice ? 1 : 0);
-                };
-                sliceToggle.ChangeState(newSlice ? 1 : 0);
-            }
-
-            // ===== Row：切片尺寸（8~64，默认 32）下拉 =====
-            // 克隆游戏 GraphicsOptionsScreen（主菜单"图形"设置）里 Resolution 用的
+            // ===== Row：温度切片（OFF / 尺寸）—— 单一下拉同时表达"开关"与"尺寸" =====
+            // 用户定稿的交互：下拉共两类选项，最顶部 OFF（默认项，即关闭切片），
+            // 其下 64×64 / 32×32 / 16×16 / 8×8 —— 玩家选任一尺寸即启用切片。
+            // 因此不再单独放"启用切片"复选框（两者合并，避免开关与尺寸状态脱节）。
+            // 克隆的是游戏 GraphicsOptionsScreen（主菜单"图形"设置）里 Resolution 用的
             // 原生 Dropdown —— 游戏自带的固定式下拉，兼容性最好。
             var sliceSizeRowObj = NewRow(panelObj, "SliceSizeRow", 28);
             if (plainTextPrefab != null)
@@ -424,40 +368,55 @@ namespace SimDLL_Rust
             TMP_InputField sliceSizeInput = null;
             if (sliceSizeDropdown != null)
             {
-                // —— 用克隆的游戏下拉 ——
-                int[] sliceChoices = { 8, 16, 32, 64 };
+                // —— 用克隆的游戏下拉：index 0 = OFF，1..4 = 尺寸（由大到小）——
+                // 选项文案纯文本（Unity Dropdown 不走 LocText）。
+                // 选 OFF → 关闭切片（保留上次尺寸，方便重新开启）；选任一尺寸 → 启用。
+                int[] sliceChoices = { 64, 32, 16, 8 };
                 sliceSizeDropdown.ClearOptions();
                 var opts = new System.Collections.Generic.List<Dropdown.OptionData>();
+                opts.Add(new Dropdown.OptionData("OFF"));
                 for (int ci = 0; ci < sliceChoices.Length; ci++)
                 {
-                    // 选项文案：纯数字（不走 LocText 本地化，Unity Dropdown 纯文本）。
-                    // 默认 32 不额外标记，避免中英混排。
-                    opts.Add(new Dropdown.OptionData(sliceChoices[ci].ToString()));
+                    string label = sliceChoices[ci] + "×" + sliceChoices[ci];
+                    opts.Add(new Dropdown.OptionData(label));
                 }
                 sliceSizeDropdown.options = opts;
-                // 回显当前值；不在候选项（非法/旧配置）时钳到最近的合法项
-                int curIdx = Array.IndexOf(sliceChoices, newSliceSize);
-                if (curIdx < 0)
+
+                // 回显：关闭 → 选 OFF(0)；启用 → 选对应尺寸，尺寸不在候选时钳到最近合法项
+                int curIdx = 0;
+                if (newSlice)
                 {
-                    int nearest = ModConfig.DEFAULT_SLICE_SIZE;
-                    int best = 0;
-                    for (int ci = 0; ci < sliceChoices.Length; ci++)
+                    int si = Array.IndexOf(sliceChoices, newSliceSize);
+                    if (si < 0)
                     {
-                        if (Math.Abs(sliceChoices[ci] - newSliceSize) < Math.Abs(nearest - newSliceSize))
+                        int nearest = ModConfig.DEFAULT_SLICE_SIZE;
+                        int best = 0;
+                        for (int ci = 0; ci < sliceChoices.Length; ci++)
                         {
-                            nearest = sliceChoices[ci];
-                            best = ci;
+                            if (Math.Abs(sliceChoices[ci] - newSliceSize) < Math.Abs(nearest - newSliceSize))
+                            {
+                                nearest = sliceChoices[ci];
+                                best = ci;
+                            }
                         }
+                        newSliceSize = nearest;
+                        si = best;
                     }
-                    newSliceSize = nearest;
-                    curIdx = best;
+                    curIdx = si + 1; // +1 跳过 OFF
                 }
                 sliceSizeDropdown.value = curIdx;
-                int capturedIdx = curIdx;
                 sliceSizeDropdown.onValueChanged.AddListener(idx =>
                 {
-                    capturedIdx = idx;
-                    newSliceSize = sliceChoices[idx];
+                    if (idx <= 0)
+                    {
+                        // OFF：只关开关，尺寸保持上次值不变
+                        newSlice = false;
+                    }
+                    else
+                    {
+                        newSlice = true;
+                        newSliceSize = sliceChoices[idx - 1];
+                    }
                 });
             }
             else
