@@ -14,6 +14,10 @@ simDLL_RS/target/
 **/*.rs.bk
 Cargo.lock
 
+# C# mod 构建产物
+**/obj/
+**/bin/
+
 # IDE / 系统文件
 .idea/
 .vscode/

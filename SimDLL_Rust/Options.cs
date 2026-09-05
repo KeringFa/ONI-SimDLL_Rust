@@ -377,7 +377,9 @@ namespace SimDLL_Rust
                 opts.Add(new Dropdown.OptionData("OFF"));
                 for (int ci = 0; ci < sliceChoices.Length; ci++)
                 {
-                    string label = sliceChoices[ci] + "×" + sliceChoices[ci];
+                    // 用 ASCII 'x' 而非乘号 '×'（U+00D7）：游戏字体不保证含乘号字形，
+                    // 显示成方块/问号会误导玩家；游戏自带分辨率选项也用 "1920x1080" 写法。
+                    string label = sliceChoices[ci] + "x" + sliceChoices[ci];
                     opts.Add(new Dropdown.OptionData(label));
                 }
                 sliceSizeDropdown.options = opts;
