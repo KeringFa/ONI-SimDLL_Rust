@@ -539,6 +539,28 @@ namespace SimDLL_PerfProbe
         internal static void Postfix(long __state) { Probe.Record("Electrical.Update", Probe.EndUs(__state)); }
     }
 
+    // ===== v4 补测：Game.Update 调用链内的裸奔方法（签名已对反编译源核实） =====
+    [HarmonyPatch(typeof(LogicCircuitManager), "RenderEveryTick", new Type[] { typeof(float) })]
+    internal static class P_LogicCircuitRenderEveryTick
+    {
+        internal static void Prefix(out long __state) { __state = Probe.Begin(); }
+        internal static void Postfix(long __state) { Probe.Record("LogicCircuit.RenderEveryTick", Probe.EndUs(__state)); }
+    }
+
+    [HarmonyPatch(typeof(SolidConduitFlow), "RenderEveryTick", new Type[] { typeof(float) })]
+    internal static class P_SolidConduitFlowRenderEveryTick
+    {
+        internal static void Prefix(out long __state) { __state = Probe.Begin(); }
+        internal static void Postfix(long __state) { Probe.Record("SolidConduitFlow.RenderEveryTick", Probe.EndUs(__state)); }
+    }
+
+    [HarmonyPatch(typeof(AsyncPathProber.Manager), "TickFrame")]
+    internal static class P_AsyncPathProberTickFrame
+    {
+        internal static void Prefix(out long __state) { __state = Probe.Begin(); }
+        internal static void Postfix(long __state) { Probe.Record("AsyncPathProber.TickFrame", Probe.EndUs(__state)); }
+    }
+
     // ===== 寻路 / 变更监控 / 纹理 =====
     [HarmonyPatch(typeof(Pathfinding), "UpdateNavGrids")]
     internal static class P_UpdateNavGrids
