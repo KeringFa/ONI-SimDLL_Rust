@@ -82,6 +82,8 @@ namespace SimDLL_PerfProbe
         internal static long frameGc2;
         private static long lastGc0, lastGc1, lastGc2; // 上一帧边界快照
         private static long winGc0, winGc1, winGc2;   // 上一 Dump 窗口快照
+        // FastTrack 在场检测：-1 未知 / 0 未加载 / 1 已加载（决定测量口径解释）
+        private static int fastTrackLoaded = -1;
 
         internal static Vector3 lastCameraPos;
         internal static bool IsCameraMoving;
@@ -297,7 +299,13 @@ namespace SimDLL_PerfProbe
             foreach (var kv in samples) totalUs += kv.Value.totalUs;
 
             var sb = new System.Text.StringBuilder();
+            if (fastTrackLoaded < 0)
+            {
+                fastTrackLoaded = AccessTools.TypeByName("PeterHan.FastTrack.FastTrackMod") != null
+                    ? 1 : 0;
+            }
             sb.Append("[PerfProbe v4] window=").Append(winMs).Append("ms")
+              .Append(" ft=").Append(fastTrackLoaded)
               .Append(" fpsCap=").Append(Application.targetFrameRate)
               .Append(" vsync=").Append(QualitySettings.vSyncCount)
               .Append(" gc0+").Append(GC.CollectionCount(0) - winGc0)
