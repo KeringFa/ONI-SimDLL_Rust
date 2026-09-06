@@ -24,6 +24,31 @@ namespace SimDLL_PerfProbe
         {
             base.OnLoad(harmony);
             PatchRuntimeRenderMethods(harmony);
+            PatchUgui(harmony);
+        }
+
+        /// v4.1：GAP 拆解补盲——uGUI 画布重建（含 TMP 文本网格），运行时 patch
+        /// （UnityEngine.UI 是独立程序集，CanvasUpdateRegistry 为 internal，用 TypeByName）。
+        private static void PatchUgui(Harmony harmony)
+        {
+            var registry = AccessTools.TypeByName("UnityEngine.UI.CanvasUpdateRegistry");
+            if (registry == null)
+            {
+                UnityEngine.Debug.Log("[PerfProbe] CanvasUpdateRegistry not found, skip uGUI probe");
+                return;
+            }
+            var perform = AccessTools.Method(registry, "PerformUpdate");
+            if (perform != null)
+            {
+                harmony.Patch(
+                    perform,
+                    prefix: new HarmonyMethod(typeof(P_CanvasPerformUpdate), nameof(P_CanvasPerformUpdate.Prefix)),
+                    postfix: new HarmonyMethod(typeof(P_CanvasPerformUpdate), nameof(P_CanvasPerformUpdate.Postfix)));
+            }
+            else
+            {
+                UnityEngine.Debug.Log("[PerfProbe] CanvasUpdateRegistry.PerformUpdate not found, skip");
+            }
         }
 
         /// 运行时 patch 二进制 DLL 中的渲染方法（KBatchedAnimUpdater 不在反编译
@@ -523,6 +548,14 @@ namespace SimDLL_PerfProbe
     {
         internal static void Prefix(out long __state) { __state = Probe.Begin(); }
         internal static void Postfix(long __state) { Probe.Record("KBatchedAnimUpdater.GetVisibleArea", Probe.EndUs(__state)); }
+    }
+
+    /// v4.1：uGUI 画布重建总成本（CanvasUpdateRegistry.PerformUpdate，运行时 patch）。
+    /// 该方法在 player loop 中位于 Game.Update 链之外 → union 归因，直接从 RENDERGAP 里分账。
+    internal static class P_CanvasPerformUpdate
+    {
+        internal static void Prefix(out long __state) { __state = Probe.Begin(); }
+        internal static void Postfix(long __state) { Probe.Record("UI.CanvasPerformUpdate", Probe.EndUs(__state)); }
     }
 
     // ===== 管道/电路网络（每帧）=====
