@@ -65,6 +65,25 @@ pub fn frame_done(region_count: usize, mode: i32, threads: usize, elapsed_us: u6
             avg_us as f64 / 1000.0,
             p.max_us as f64 / 1000.0
         );
+        // 阶段分解行（2026-09-06 方向 A）：与 SimDLL_PerfProbe（C# 侧）互补。
+        // 口径标注：copy/emitters/sim_to_game = 主线程串行段（真实墙钟）；
+        // 其余 = 阶段 A/C rayon worker 内 CPU 累计（并行下 > 墙钟，除以并行
+        // 线程数估墙钟下界；serial 区域数=1 时等于墙钟）。
+        let stages = crate::a_framework::stage_profiler::drain_stages();
+        let frames_f = p.frames.max(1) as f64;
+        let mut stage_line = String::with_capacity(160);
+        stage_line.push_str("[simdll-stages] ");
+        for (i, ns) in stages.iter().enumerate() {
+            if i > 0 {
+                stage_line.push(' ');
+            }
+            stage_line.push_str(&format!(
+                "{}={:.2}",
+                crate::a_framework::stage_profiler::stage_name(i),
+                *ns as f64 / frames_f / 1000.0
+            ));
+        }
+        stage_line.push_str(" (ms/frame)\n");
         // 写游戏 logs 目录（与 simdll.log 同目录，动态推导）；失败回退临时目录。
         let dir = crate::a_framework::logger::resolve_log_dir();
         let path = if std::fs::create_dir_all(&dir).is_ok() {
@@ -79,6 +98,7 @@ pub fn frame_done(region_count: usize, mode: i32, threads: usize, elapsed_us: u6
         {
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(stage_line.as_bytes());
         }
         *p = FrameSample {
             frames: 0,

@@ -100,10 +100,6 @@ namespace SimDLL_Rust
             bool htAvailable = CpuInfo.HasHyperThreading();
             int currentReservedCores = ModConfig.ReservedCores;
             int newReservedCores = currentReservedCores;
-            bool currentSlice = ModConfig.SliceEnabled;
-            bool newSlice = currentSlice;
-            int currentSliceSize = ModConfig.SliceSize;
-            int newSliceSize = currentSliceSize;
 
             dialog.SetHeader(STRINGS.UI.FRONTEND.MOD_OPTIONS.DIALOG_TITLE);
 
@@ -339,132 +335,6 @@ namespace SimDLL_Rust
                 Debug.LogWarning("[SimDLL_Rust] RailModUploadMenu 不可用，预留线程数输入框不可用");
             }
 
-            // ===== Row：温度切片（OFF / 尺寸）—— 单一下拉同时表达"开关"与"尺寸" =====
-            // 用户定稿的交互：下拉共两类选项，最顶部 OFF（默认项，即关闭切片），
-            // 其下 64×64 / 32×32 / 16×16 / 8×8 —— 玩家选任一尺寸即启用切片。
-            // 因此不再单独放"启用切片"复选框（两者合并，避免开关与尺寸状态脱节）。
-            // 克隆的是游戏 GraphicsOptionsScreen（主菜单"图形"设置）里 Resolution 用的
-            // 原生 Dropdown —— 游戏自带的固定式下拉，兼容性最好。
-            var sliceSizeRowObj = NewRow(panelObj, "SliceSizeRow", 28);
-            if (plainTextPrefab != null)
-            {
-                var sliceSizeLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, sliceSizeRowObj, true);
-                var sliceSizeCsf = sliceSizeLabelObj.GetComponent<ContentSizeFitter>();
-                if (sliceSizeCsf != null) sliceSizeCsf.enabled = false;
-                var sliceSizeLabelText = sliceSizeLabelObj.GetComponentInChildren<LocText>();
-                if (sliceSizeLabelText != null)
-                {
-                    sliceSizeLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_SIZE_LABEL;
-                    sliceSizeLabelText.alignment = TextAlignmentOptions.Left;
-                    sliceSizeLabelText.raycastTarget = false;
-                }
-                var sliceSizeLabelLE = sliceSizeLabelObj.GetComponent<LayoutElement>()
-                    ?? sliceSizeLabelObj.AddComponent<LayoutElement>();
-                sliceSizeLabelLE.preferredWidth = 300;
-                sliceSizeLabelLE.flexibleWidth = 1;
-            }
-            // 克隆下拉：成功则用下拉选尺寸；失败则回退 TMP 输入框（见下行注释）。
-            Dropdown sliceSizeDropdown = CloneResolutionDropdown(sliceSizeRowObj.transform, out GameObject sliceDropdownGO);
-            TMP_InputField sliceSizeInput = null;
-            if (sliceSizeDropdown != null)
-            {
-                // —— 用克隆的游戏下拉：index 0 = OFF，1..4 = 尺寸（由大到小）——
-                // 选项文案纯文本（Unity Dropdown 不走 LocText）。
-                // 选 OFF → 关闭切片（保留上次尺寸，方便重新开启）；选任一尺寸 → 启用。
-                int[] sliceChoices = { 64, 32, 16, 8 };
-                sliceSizeDropdown.ClearOptions();
-                var opts = new System.Collections.Generic.List<Dropdown.OptionData>();
-                opts.Add(new Dropdown.OptionData("OFF"));
-                for (int ci = 0; ci < sliceChoices.Length; ci++)
-                {
-                    // 用 ASCII 'x' 而非乘号 '×'（U+00D7）：游戏字体不保证含乘号字形，
-                    // 显示成方块/问号会误导玩家；游戏自带分辨率选项也用 "1920x1080" 写法。
-                    string label = sliceChoices[ci] + "x" + sliceChoices[ci];
-                    opts.Add(new Dropdown.OptionData(label));
-                }
-                sliceSizeDropdown.options = opts;
-
-                // 回显：关闭 → 选 OFF(0)；启用 → 选对应尺寸，尺寸不在候选时钳到最近合法项
-                int curIdx = 0;
-                if (newSlice)
-                {
-                    int si = Array.IndexOf(sliceChoices, newSliceSize);
-                    if (si < 0)
-                    {
-                        int nearest = ModConfig.DEFAULT_SLICE_SIZE;
-                        int best = 0;
-                        for (int ci = 0; ci < sliceChoices.Length; ci++)
-                        {
-                            if (Math.Abs(sliceChoices[ci] - newSliceSize) < Math.Abs(nearest - newSliceSize))
-                            {
-                                nearest = sliceChoices[ci];
-                                best = ci;
-                            }
-                        }
-                        newSliceSize = nearest;
-                        si = best;
-                    }
-                    curIdx = si + 1; // +1 跳过 OFF
-                }
-                sliceSizeDropdown.value = curIdx;
-                sliceSizeDropdown.onValueChanged.AddListener(idx =>
-                {
-                    if (idx <= 0)
-                    {
-                        // OFF：只关开关，尺寸保持上次值不变
-                        newSlice = false;
-                    }
-                    else
-                    {
-                        newSlice = true;
-                        newSliceSize = sliceChoices[idx - 1];
-                    }
-                });
-            }
-            else
-            {
-                // —— 回退：RailModUploadMenu.modVersion 输入框 ——
-                Debug.LogWarning("[SimDLL_Rust] 分辨率下拉克隆失败，回退输入框");
-                if (railMenu != null)
-                {
-                    var versionSource = Traverse.Create(railMenu).Field<TMP_InputField>("modVersion").Value;
-                    if (versionSource != null)
-                    {
-                        var inputClone = Util.KInstantiateUI(versionSource.gameObject, sliceSizeRowObj, true);
-                        var inputLe = inputClone.GetComponent<LayoutElement>();
-                        if (inputLe == null) inputLe = inputClone.AddComponent<LayoutElement>();
-                        inputLe.preferredWidth = 80;
-                        inputLe.minWidth = 60;
-
-                        sliceSizeInput = inputClone.GetComponent<TMP_InputField>();
-                        if (sliceSizeInput != null)
-                        {
-                            sliceSizeInput.contentType = TMP_InputField.ContentType.IntegerNumber;
-                            sliceSizeInput.characterLimit = 2;
-                            sliceSizeInput.text = newSliceSize.ToString();
-
-                            var placeholder = sliceSizeInput.placeholder as TextMeshProUGUI;
-                            if (placeholder != null)
-                                placeholder.text = ModConfig.DEFAULT_SLICE_SIZE.ToString();
-
-                            sliceSizeInput.onEndEdit.AddListener(val =>
-                            {
-                                if (string.IsNullOrEmpty(val))
-                                {
-                                    newSliceSize = ModConfig.DEFAULT_SLICE_SIZE;
-                                    sliceSizeInput.text = newSliceSize.ToString();
-                                }
-                                else if (int.TryParse(val, out int result))
-                                {
-                                    newSliceSize = ModConfig.ClampSliceSize(result);
-                                    sliceSizeInput.text = newSliceSize.ToString();
-                                }
-                            });
-                        }
-                    }
-                }
-            }
-
             // ===== 下划线 + 提示 =====
             var dividerObj = new GameObject("Divider", typeof(RectTransform));
             dividerObj.transform.SetParent(panelObj.transform, false);
@@ -506,23 +376,7 @@ namespace SimDLL_Rust
                 htHintLE.flexibleWidth = 1;
             }
 
-            // 提示3（白色）：D4 温度切片说明
-            if (plainTextPrefab != null)
-            {
-                var sliceHintObj = Util.KInstantiateUI(plainTextPrefab.gameObject, panelObj, true);
-                var sliceHintCsf = sliceHintObj.GetComponent<ContentSizeFitter>();
-                if (sliceHintCsf != null) sliceHintCsf.enabled = false;
-                var sliceHintText = sliceHintObj.GetComponentInChildren<LocText>();
-                if (sliceHintText != null)
-                {
-                    sliceHintText.alignment = TextAlignmentOptions.Left;
-                    sliceHintText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_HINT;
-                }
-                var sliceHintLE = sliceHintObj.GetComponent<LayoutElement>() ?? sliceHintObj.AddComponent<LayoutElement>();
-                sliceHintLE.flexibleWidth = 1;
-            }
-
-            // 提示4（红色）：修改设置后需重启游戏生效
+            // 提示3（红色）：修改设置后需重启游戏生效
             if (plainTextPrefab != null)
             {
                 var restartObj = Util.KInstantiateUI(plainTextPrefab.gameObject, panelObj, true);
@@ -544,13 +398,10 @@ namespace SimDLL_Rust
             dialog.AddOption(global::STRINGS.UI.CONFIRMDIALOG.OK, d =>
             {
                 bool changed = newEnabled != currentEnabled || newHt != currentHt
-                    || newReservedCores != currentReservedCores
-                    || newSlice != currentSlice || newSliceSize != currentSliceSize;
+                    || newReservedCores != currentReservedCores;
                 if (newEnabled != currentEnabled) ModConfig.SetLogEnabled(newEnabled);
                 if (newHt != currentHt) ModConfig.SetHyperThreadOptimizationEnabled(newHt);
                 if (newReservedCores != currentReservedCores) ModConfig.SetReservedCores(newReservedCores);
-                if (newSlice != currentSlice) ModConfig.SetSliceEnabled(newSlice);
-                if (newSliceSize != currentSliceSize) ModConfig.SetSliceSize(newSliceSize);
                 if (changed) ModConfig.Save();
                 d.Deactivate();
                 if (changed)
@@ -610,97 +461,6 @@ namespace SimDLL_Rust
             le.preferredHeight = preferredHeight;
             le.flexibleWidth = 1;
             return rowObj;
-        }
-
-        /// <summary>
-        /// 克隆游戏主菜单"图形"设置（GraphicsOptionsScreen）里分辨率下拉（UnityEngine.UI.Dropdown）
-        /// 到 `parent`，返回克隆的 Dropdown（克隆失败返回 null，调用方应回退其他控件）。
-        ///
-        /// 获取链路（全部为序列化引用，ScreenPrefabs 常驻单例可达，无需某屏已打开）：
-        ///   ScreenPrefabs.Instance.OptionsScreen（OptionsMenuScreen prefab）
-        ///     → 私有字段 graphicsOptionsScreenPrefab（GraphicsOptionsScreen prefab，Traverse 反射）
-        ///     → 层级内找 Dropdown（路径 Find 优先，递归 GetComponentInChildren 兜底）
-        ///
-        /// 缩小宽度：原分辨率下拉较宽（GraphicsOptionsScreen 整行），此处把克隆体的
-        /// LayoutElement 收到与输入框一致的宽度（preferredWidth 80 / minWidth 60）。
-        /// </summary>
-        private static Dropdown CloneResolutionDropdown(Transform parent, out GameObject clonedGO)
-        {
-            clonedGO = null;
-            try
-            {
-                var screenPrefabs = ScreenPrefabs.Instance;
-                if (screenPrefabs == null || screenPrefabs.OptionsScreen == null)
-                {
-                    Debug.LogWarning("[SimDLL_Rust] ScreenPrefabs.OptionsScreen 不可用，无法克隆下拉");
-                    return null;
-                }
-
-                // 1) OptionsMenuScreen prefab → GraphicsOptionsScreen prefab（私有序列化字段）。
-                //    用非泛型 GetValue() 取 object 再 cast——字段类型是 GraphicsOptionsScreen，
-                //    泛型强转不匹配时 Traverse 会静默返回 null，难排查。
-                var graphicsObj = Traverse.Create(screenPrefabs.OptionsScreen)
-                    .Field("graphicsOptionsScreenPrefab").GetValue();
-                var graphicsPrefab = graphicsObj as Component;
-                if (graphicsPrefab == null)
-                {
-                    Debug.LogWarning("[SimDLL_Rust] graphicsOptionsScreenPrefab 不可用，无法克隆下拉");
-                    return null;
-                }
-
-                // 2) 找 Resolution 下拉：优先按用户给出的层级路径（AssetStudio 解包路径），
-                //    找不到再递归 GetComponentInChildren<Dropdown>（兜底拿第一个下拉）。
-                //    注意 GraphicsOptionsScreen 里还有一个"颜色模式"下拉，路径定位更精确。
-                Dropdown sourceDropdown = null;
-                var resPath = graphicsPrefab.transform.Find("Content/DisplaySettings/Resolution/Resolution");
-                if (resPath != null)
-                {
-                    sourceDropdown = resPath.GetComponent<Dropdown>();
-                }
-                if (sourceDropdown == null)
-                {
-                    sourceDropdown = graphicsPrefab.GetComponentInChildren<Dropdown>(true);
-                }
-                if (sourceDropdown == null)
-                {
-                    Debug.LogWarning("[SimDLL_Rust] GraphicsOptionsScreen 内找不到 Dropdown，无法克隆");
-                    return null;
-                }
-
-                // 3) 克隆到 parent（KInstantiateUI 深拷贝全部子物体：caption/template/option 等）
-                clonedGO = Util.KInstantiateUI(sourceDropdown.gameObject, parent.gameObject, true);
-                var cloned = clonedGO.GetComponent<Dropdown>();
-                if (cloned == null)
-                {
-                    Debug.LogWarning("[SimDLL_Rust] 克隆体缺少 Dropdown 组件");
-                    return null;
-                }
-
-                // 4) 收窄到与输入框一致的宽度。分辨率下拉宽是因为其 caption 文本长；
-                //    收窄 LayoutElement + 让 RectTransform 不再横向撑满。
-                var le = clonedGO.GetComponent<LayoutElement>();
-                if (le == null) le = clonedGO.AddComponent<LayoutElement>();
-                le.preferredWidth = 80;
-                le.minWidth = 60;
-                le.flexibleWidth = 0;
-                var rt = clonedGO.GetComponent<RectTransform>();
-                if (rt != null)
-                {
-                    rt.anchorMin = new Vector2(0f, 0.5f);
-                    rt.anchorMax = new Vector2(0f, 0.5f);
-                    rt.pivot = new Vector2(0f, 0.5f);
-                    rt.sizeDelta = new Vector2(80, rt.sizeDelta.y);
-                }
-                // 清掉原 dropdown 的旧选项与监听，避免把分辨率选项带进来
-                cloned.ClearOptions();
-                cloned.onValueChanged.RemoveAllListeners();
-                return cloned;
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning("[SimDLL_Rust] 克隆分辨率下拉异常: " + e.Message);
-                return null;
-            }
         }
 
         /// <summary>

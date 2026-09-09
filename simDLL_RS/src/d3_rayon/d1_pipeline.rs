@@ -83,6 +83,7 @@ fn ht_idle_mask(topo: &CpuTopology, ht_index: usize, reserve: usize) -> Option<u
 /// 实测 +5 FPS 来自并行度而非超线程规划）；如要恢复绑定，在
 /// worker_loop 开头调用本函数即可。
 #[allow(dead_code)]
+#[cfg(windows)]
 fn set_thread_affinity(mask: u64) {
     unsafe {
         let _ = windows::Win32::System::Threading::SetThreadAffinityMask(
@@ -91,6 +92,11 @@ fn set_thread_affinity(mask: u64) {
         );
     }
 }
+
+/// Linux 占位（亲和绑定已移除；如恢复需用 libc sched_setaffinity）。
+#[allow(dead_code)]
+#[cfg(target_os = "linux")]
+fn set_thread_affinity(_mask: u64) {}
 
 /// 每帧线程相位：A（网格物理）或 C（收尾）。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,10 +113,6 @@ struct FrameContext {
     cosmic: Vec<f32>,
     rng_ptrs: Vec<SendSyncPtr<RegionRng>>,
     events_ptrs: Vec<SendSyncPtr<RegionEvents>>,
-    /// D4：各区域的温度事件缓冲指针（非 D4 路径全为 null，任务里跳过前置）。
-    temp_ptrs: Vec<SendSyncPtr<RegionEvents>>,
-    /// D4：温度是否已由全局切片路径跑完（阶段 A 任务跳过 derive + 温度）。
-    skip_temperature: bool,
     phase: Phase,
 }
 
@@ -174,11 +176,10 @@ fn worker_loop(
 ) {
     // 实验：不绑定亲和性，交给 OS 调度（线程数 = 组数，天然用满超线程核）。
     while let Ok(()) = rx.recv() {
-        let (sim, phase, skip_temperature, jobs) = {
+        let (sim, phase, jobs) = {
             let f = frame.lock().unwrap_or_else(|e| e.into_inner());
             let sim = f.sim;
             let phase = f.phase;
-            let skip_temperature = f.skip_temperature;
             let jobs: Vec<_> = group
                 .region_indices
                 .iter()
@@ -188,18 +189,13 @@ fn worker_loop(
                     let pp = f.pp[i];
                     let rng = f.rng_ptrs[i].get();
                     let events = f.events_ptrs[i].get();
-                    let temp = f.temp_ptrs.get(i).map(|p| p.get()).unwrap_or(std::ptr::null_mut());
-                    (bounds, cosmic, pp, rng, events, temp)
+                    (bounds, cosmic, pp, rng, events)
                 })
                 .collect();
-            (sim, phase, skip_temperature, jobs)
+            (sim, phase, jobs)
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for (bounds, cosmic, pp, rng, events, temp) in jobs {
-                // D4：本区域的温度事件先于气体/液体事件进入同一份区域缓冲（非 D4 为 null）。
-                if !temp.is_null() {
-                    unsafe { (*events).append_from(&*temp) };
-                }
+            for (bounds, cosmic, pp, rng, events) in jobs {
                 with_region_rng(rng, || {
                     with_region_sink(events, || unsafe {
                         match phase {
@@ -208,7 +204,6 @@ fn worker_loop(
                                 bounds,
                                 cosmic,
                                 true,
-                                skip_temperature,
                             ),
                             Phase::C => crate::c2_physics::run_region_physics_c(
                                 &mut *sim.get(),
@@ -235,8 +230,6 @@ pub fn run_d1_pipeline(
     region_pp_bounds: &[RegionBounds],
     region_cosmic: &[f32],
     groups: &[AffinityGroup],
-    temp_events: &[RegionEvents],
-    skip_temperature: bool,
 ) {
     if region_bounds.is_empty() || groups.is_empty() {
         return;
@@ -251,13 +244,6 @@ pub fn run_d1_pipeline(
         (0..region_bounds.len()).map(|_| Default::default()).collect();
     let events_ptrs: Vec<SendSyncPtr<RegionEvents>> = (0..region_bounds.len())
         .map(|i| SendSyncPtr(&mut region_events[i] as *mut RegionEvents))
-        .collect();
-    // D4：温度事件按区域前置进阶段 A 缓冲（同 D2，见 pipeline.rs 的对应注释）。
-    let temp_ptrs: Vec<SendSyncPtr<RegionEvents>> = (0..region_bounds.len())
-        .map(|i| match temp_events.get(i) {
-            Some(te) => SendSyncPtr(te as *const RegionEvents as *mut RegionEvents),
-            None => SendSyncPtr::default(),
-        })
         .collect();
     let sim_ptr = SendSyncPtr(sim as *mut SimData);
 
@@ -275,8 +261,6 @@ pub fn run_d1_pipeline(
             cosmic: Vec::new(),
             rng_ptrs: Vec::new(),
             events_ptrs: Vec::new(),
-            temp_ptrs: Vec::new(),
-            skip_temperature: false,
             phase: Phase::A,
         }));
         let barrier = Arc::new(Barrier::new(groups.len() + 1));
@@ -293,8 +277,6 @@ pub fn run_d1_pipeline(
         f.cosmic = region_cosmic.to_vec();
         f.rng_ptrs = rng_ptrs;
         f.events_ptrs = events_ptrs;
-        f.temp_ptrs = temp_ptrs;
-        f.skip_temperature = skip_temperature;
         f.phase = Phase::A;
     }
 
@@ -428,7 +410,7 @@ mod tests {
     /// 液体总质量守恒。
     #[test]
     fn d1_pipeline_preserves_mass() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_two_region_sim();
         let bounds: Vec<RegionBounds> = sd
             .active_regions
@@ -454,7 +436,7 @@ mod tests {
                 affinity_mask: 2,
             },
         ];
-        run_d1_pipeline(&mut sd, &bounds, &pp, &cosmic, &groups, &[], false);
+        run_d1_pipeline(&mut sd, &bounds, &pp, &cosmic, &groups);
         unsafe {
             let u = &*sd.updated_cells.ptr;
             let mut total = 0.0f32;

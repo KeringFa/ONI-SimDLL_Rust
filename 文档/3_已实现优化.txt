@@ -1,0 +1,97 @@
+================================================================================
+simDLL_RS 已实现优化记录（2026-09-06 批次）
+来源：1_优化点_豆包2.1_Turbo.txt（评估）→ 2_重申优化点.txt（拍板）→ 本文件（落地）
+验证基准：588 单元测试全绿 + release 构建；部署 Local/SimDLL_Rust/SimDLL_RS.sim
+================================================================================
+
+同一日早前批次（同模式，一并记录）
+--------------------------------------------------------------------------------
+【R0】BFS visited 世代戳复用池（c_simulation/bfs_scratch.rs，新建）
+  改动：thread_local Scratch{visited: Vec<u32>, generation: u32}，
+        with_visited_scratch(total, |visited, gen| ...)。
+        visited[i]==gen ⟺ 已访问，免每次 218KB 分配+清零。
+  接入 4 处 BFS：frame_processor find_reachable_state（泵选格）/
+        flood_removed（质量移除）/ disease get_reachable_cells（病菌发射）/
+        element_emitter get_reachable_cells（火山喷发）。
+  行为：逐位等价（世代戳与 bool 逻辑等价）；嵌套调用 fail-loud（RefCell panic）。
+  收益：中后期 15-80 次 BFS/帧 × 218KB ≈ 3-16MB/帧 分配+清零消除。
+  新增护栏：get_reachable_cells_repeated_calls_are_isolated（连续/交叉调用隔离）。
+  注：尺寸变化（切存档）resize+清零+世代归零；u32 回绕清零重来。
+
+本批次 T1-T6（豆包清单落地）
+--------------------------------------------------------------------------------
+【T1 = 清单#15】温度换热 f64 → f32（原版对齐修正）
+  位置：c2_physics/temperature.rs calculate_temperature_exchange_precise
+  改动：删除 6 次 as f64 中间转换，全程 f32；min 链运算顺序不变。
+  依据：原版 SimDLL_Source.c L133833+ 全程 float（fVar 序列）——Rust 的 f64
+        中间计算是精度偏差而非增强；改回 f32 即向原版对齐。
+  收益：~3-5% 帧时间（消除 cvt 转换 + 解除温度主路径 SIMD 向量化阻碍）。
+  验证：587 测试全绿（温度断言均为 1e-4 容差，f32 精度足够）。
+  游戏内验证点：熔化/凝固/换热阈值行为与原版一致。
+
+【T2 = 清单#1】region 局部 CopyFrom 逐格 → 行级 memcpy
+  位置：c_simulation/sim_data_ops.rs copy_updated_cells_to_cells_region
+  改动：macro copy_row_field! 按行 copy_nonoverlapping（11 字段各自整行拷贝，
+        类型逐一核对：u16/f32×3/u8×4/i32/f32），替代逐格 11 次 .set() 边界检查。
+  依据：串行 copy_from 本就用 copy_nonoverlapping；原版 CellSOA::CopyFrom 用 memcpy。
+  收益：多星 11 区域 × 每子步 3 次区域同步的逐格循环开销消除。
+  行为：拷贝数据逐位一致（同字段同长度同顺序）。
+
+【T3 = 清单#13】温度 pair_allowed / update_temperature_pair 查表复用
+  位置：c2_physics/temperature.rs
+  改动：
+    - pair_allowed 拆出 pair_allowed_etd(etd_a, etd_b) 纯判定（门控顺序不变）；
+    - update_temperature_pair 拆出 update_temperature_pair_with(…, &etd_a, &etd_b)
+      （免重查，原签名保留为薄包装，测试直接调用不受影响）；
+    - run_temperature_band 调用点：|ΔT|≥1 门控**通过后**才查双方 ETD（惰性），
+      查到的 ETD 同时供判定与换热使用——每对省 2 次 ETD 查表。
+  ⚠️ 实施教训：首版把查表提到门控前，"多数格温差小"的稳定场景反而变慢
+     （负优化），已改为惰性查表。查表时机必须与门控收益一起评估。
+
+【T4 = 清单#18】气体 gas_pair_ok / update_pressure 查表复用
+  位置：c2_physics/gas_flow.rs（gas_pair_ok + 主循环 3 处调用）、
+        c2_physics/liquid_flow.rs（update_pressure 拆分）
+  改动：
+    - gas_pair_ok 返回 Option<(dst_elem, dst_pd)>（通过时带走邻格压力数据）；
+    - update_pressure 拆出 pub(crate) update_pressure_with(…, cell_elem,
+      neighbor_elem, &cell_pd, &neighbor_pd)，免重查 2 次 pressure data；
+    - gas_flow 主循环：源格 pd 在循环开头查过后经元组传递（src_pd），
+      三处调用点（水平/垂直/对角）全部改走 update_pressure_with。
+  行为：门控顺序逐位一致（含对角 !corner_blocked 门控——实施中曾误删已即时恢复）。
+
+【T5 = 清单#16】combine_conductivity insulation LUT
+  位置：c2_physics/temperature.rs
+  改动：static INSULATION_IV_LUT: [f32; 256]，const 求值
+        iv = ins*ins*1.53787e-05（同表达式同顺序 → 逐位一致）；
+        combine_conductivity 查表取 iv_a/iv_b（tc 项仍现算——f32 连续值不可查表）。
+  新增护栏：insulation_iv_lut_matches_inline_computation
+        （256 值与现算逐位全等断言，任一侧改写导致舍入差异即红）。
+
+【T6 = 清单#21】gas_flow src_mass 未使用读取删除
+  位置：c2_physics/gas_flow.rs 主循环 src 读取块
+  改动：删除 cells.mass.get(src) 读取与 let _ = src_mass（与 T4 的 src_pd
+        元组重构一并完成）。
+  依据：原版调用方不使用该值（UpdatePressure 内部重读）。
+
+评估后放弃（留档防误捡）
+--------------------------------------------------------------------------------
+【T7 = 清单#3】update_data 每子步 4 个 Vec 分配 —— 放弃
+  原因：实测分配 ~500B-2KB/子步（<0.01% 帧时间），消除需把 d3 pipeline 的
+  rayon 闭包捕获从"每 group clone Vec"重构为切片借用——动刚稳定的多星并行
+  核心，风险收益不成比例。（对照：visited 复用单次 218KB×15-80 次/帧，
+  量级差 1000 倍，所以值得。）
+其余不做项及理由见 2_重申优化点.txt 第三节。
+
+验证与部署
+--------------------------------------------------------------------------------
+- 单元测试：588 passed / 0 failed（基线 586 → +LUT 一致性 → +隔离隔离护栏注：
+  visited 批次 +1 隔离测试、本批次 +1 LUT 测试）
+- release 构建：Finished（25.1s）
+- 部署：Local/SimDLL_Rust/SimDLL_RS.sim（1,970,688 B，sha 与构建产物一致）
+
+预期收益汇总（待游戏内 perf 日志验证）
+--------------------------------------------------------------------------------
+- 单星（串行）：T1 温度主路径 ~3-5% + T3/T5 温度热路径 ~1-2% + R0 分配消除
+- 多星（D2/D1 并行）：T2 区域同步开销 + T4 气体热路径 + R0
+- 综合：约 5-8% 帧时间
+================================================================================

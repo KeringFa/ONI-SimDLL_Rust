@@ -1,11 +1,27 @@
 项目说明：
 1. 项目名称：simDLL_RS；基于游戏《缺氧》的原版simDLL，用Rust编程语言构建的Rust版simDLL。
-2. 本地反编译源码汇总参考："C:\Users\KeringFa\Desktop\simDLL_RS_Kit\OxygenNotIncluded_Source"
-3. 原版游戏Data文件夹："C:\Users\KeringFa\Desktop\simDLL_RS_Kit\OxygenNotIncluded_Data"
-4. 原版simDLL.dll的编程语言为C++，反编译源码："C:\Users\KeringFa\Desktop\simDLL_RS_Kit\OxygenNotIncluded_Source\SimDLL_Source.c"；源码由ghidra_12.1.2_PUBLIC工具加载simDLL.pdb后导出；源码切片（方便对照）："C:\Users\KeringFa\Desktop\simDLL_RS_Kit\OxygenNotIncluded_Source\simDLL_edit"
+2. 本地反编译源码汇总参考："my_Project\OxygenNotIncluded_Source"
+3. 原版游戏："my_Project\OxygenNotIncluded"。内涵动态链接库、数据表格等。
+4. 原版simDLL.dll的编程语言为C++，反编译源码："my_Project\OxygenNotIncluded_Source\SimDLL_Source.c"；源码由ghidra_12.1.2_PUBLIC工具加载simDLL.pdb后导出；源码切片（方便对照）："my_Project\OxygenNotIncluded_Source\simDLL_edit"
+5. my_Project\OxygenNotIncluded\OxygenNotIncluded_Data\Managed 是原版游戏的库
 
-项目目的：使用rust语言重写simDLL.dll，并能正常运行游戏，加载存档进入世界。
-项目位置："C:\Users\KeringFa\Desktop\simDLL_RS_Kit\simDLL_RS"
+项目目的：
+1. 使用rust语言重写SimDLL.dll，并能正常运行游戏，加载存档进入世界。v1版本已经完成，可能存在某些没有实现的原版机制或模块。
+2. 性能优化：实现2种多线程并行技术。v1版本已经完成，但可能存在代码文件分类误导或其他问题。
+3. 进阶优化：探索第三条性能优化路径。
+
+网络上类似的模组："my_Project\other\simSimDLL-main"，网站为: "https://github.com/R9MX4/simSimDLL", 已经停更，且无法应用在游戏中。
+
+项目代码位置："my_Project\simDLL_RS_Kit_v1\simDLL_RS"
 
 用户备注：
-1. 用户是代码小白，如有不理解或任何疑问请及时提出。
+1. 用户是代码小白，可能存在叙述错误或不合常理的话，如有不理解或任何疑问请及时提出。
+2. 代码注释可能存在误导或过时问题。
+
+其他：
+1. Local文件夹是模组发布前备份，实际模组加载位置: C:\Users\KeringFa\Documents\Klei\OxygenNotIncluded\mods\Local
+2. SimDLL_PerfProbe项目是临时数据收集模组，主要收集游戏内帧数情况。
+3. SimDLL_Rust项目是模组接口，内含其他控制。
+4. 文档文件夹包含一些研究数据。
+5. 日志文件夹由用户维护提供最新的日志文件。
+6. 本地的Git仓库配置混乱，暂且先用着。

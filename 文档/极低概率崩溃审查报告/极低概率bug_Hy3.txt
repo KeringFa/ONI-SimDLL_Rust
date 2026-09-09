@@ -1,0 +1,216 @@
+=====================================================================
+simDLL_RS 极低概率崩溃（EMBARK 首帧 HandleVector 越界）根因分析报告
+=====================================================================
+分析日期：2026-08-11
+分析方式：静态代码审查（未改动任何源文件，仅阅读与交叉对照）
+依据材料：
+  - 极低概率崩溃.txt（现象与既有排查记录）
+  - simDLL_RS项目说明.txt
+  - simDLL_RS/src 下 Rust 源码
+  - OxygenNotIncluded_Source/SimDLL_Source.c（原版 C++ 反编译）
+  - OxygenNotIncluded_Source 下 C# 源码（Game.cs / HandleVector.cs 等，间接对照）
+
+---------------------------------------------------------------------
+一、崩溃机制（确认）
+---------------------------------------------------------------------
+C# 在 Game.StepTheSim 中遍历 simDLL 返回的 GDU.callback_info，对每一条执行：
+
+    handle.index = callbackInfo.callbackIdx;
+    callbackManager.IsVersionValid(handle);   // 越界 → ArgumentOutOfRangeException
+
+HandleVector.IsVersionValid 内部为：
+    index = handle.index & 0xFFFFFF;
+    return versions[index] == version;
+
+只要 callback_idx 不在 C# callbackManager.versions[] 的当前有效范围内，就会索引越界。
+报告里用 “callbackIdx = -1 → (-1)&0xFFFFFF = 0xFFFFFF = 16777215” 举例，说明
+“越界”的其中一种情形；实际越界同样可由“正数但超出注册数”造成。
+
+---------------------------------------------------------------------
+二、逐步排查与排除项（均已读源码核实，非推测）
+---------------------------------------------------------------------
+排查项                              结论      关键证据
+----------------------------------  --------  ------------------------------------------------
+是否多推了 callback_info           否        全仓仅 5 个 CallbackInfo{…} 构造点，与原版一致
+5 处 push 是否都过滤 -1            是        dig/set_cell_properties/cell_modifications：
+                                                  != -1（frame_processor.rs:144/367/503）
+                                               element_emitter blocked/unblocked：
+                                                  cb != 0xFFFFFFFF（element_emitter.rs:442/466）
+element_emitter 默认哨兵           正确       blocked_cb_idx/unblocked_cb_idx 默认 0xFFFFFFFF
+                                                （element_emitter.rs:48-49）
+结构体字段错位（callback_idx
+读到别的字段）                      否        CellModification / CellPropertiesChange / DigPoint
+                                                的 callback_idx 均在 offset 4（第 2 个 i32），
+                                                与 C# 消息字节序一致（sim_events.rs:20-25/37-42/148-153）
+帧间残留 / 乒乓                     否        copy_sim_data_to_game 交换后清空
+                                                （sim_data_ops.rs:289 交换、:313 清空）
+线程竞态 / 悬垂指针（GDU 交接）    否        sim 线程 m_sim_mutex + SimSync/GameSync 双缓冲，
+                                                主线程读完才换（sim_thread.rs:75-223）
+MsvcVector.len()/as_ptr() 算错    否        len = end-begin、as_ptr = begin（stl_shim.rs:45/92）
+
+补充核实：
+- element_chunk / radiation / mass_consumed 这三类消息在 Rust 中分别推到
+  component_state_changed_messages / radiation_consumed_callbacks /
+  mass_consumed_callbacks，并不推到 callback_info，因此不存在“多推到 callback_info”。
+- GDU 的 callback_info 指针与数量由 save_load.rs:662-672 从
+  game_data.callback_info.as_ptr() / .len() 给出，正确。
+
+核心推论：
+  5 个 push 点均正确过滤 -1（含 0xFFFFFFFF），故 -1 不可能从 sim 这一侧漏进
+  gdu.callback_info。
+
+---------------------------------------------------------------------
+三、根因结论
+---------------------------------------------------------------------
+非法 callback_idx 只剩两种可能：
+  (A) -1（已被全部过滤排除）
+  (B) 正数但越界
+
+既然 (A) 已被排除，崩溃值必为 (B)：一个“正数但越界”的索引——
+即 C# 自己通过消息交给 sim 的句柄，但在 C# 读取 GDU 的那一刻，
+C# 的 callbackManager 里其实没有这个有效句柄（索引超出 versions[] 当前容量，
+或版本/注册顺序不一致）。
+
+这正是原有 bug 报告里的第二类假说：
+  “cb 索引与 C# 注册数不同步（顺序/数量差异）”。
+
+本质：sim 线程（生成 callback_info）与主线程（注册句柄）之间的
+【跨组件状态失同步】，不是 sim 内部单纯的 -1 漏过过滤。
+
+---------------------------------------------------------------------
+四、最可疑的具体触发点（EMBARK 首帧）
+---------------------------------------------------------------------
+element_emitter.rs:438-478 的 blocked / unblocked 回调推送。
+
+理由：
+1. 5 个 push 点里，只有它是“首帧内自发触发”的（由 elapsed_time + 是否有空间
+   决定状态翻转），不依赖玩家后续操作；其余 4 个均由显式消息驱动。
+2. 它转发的 onBlockedCB / onUnblockedCB，是“世界生成阶段” AddElementEmitter
+   时 C# 传进来的句柄；sim 侧仅原样转发（blocked_cb_idx / unblocked_cb_idx 由
+   element_emitter.rs:155-156 从 msg.on_blocked_cb / on_unblocked_cb 存入）。
+3. 世界生成时大量建筑 OnSpawn 注册句柄，且发射器句柄通过 free_handles 复用
+   （element_emitter.rs:160-165），导致“sim 视图的句柄”与“C# callbackManager
+   视图的句柄”在首帧极易出现顺序/版本错位。
+
+---------------------------------------------------------------------
+五、为何“极低概率 + 只在首帧”
+---------------------------------------------------------------------
+- 只在首帧：世界刚生成、建筑 OnSpawn 集中注册句柄，且发射器首帧就可能发生
+  blocked/unblocked 状态翻转；后续稳定游玩时句柄状态已一致。
+- 极低概率：是否触发取决于世界生成时建筑集合与注册顺序、以及某个发射器
+  的状态翻转是否恰好与 C# callbackManager 的句柄状态不一致——属罕见时序/顺序
+  条件，故 n=2 / 大量新建未再崩。
+
+---------------------------------------------------------------------
+六、确认步骤（必须用诊断日志复现，才能最终定位到具体行）
+---------------------------------------------------------------------
+仿真侧全部正确，差异在 C#↔sim 的句柄同步时序，静态审查无法 100% 锁定
+“到底哪一个 push 点、哪一个句柄越界”。报告第四节已埋好诊断点：
+
+  - element_emitter.rs:444-477  记录 cb / cb_signed + event 标记
+    （element_emitter_blocked_callback / element_emitter_unblocked_callback）
+  - save_load.rs:662-667        记录每帧 callback_info count
+
+操作：
+  1. 开启日志 → 重启 → 反复新建游戏（重复多次）
+  2. 崩溃后收集 simdll.log
+  3. 重点看“崩溃前最后一帧”的：
+       - callback_info count
+       - emitter push 的 cb / cb_signed 值
+  4. 判定：
+       - 若 cb == -1 / 0xFFFFFFFF：说明某个过滤其实没挡住（sim 内部问题，
+         需回看对应 push 点的过滤条件）
+       - 若 cb 为大正数：即为“句柄越界（C#↔sim 失同步）”，与本文第三节结论一致
+
+---------------------------------------------------------------------
+七、关于“防御性过滤”的提醒（不建议作为根因修复）
+---------------------------------------------------------------------
+bug 报告第五节建议：对 callback_info push 增加“callback_idx < 0 或 > 0xFFFF 时
+丢弃并告警”。这属于【止血】式防御过滤，不是根因修复：
+  - 它能在崩溃时避免越界，但会悄悄丢弃本应触发的回调（如发射器 blocked/unblocked
+    通知丢失），可能引入其它隐性行为异常；
+  - 报告原话亦提醒：“需先确认合法上限语义，勿凭猜测改动”。
+应先按第六节复现取证，确认是 -1 漏过还是句柄失同步，再决定修“过滤逻辑”还是
+修“C#↔sim 句柄注册时序”。
+
+---------------------------------------------------------------------
+八、一句话结论
+---------------------------------------------------------------------
+崩溃是 gdu.callback_info 中出现一个 C# callbackManager 查不到的 callback_idx；
+sim 侧 5 个 push 点对 -1 的过滤均已确认正确，故根因为【首帧世界生成期间，
+sim 转发的回调句柄与 C# 回调管理器注册状态失同步】，最可疑触发点是
+element_emitter 的 blocked/unblocked 首帧自发推送。最终定位须用已埋诊断日志复现一次。
+
+---------------------------------------------------------------------
+九、C# 侧确认（补充核查，2026-08-11，仍只读未改源文件）
+---------------------------------------------------------------------
+对照 OxygenNotIncluded_Source 的 C# 源码后，崩溃机制与根因得到进一步收紧：
+
+1) 崩溃确切抛出点（已确认）
+   Game.StepTheSim 遍历 ptr->callbackInfo（Game.cs:1120-1131），对每条：
+       handle.index = callbackInfo.callbackIdx;
+       if (!IsManuallyReleasedHandle(handle))  // Game.cs:1127
+   而 IsManuallyReleasedHandle（Game.cs:2013）第一行即调用
+       callbackManager.IsVersionValid(handle)
+   异常就在这里抛出。调用链：
+       Game.StepTheSim → Game.IsManuallyReleasedHandle
+         → HandleVector<CallbackInfo>.IsVersionValid（HandleVector.cs:186-191）
+         → versions[index] 越界 → System.ArgumentOutOfRangeException
+   （report 第一节把“抛出点”笼统写成 callbackManager.IsVersionValid，
+    现精确定位为：从 Game.IsManuallyReleasedHandle 进入 HandleVector.IsVersionValid。）
+
+2) IsVersionValid 无任何边界保护（已确认，关键）
+   HandleVector.cs:186-191：
+       byte num   = (byte)(handle.index >> 24);
+       int  index = handle.index & 0xFFFFFF;
+       return num == versions[index];      // ← 直接索引，无 bounds 检查
+   versions 是 List<byte>，长度 = 当前已分配句柄槽数（初始 256，随 Add 增长）。
+   只要 index >= versions.Count，versions[index] 必抛 ArgumentOutOfRangeException。
+   这正是 bug 报告里的异常类型，完全吻合。
+
+3) C# 侧没有 -1/哨兵兜底（已确认）
+   IsVersionValid 内部【没有】先调用 IsValid()（HandleVector.cs:181-184 的哨兵判断）。
+   因此 C# 对越界 idx 毫无防护，完全依赖 sim 侧不产出越界 callback_idx。
+   反推：若 sim 漏过 -1（→ index = 0xFFFFFF = 16777215），同样会在这里越界崩。
+   所以 sim 侧对 -1 / 0xFFFFFFFF 的过滤是“唯一”的 -1 防线，与 report 第三节一致。
+
+4) 句柄在 C# ↔ sim 之间“原样往返”（已确认）
+   ElementEmitter 侧：
+     OnSpawn()      → onBlockedHandle = callbackManager.Add(...)   （ElementEmitter.cs:30-31）
+     OnSimRegister()→ SimMessages.AddElementEmitter(..., onBlockedHandle.index, onUnblockedHandle.index)
+                                                                    （ElementEmitter.cs:101-105）
+   传给 sim 的 onBlocked_cb 即为该 Handle 的打包值 (version<<24 | slot)。
+   Rust 原样存为 blocked_cb_idx，推送时原样写回 callbackIdx；
+   C# StepTheSim 再用 callbackInfo.callbackIdx 还原同一 Handle。
+   故 sim 回传的 slot / version 就是 C# 当初给出的那个——崩溃与否只取决于
+   “此刻 callbackManager 里该 slot 是否仍有效”。
+
+5) 崩溃的【必要条件】被收紧（重要修正/细化）
+   IsVersionValid 有两种失败：
+     (a) index >= versions.Count        → 抛 ArgumentOutOfRangeException（= 本次崩溃）
+     (b) index <  versions.Count 但
+         versions[index] != num(版本)     → 仅返回 false，被静默丢弃（不崩）
+   报告里的崩溃是 ArgumentOutOfRangeException，故必然是 (a)：
+       崩溃 callback_idx 的【低 24 位 slot 索引 ≥ 当前 callbackManager 的槽数】。
+   也就是说：sim 回传的 callback_idx 指向的“槽位”，在【当前】callbackManager 实例里
+   根本不存在（从未被分配过）。版本不匹配（情形 b）只会悄悄丢掉回调，不会崩。
+
+   ⇒ 根因从“句柄失同步”进一步细化为：
+     【sim 持有一个来自“其它 callbackManager 生命周期”的失效句柄】
+     （典型：EMBARK 前的模板/预览阶段、或上一局，曾分配过 >256 个槽；
+      新一局 callbackManager 重新以 256 起建，sim 却仍回传一个 slot ≥ 256 的旧句柄；
+      首帧推送该旧句柄 → 越界 → 崩）。
+   这与“只在首帧”（新世界建筑 OnSpawn 后 callbackManager 迅速增长，slot 一旦落入
+   新容量内就转为情形 b 静默丢弃，不再崩）、“极低概率”（是否恰好有旧高 slot 句柄
+   在首帧被推送、且早于 callbackManager 扩容）完全自洽。
+
+6) 复现取证建议（更新 report 第六节）
+   在崩溃日志中，除看 cb / cb_signed 与 callback_info count 外，应再加一项：
+     - 崩溃当帧 callbackManager.versions.Count（即当前槽数）
+   判定：
+     - 若 cb 的低 24 位 (cb & 0xFFFFFF) >= 当时 versions.Count
+         → 坐实为“旧生命周期句柄 slot 越界”（本报告第九节结论）。
+     - 若 cb 的低 24 位 < versions.Count 但版本不匹配
+         → 那是情形 (b)，不会崩，说明本次崩溃另有其因，需回看其它 push 点。
+   由此可从日志一次性区分“slot 越界（崩）”与“版本错位（静默丢）”，
+   直接坐实根因，无需改代码即可定论。

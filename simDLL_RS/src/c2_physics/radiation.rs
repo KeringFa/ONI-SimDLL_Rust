@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn radiation_sickness_disease_contributes_count_times_0001() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         init_radiation_table();
         install_rs_table(true);
         let mut sd = make_sim();
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn non_radiation_sickness_disease_does_not_contribute() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         init_radiation_table();
         install_rs_table(true);
         let mut sd = make_sim();
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn no_disease_cell_contributes_zero() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         init_radiation_table();
         install_rs_table(true);
         let mut sd = make_sim();
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn missing_disease_table_skips_contribution() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         init_radiation_table();
         uninstall_disease_table();
         let mut sd = make_sim();
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn table_without_radiation_sickness_is_noop() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         init_radiation_table();
         install_rs_table(false); // 表无 RS → GetDiseaseIndex 返回 0xff
         let mut sd = make_sim();
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn update_data_applies_radiation_sickness_contribution() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         create_solid_table();
         install_rs_integration_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false); // radiation_enabled=true
@@ -517,7 +517,7 @@ mod tests {
     /// 任务 3a：DLC 门控——radiation_enabled=false → 零执行（辐射不变、occlusion 不被填）。
     #[test]
     fn radiation_task_gated_by_enabled_flag() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_radiation_table();
         let mut sd = make_sim();
         sd.radiation_enabled = false;
@@ -538,7 +538,7 @@ mod tests {
     /// → 中心格 +10×0.001×1000×1.0 = 10；距离 1 权重 0.75 → +7.5。
     #[test]
     fn radiation_task_spreads_element_kernel() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_radiation_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -560,7 +560,7 @@ mod tests {
     /// 固体（factor=0.5, mass 大）→ occlusion 衰减。
     #[test]
     fn radiation_task_cosmic_occlusion_and_apply() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_radiation_table();
         let mut sd = make_sim();
         // cell 13（行1 列5）= 固体 1；cell 21（行2 列5）= 真空 0；cell 29（行3 列5）= 真空 0（顶）
@@ -588,7 +588,7 @@ mod tests {
     /// 的微小漏射被清零，不再累加 cosmic。
     #[test]
     fn radiation_task_occlusion_below_threshold_zeroed() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_radiation_table();
         let mut sd = make_sim();
         // cell 13（行1 列5）= 元素3（factor 1.0）mass=1986 →
@@ -617,7 +617,7 @@ mod tests {
     /// 并行下该共享缓冲还会被多 region 线程竞争写，导致宇宙辐射间歇性穿透方块。
     #[test]
     fn radiation_task_vertical_regions_occlusion_isolated() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_radiation_table();
         let mut sd = make_sim();
         // 上方 region B：y 4..7。y=6/y=5 真空，y=4 固体（elem1, mass2000, factor0.5）
@@ -664,7 +664,7 @@ mod tests {
     /// 极小值（0.005）→ 清零；超大值（1e7）→ 钳到 9e6。
     #[test]
     fn radiation_task_decay_and_clamp() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_radiation_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {

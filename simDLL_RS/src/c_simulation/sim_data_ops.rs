@@ -8,7 +8,6 @@
 
 use crate::a_framework::sim_data::SimData;
 use crate::a_framework::game_data::{EmittedMassInfo, GameData};
-use crate::d1_activity::{compute_region_bounds, RegionBounds};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// CopySimDataToGame 内局部静态 tick_count 的镜像（原版 11_msvcrt_ignored.c L32494-32498）：
@@ -169,24 +168,35 @@ pub fn copy_updated_cells_to_cells_region(
     }
     let cells = unsafe { &mut *sim_data.cells.ptr };
     let upd = unsafe { &*sim_data.updated_cells.ptr };
-    for row in min_y..max_y {
-        for col in min_x..max_x {
-            let i = row * w + col;
-            cells.element_idx.set(i, upd.element_idx.get(i));
-            cells.temperature.set(i, upd.temperature.get(i));
-            cells.mass.set(i, upd.mass.get(i));
-            cells.properties.set(i, upd.properties.get(i));
-            cells.insulation.set(i, upd.insulation.get(i));
-            cells.strength_info.set(i, upd.strength_info.get(i));
-            cells.disease_idx.set(i, upd.disease_idx.get(i));
-            cells.disease_count.set(i, upd.disease_count.get(i));
-            cells.disease_infestation_tick_count.set(i, upd.disease_infestation_tick_count.get(i));
-            cells
-                .disease_growth_accumulated_error
-                .set(i, upd.disease_growth_accumulated_error.get(i));
-            cells.radiation.set(i, upd.radiation.get(i));
-        }
+    // 行级 memcpy（2026-09-06 #1）：串行 copy_from 用 copy_nonoverlapping，
+    // region 版此前逐格 .set()×11（每次边界检查）。改为每行每字段一次
+    // copy_nonoverlapping——数据逐位一致，仅消除内层边界检查与循环开销。
+    let row_len = max_x - min_x;
+    macro_rules! copy_row_field {
+        ($field:ident, $ty:ty) => {
+            for row in min_y..max_y {
+                let base = row * w + min_x;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        upd.$field.begin.add(base) as *const $ty,
+                        cells.$field.begin.add(base) as *mut $ty,
+                        row_len,
+                    );
+                }
+            }
+        };
     }
+    copy_row_field!(element_idx, u16);
+    copy_row_field!(temperature, f32);
+    copy_row_field!(mass, f32);
+    copy_row_field!(properties, u8);
+    copy_row_field!(insulation, u8);
+    copy_row_field!(strength_info, u8);
+    copy_row_field!(disease_idx, u8);
+    copy_row_field!(disease_count, i32);
+    copy_row_field!(disease_infestation_tick_count, u8);
+    copy_row_field!(disease_growth_accumulated_error, f32);
+    copy_row_field!(radiation, f32);
 }
 
 /// 清零整张 flow 数组（Vector4f × width×height，含边界）。
@@ -211,31 +221,16 @@ pub fn clear_flow(sim_data: &mut SimData) {
     flow.fill(crate::a_framework::vector_math::Vector4f::default());
 }
 
-/// 按区域清零时能走栈缓冲的最大区域数。超过则退回 [`clear_flow`] 全清。
+/// 按活动区域清 flow（替代整网格清零的性能优化）。
 ///
-/// 区域数 = 已发现世界数 + 在飞火箭内部舱数。常规存档远小于此值，
-/// 64 只是保守上限（栈上 64 × 32B = 2KB，不额外分配）。
+/// 收益：736×304 网格整清 = 3.41 MB memset/帧；只清活动区域省 ~37.2% 死区。
+/// 安全性论证（2026-08-30 已验证）：
+///   1. flow 在 new_for_allocate 零初始化；
+///   2. save_load 不持久化 sim_data.flow；
+///   3. 物理只按区域边界写 flow → 区域外 flow 恒 0，全清属浪费。
+/// 回退：区域列表空或 > MAX_REGIONS_STACK 时退回全清（保守、行为不变）。
 const MAX_REGIONS_STACK: usize = 64;
 
-/// 只清零**活动区域**内的 flow（[`clear_flow`] 的按区域版本）。
-///
-/// ## 为什么安全（等价于全网格清零）
-/// 1. `flow` 在 `SimData::new_for_allocate`（AllocateCells）里零初始化，
-///    且**不参与存档读写**（save_load 只处理 `accumulated_flow` 等纹理，
-///    不碰 `sim_data.flow`）；
-/// 2. 物理阶段只在活动区域内写 flow —— 温度/气体/液体/辐射/后处理全部走
-///    `d1_activity::compute_region_bounds` 裁剪后的边界；
-/// 3. 由 1 + 2 推出：**区域外的 flow 恒为 0**，每帧重复清零纯属浪费。
-///
-/// ## 收益
-/// sim 网格含世界装箱间隙，且眼冒金星 DLC 额外预留 136 格宽的太空条带
-/// （`BestFit.BestFitWorlds` 的 `result.x += 136`）。实测 Ceres Spaced Out
-/// 星群网格 736×304 = 223,744 格，其中死区 83,296 格（37.2%）。
-/// 全网格 fill 每帧 3.41 MB → 按区域清只剩约 2.14 MB。
-///
-/// ## 回退
-/// 区域列表为空、或区域数超过 `MAX_REGIONS_STACK` 时，退回 [`clear_flow`]
-/// 全网格清零——保守但行为完全不变。
 pub fn clear_flow_regions(sim_data: &mut SimData) {
     if sim_data.flow.ptr.is_null() {
         return;
@@ -246,10 +241,8 @@ pub fn clear_flow_regions(sim_data: &mut SimData) {
     if total == 0 {
         return;
     }
-
     // 分两步：先借用 active_regions 算出边界，再取 flow 的可变切片。
-    // 两者都来自 sim_data，借用必须错开，否则触发 aliasing 报错。
-    let empty = RegionBounds {
+    let empty = crate::d1_activity::RegionBounds {
         min_x: 0,
         min_y: 0,
         max_x: 0,
@@ -264,11 +257,10 @@ pub fn clear_flow_regions(sim_data: &mut SimData) {
             return;
         }
         for r in regions {
-            bounds[n] = compute_region_bounds(sim_data, r);
+            bounds[n] = crate::d1_activity::compute_region_bounds(sim_data, r);
             n += 1;
         }
     }
-
     let flow = unsafe { std::slice::from_raw_parts_mut(sim_data.flow.ptr, total) };
     for b in &bounds[..n] {
         if b.is_empty() {
@@ -942,7 +934,7 @@ mod tests {
         }
     }
 
-    /// 按区域清 flow 的对照基准：先造一份「全脏」的 flow 缓冲。
+    /// 按区域清 flow 的对照基准：先造一份「全脏」的 flow 缓冲（36 格非零）。
     fn make_dirty_flow(sd: &mut SimData) -> crate::a_framework::vector_math::Vector4f {
         let flow_vec: Vec<crate::a_framework::vector_math::Vector4f> =
             vec![crate::a_framework::vector_math::Vector4f::default(); 36];

@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn realign_preserves_same_key_and_derives_new() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut st = RegionRngState::new();
         let regions = [region(1, 1, 10, 10), region(20, 1, 30, 10)];
         st.realign(100, &regions);
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn route_prefers_region_rng_over_global() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut rng = RegionRng {
             random_seed: 42,
             displacement_direction: 1,

@@ -1192,11 +1192,36 @@ pub fn update_pressure(sim: &mut crate::a_framework::sim_data::SimData, cell: us
         Some(p) => p,
         None => return 0.0,
     };
-    let mut bvar12 = neighbor_pd.state & 3;
     let cell_pd = match elements_table::get_element_pressure_data(cell_elem) {
         Some(p) => p,
         None => return 0.0,
     };
+    update_pressure_with(
+        sim, cell, neighbor, cell_elem, neighbor_elem, &cell_pd, &neighbor_pd,
+    )
+}
+
+/// #18 查表复用版（2026-09-06）：gas_flow 主循环在 gas_pair_ok 里已查过
+/// 邻格（dst）的 pd、循环开头已查过源格（src）的 pd——传递进来免重查，
+/// 每对省 2 次 get_element_pressure_data（AtomicPtr 加载 + 索引检查）。
+/// 门控与计算顺序与 update_pressure 逐位一致。
+pub(crate) fn update_pressure_with(
+    sim: &mut crate::a_framework::sim_data::SimData,
+    cell: usize,
+    neighbor: usize,
+    cell_elem: u16,
+    neighbor_elem: u16,
+    cell_pd: &crate::b_elements::element::ElementPressureData,
+    neighbor_pd: &crate::b_elements::element::ElementPressureData,
+) -> f32 {
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return 0.0;
+    }
+    let cells = unsafe { &*sim.cells.ptr };
+    if cell >= cells.mass.len() || neighbor >= cells.mass.len() {
+        return 0.0;
+    }
+    let mut bvar12 = neighbor_pd.state & 3;
     let cell_state = cell_pd.state & 3; // 原版 param_7
     // 2026-08-03 修复：**液体**源格禁止向异元素非真空目标转移。
     // 原版压力只在同元素格或真空目标间转移（UpdateData 门控 L144628-144655）；
@@ -2467,7 +2492,9 @@ pub(crate) fn run_liquid_displacement_task(
     let x_max = (bounds.max_x as i32).min(w - 3);
     let y_min = bounds.min_y.max(3) as i32;
     let y_max = (bounds.max_y as i32).min(h - 3);
-    if x_min > x_max || y_min > y_max {
+    // 排他上界（原版 L144726-144738 钳到 [3, w-3] 后用 `< max`；D-M2 2026-08-10
+    // 此前 ..= 多处理 1 行 1 列）。
+    if x_min >= x_max || y_min >= y_max {
         return;
     }
     let flow = if sim.flow.ptr.is_null() {
@@ -2477,8 +2504,8 @@ pub(crate) fn run_liquid_displacement_task(
     };
     let mut flow = flow;
     let dir = sim.iterate_direction as i32;
-    for y in y_min..=y_max {
-        for x in x_min..=x_max {
+    for y in y_min..y_max {
+        for x in x_min..x_max {
             let cell = (y * w + x) as usize;
             let cell_elem = unsafe { (*sim.cells.ptr).element_idx.get(cell) };
             // 原版 L42480：本格 pressure state & 3 == 2（液体）
@@ -2708,11 +2735,14 @@ pub(crate) fn add_liquid(
             push_substance_change(sim, target);
             return;
         }
-        let below = target.wrapping_sub(width);
-        if below < updated.element_idx.len() && elem_state(updated, below) == 2 {
+        // 原版 L1191：`iVar11 = width + iVar14` —— 与**上格**液体交换（C# Grid.CellAbove
+        // = cell+width）；2026-08-12 对照审查修正：此前误用 target-width（下格），
+        // 与 AddLiquid 气体分支语义相反。
+        let above = target + width;
+        if above < updated.element_idx.len() && elem_state(updated, above) == 2 {
             let updated = unsafe { &mut *sim.updated_cells.ptr };
-            swap_cells(updated, below, target);
-            push_substance_change(sim, below);
+            swap_cells(updated, above, target);
+            push_substance_change(sim, above);
             push_substance_change(sim, target);
         }
         if merge_into_same_element_neighbor(sim, target, elem, mass, temperature, disease_idx, disease_count) {
@@ -2723,7 +2753,23 @@ pub(crate) fn add_liquid(
     }
     // 原版 L134446-134455：异液体 → DisplaceLiquid 挤走后，四邻同元素合并/放置
     let liq = updated.element_idx.get(target);
-    displace_liquid(sim, target, liq);
+    // 2026-08-12 修正：原版 `bVar15 = DisplaceLiquid(...)`，**成功**才把新液体写入
+    // 目标格（LAB_180037959 ChangeSubstance）；此前忽略返回值，成功时误并入同元素
+    // 邻格、目标格留真空，与 AddLiquid 语义不符。
+    if displace_liquid(sim, target, liq) {
+        let updated = unsafe { &mut *sim.updated_cells.ptr };
+        updated.element_idx.set(target, elem);
+        add_mass_and_update_temperature(
+            updated,
+            target,
+            mass,
+            temperature,
+            disease_idx,
+            disease_count,
+        );
+        push_substance_change(sim, target);
+        return;
+    }
     if merge_into_same_element_neighbor(sim, target, elem, mass, temperature, disease_idx, disease_count) {
         return;
     }
@@ -2758,10 +2804,10 @@ pub(crate) fn add_gas(
     let displace_ok = match target_state {
         0 => true,
         1 => displace_gas(sim, cell, cur),
-        2 => {
-            displace_liquid(sim, cell, cur);
-            true
-        }
+        // 2026-08-12 修正：原版 `bVar10 = DisplaceLiquid(...)`——液体挤不动（如水格
+        // 四周液体不可渗透的透气砖）时**不得**覆写水格；此前无条件 true → 水整格
+        // 瞬间消失（高压存储场景玩家反馈）。
+        2 => displace_liquid(sim, cell, cur),
         _ => false,
     };
     if displace_ok {
@@ -2771,40 +2817,39 @@ pub(crate) fn add_gas(
         push_substance_change(sim, cell);
         return;
     }
-    // 原版 L134208-134249：Displace 失败 → 四邻（左/右/上）找真空或同元素格
-    // 原版 L134208-134249：Displace 失败 → 四邻（左/右/上）找真空或同元素格
-    let (vacuum_n, same_n) = {
-        let updated = unsafe { &*sim.updated_cells.ptr };
-        let mut vn = None;
-        let mut sn = None;
-        for n in [cell.wrapping_sub(1), cell + 1, cell + width] {
+    // 原版 L134208-134249：Displace 失败 → 邻格 [左, 右, 上] **逐格**先查真空再查
+    // 同元素（位置优先：左格真空优先于右格同元素）。2026-08-12 修正：此前分两轮
+    // 收集"所有真空优先于同元素"，与原版逐格判断的优先级不符。
+    for n in [cell.wrapping_sub(1), cell + 1, cell + width] {
+        let ne = {
+            let updated = unsafe { &*sim.updated_cells.ptr };
             if n >= updated.element_idx.len() {
                 continue;
             }
-            let ne = updated.element_idx.get(n);
-            if vn.is_none() && ne == sim.vacuum_element_idx {
-                vn = Some(n);
-            }
-            if sn.is_none() && ne == elem {
-                sn = Some(n);
-            }
+            updated.element_idx.get(n)
+        };
+        if ne == sim.vacuum_element_idx {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            updated.element_idx.set(n, elem);
+            updated.mass.set(n, mass);
+            updated.temperature.set(n, temperature);
+            updated.disease_idx.set(n, disease_idx);
+            updated.disease_count.set(n, disease_count);
+            push_substance_change(sim, n);
+            return;
         }
-        (vn, sn)
-    };
-    if let Some(n) = vacuum_n {
-        let updated = unsafe { &mut *sim.updated_cells.ptr };
-        updated.element_idx.set(n, elem);
-        updated.mass.set(n, mass);
-        updated.temperature.set(n, temperature);
-        updated.disease_idx.set(n, disease_idx);
-        updated.disease_count.set(n, disease_count);
-        push_substance_change(sim, n);
-        return;
-    }
-    if let Some(n) = same_n {
-        let updated = unsafe { &mut *sim.updated_cells.ptr };
-        add_mass_and_update_temperature(updated, n, mass, temperature, disease_idx, disease_count);
-        return;
+        if ne == elem {
+            let updated = unsafe { &mut *sim.updated_cells.ptr };
+            add_mass_and_update_temperature(
+                updated,
+                n,
+                mass,
+                temperature,
+                disease_idx,
+                disease_count,
+            );
+            return;
+        }
     }
     // 原版 L134249-134277：兜底原位减质量或替换+剩余合并
     place_subtract(sim, cell, elem, mass, temperature, disease_idx, disease_count);
@@ -3500,12 +3545,156 @@ mod tests {
         assert!(!result.is_null(), "CreateElementsTable should succeed");
     }
 
+    fn create_crude_oil_boil_table() {
+        let mut w = BinaryBufferWriter::new();
+        w.write_int(5);
+        let elems = [
+            Element::default(),
+            {
+                let mut e = Element::default();
+                e.id = 1;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.molar_mass = 52.9;
+                e.max_mass = 870.0;
+                e.min_vertical_flow = 0.0;
+                e.specific_heat_capacity = 1.69;
+                e.thermal_conductivity = 2.0;
+                e.low_temp = 233.0;
+                e.high_temp = 673.0;
+                e.high_temp_transition_idx = 2;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 2;
+                e.state = 2;
+                e.number_of_gradient_colors = 1;
+                e.flow = 50.0;
+                e.viscosity = 50.0;
+                e.molar_mass = 44.0;
+                e.max_mass = 1000.0;
+                e.min_vertical_flow = 0.0;
+                e.specific_heat_capacity = 1.69;
+                e.thermal_conductivity = 2.0;
+                e.low_temp = 216.0;
+                e.high_temp = 812.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 3;
+                e.state = 3;
+                e.number_of_gradient_colors = 1;
+                e.max_mass = 1000.0;
+                e.specific_heat_capacity = 1.0;
+                e.thermal_conductivity = 2.0;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e
+            },
+            {
+                let mut e = Element::default();
+                e.id = 4;
+                e.state = 1;
+                e.low_temp = 0.0;
+                e.high_temp = 10000.0;
+                e.molar_mass = 29.0;
+                e
+            },
+        ];
+        for elem in &elems {
+            let elem_bytes = unsafe {
+                std::slice::from_raw_parts(elem as *const Element as *const u8, 164).to_vec()
+            };
+            w.write_bytes(&elem_bytes);
+        }
+        for _ in 0..5 {
+            w.write_int(0);
+        }
+        let data = w.into_bytes();
+        let mut reader = BinaryBufferReader::new(&data);
+        let result = CreateElementsTable(&mut reader);
+        assert!(!result.is_null(), "CreateElementsTable should succeed");
+    }
+
+    #[test]
+    fn crude_oil_partial_transition_full_pipeline_produces_676k_petroleum() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        create_crude_oil_boil_table();
+        let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
+        sd.vacuum_element_idx = 0;
+        sd.void_element_idx = 0xFFFF;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                for i in 0..36usize {
+                    buf.element_idx.set(i, 0);
+                    buf.mass.set(i, 0.0);
+                    buf.temperature.set(i, 300.0);
+                }
+                buf.element_idx.set(14, 1);
+                buf.mass.set(14, 800.0);
+                buf.temperature.set(14, 607.0);
+                buf.element_idx.set(15, 3);
+                buf.mass.set(15, 1000.0);
+                buf.temperature.set(15, 1000.0);
+                // solid below (cell-width = 8) keeps the oil from falling away
+                buf.element_idx.set(8, 3);
+                buf.mass.set(8, 1000.0);
+                buf.temperature.set(8, 600.0);
+            }
+        }
+        let mut petroleum_drops_676k = 0usize;
+        let mut petroleum_drops_other: Vec<(f32, f32)> = Vec::new();
+        for _tick in 0..20 {
+            crate::c2_physics::update_data(&mut sd);
+            let spawns: Vec<(u16, f32, f32)> = unsafe {
+                let events = &*sd.sim_events.ptr;
+                events
+                    .spawn_liquid_info
+                    .as_slice()
+                    .iter()
+                    .map(|d| (d.element_idx, d.mass, d.temperature))
+                    .collect()
+            };
+            unsafe {
+                let events = &mut *sd.sim_events.ptr;
+                events.spawn_liquid_info.clear();
+            }
+            for (elem, mass, temp) in spawns {
+                if elem == 2 {
+                    if (temp - 676.0).abs() < 1.0 {
+                        petroleum_drops_676k += 1;
+                    } else {
+                        petroleum_drops_other.push((mass, temp));
+                    }
+                }
+            }
+            let oil_mass = unsafe { (*sd.updated_cells.ptr).mass.get(14) };
+            if oil_mass <= 0.01 && !petroleum_drops_other.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            petroleum_drops_676k > 0,
+            "pipeline should emit petroleum droplet at 676K; non-676K drops: {:?}",
+            petroleum_drops_other
+        );
+        assert!(
+            petroleum_drops_other.is_empty(),
+            "found petroleum droplet not at 676K (mass,temp): {:?}",
+            petroleum_drops_other
+        );
+        DestroyElementsTable();
+    }
     /// IsLiquidPermeable：真空/气体（state&3 <= 1）可渗透；
     /// 液体（state&3 == 2）与固体（state&3 == 3）都**不可渗透**（原版 L615: `1 < (state&3)` → false）；
     /// properties bit1（&2）置位时不可渗透（原版 L607）。
     #[test]
     fn is_liquid_permeable_basic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -3528,7 +3717,7 @@ mod tests {
     /// properties bit1（&2）置位时，非固体元素也算固体（原版 L639-644）。
     #[test]
     fn is_solid_detects_unobtanium() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -3551,7 +3740,7 @@ mod tests {
     /// flow 重置 {-0.3, 0.3, 0.3, -0.3}。
     #[test]
     fn run_space_vacuum_task_removes_liquid_gas_skips_solid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         // 模拟 SetWorldZones 后：内部格 cell14/15/16 标记太空（0xFF）
@@ -3603,7 +3792,7 @@ mod tests {
     /// 太空真空特判的门控：非太空格（worldZones != 0xFF）与背墙非真空格不删除。
     #[test]
     fn run_space_vacuum_task_gates_on_world_zone_and_backwall() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         let mut wz = vec![0u8; 30];
@@ -3640,7 +3829,7 @@ mod tests {
     /// 持 LIB_TESTS_LOCK 并先销毁全局表，确保与并行建表测试无竞态。
     #[test]
     fn empty_table_returns_safe_defaults() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable(); // 确保表为空（测试间可能残留）
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -3694,7 +3883,7 @@ mod tests {
     /// 强行为断言在下方自建表测试中覆盖。
     #[test]
     fn update_liquid_moves_mass_down_to_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable(); // 元素表为空
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         update_liquids(&mut sd); // 空表下不应 panic
@@ -3708,7 +3897,7 @@ mod tests {
     /// 事件：左邻元素 0→1 产生 1 条 substance 事件（sim13 → game 4）。
     #[test]
     fn update_liquid_same_element_transfers_mass_and_flow() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -3783,7 +3972,7 @@ mod tests {
     /// 对角 18 固体跳过 → 20（同气体、旁格 14 非固体）→ 气体整体移到 20。
     #[test]
     fn liquid_spreads_into_gas_and_gas_escapes_diagonally() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 表：0=真空(state0)、1=液体(state2)、2=气体(state1)、3=固体(state3)
         let mut w = BinaryBufferWriter::new();
         w.write_int(4);
@@ -4029,7 +4218,7 @@ mod tests {
     /// 并进水格（add_mass 不改元素）→ 污染水质量变水消失。
     #[test]
     fn displace_liquid_directional_merge_requires_same_element() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_clean_density_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4077,7 +4266,7 @@ mod tests {
     /// 400 tick 后污染水总质量必须守恒为 1000kg。
     #[test]
     fn polluted_sinking_conserves_mass() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_clean_density_table();
         let mut sd = SimData::new_for_allocate(20, 14, 17, true, false);
         sd.vacuum_element_idx = 0;
@@ -4159,7 +4348,7 @@ mod tests {
     /// beyond 合并为 150（100 并入 50）、dst 温度覆盖为源格温度。
     #[test]
     fn do_liquid_pressure_displacement_squeezes_to_liquid_beyond() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4210,7 +4399,7 @@ mod tests {
     /// （18=上方同气体），SwapCells 把邻格液体B 整体搬入 beyond(12)，随后 125 灌入邻格。
     #[test]
     fn do_liquid_pressure_displacement_gas_beyond_displaces_gas() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4262,7 +4451,7 @@ mod tests {
     /// 门控：dst 同元素 / dst 非液体（气体）/ 质量不足 / dst 不可渗透 → 全部返回 0 且无副作用。
     #[test]
     fn do_liquid_pressure_displacement_gates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4322,7 +4511,7 @@ mod tests {
     /// flow[53].x += 125、flow[52].y -= 125。
     #[test]
     fn run_liquid_displacement_task_squeezes_and_accounts_flow() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(12, 10, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4385,7 +4574,7 @@ mod tests {
     /// 病菌 12.5% 转移：src 病菌 800 → 转移 100，dst 得 100、src 剩 700。
     #[test]
     fn do_liquid_pressure_displacement_transfers_disease() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4428,7 +4617,7 @@ mod tests {
     ///   row0: [     ] [ 2 固] [    ]
     #[test]
     fn enclosed_vertical_shaft_gas_teleports_to_top() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4481,7 +4670,7 @@ mod tests {
     /// 换位 → 气体到 14、液2 到 7（用户实测原版行为）。
     #[test]
     fn horizontal_gas_liquid_corner_enclosed_behavior() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4531,7 +4720,7 @@ mod tests {
     ///   气体**不动**（用户实测"真空时不转移"）。
     #[test]
     fn gas_above_correct_layout_swap_vs_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let w = 12usize;
         let gas = 1 * w + 1; // (x=1,y=1) 气1
@@ -4608,7 +4797,7 @@ mod tests {
     /// 用户 L 布局——液1 被水平阻挡不动，见 diagonal_swap_liquid_swaps_with_below_left_gas）。
     #[test]
     fn full_column_merge_then_gas_swap_cascade() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4662,7 +4851,7 @@ mod tests {
     /// 此测试直接调 update_liquid(14) 验证"合并 + 对角换位"一步到位。
     #[test]
     fn diagonal_swap_liquid_swaps_with_below_left_gas() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4709,7 +4898,7 @@ mod tests {
     /// 全管线（update_data 5 帧）用户精确布局：300kg 液2 直接对角换位（位置断言）。
     #[test]
     fn diagonal_swap_full_pipeline_300kg() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4747,7 +4936,7 @@ mod tests {
     /// 满格 1000/1000 变体（位置断言；后续帧水平转移会再分配质量，不做精确质量断言）。
     #[test]
     fn diagonal_swap_full_pipeline_1000kg_merge_then_swap() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4785,7 +4974,7 @@ mod tests {
     /// 液2 位置为真空 → 无液体执行对角换位 → 气1 不动（用户实测"真空不转移"）。
     #[test]
     fn diagonal_swap_vacuum_at_liquid2_no_transfer() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4823,7 +5012,7 @@ mod tests {
     /// 砖块(3,2)=15，三格砖封。阶段 E 右下分支（cell−width+1）应与左下分支对称触发。
     #[test]
     fn diagonal_swap_mirror_below_right_gas() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4868,7 +5057,7 @@ mod tests {
     /// 液2 膨胀（测试表 viscosity=50 → 1045；游戏水=125 → 1120+，用户实测 1200）。
     #[test]
     fn diagonal_swap_no_mass_inflation_bottom_up() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_displacement_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -4931,7 +5120,7 @@ mod tests {
     /// 本测试验证 ①（逼近满格）与 ②（下层满格时超满上层仍可排出）。
     #[test]
     fn update_liquid_drains_down_toward_full_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5009,7 +5198,7 @@ mod tests {
     /// 下方真空格 → SwapCells 交换 + 2 条 substance 事件（原版 L842-845）。
     #[test]
     fn update_liquid_vacuum_below_swaps_and_fires_events() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5051,7 +5240,7 @@ mod tests {
     /// 期望：左邻变液体、mass=25（100×0.25）、flow[cell].x=25、源格减 25。
     #[test]
     fn update_liquid_spreads_left_to_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         // 内部格坐标：cell14 = (row2,col2)。下方 cell8 = (row1,col2) 固体。
@@ -5110,7 +5299,7 @@ mod tests {
     /// 左扩散事件（设计测试 6）：左扩散到真空格应产生 substance 事件。
     #[test]
     fn update_liquid_spread_left_fires_event() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5150,7 +5339,7 @@ mod tests {
     /// 邻格固体拒绝（设计测试 5）：左邻固体 → 不转移。
     #[test]
     fn update_liquid_skips_spread_to_solid_neighbor() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5188,7 +5377,7 @@ mod tests {
     /// 期望：右邻变液体、mass=25、flow[cell].y(RIGHT)=25、源格减 25。
     #[test]
     fn update_liquid_spreads_right_to_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5244,7 +5433,7 @@ mod tests {
     /// 右分支基于剩余质量计算（75×0.25=18.75）——依赖左分支递减后右分支用剩余值。
     #[test]
     fn update_liquid_spreads_both_directions() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5302,7 +5491,7 @@ mod tests {
     /// 质量差 1 → f22=0.25，f23=min(min(100,50),0.25)=0.25 ≥ 0 且 > 0 → 转移 0.25。
     #[test]
     fn update_liquid_horizontal_flow_threshold() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5387,7 +5576,7 @@ mod tests {
     /// Rust 旧实现读 flow（=0）→ f23=0 → 不扩散（用户实测"水堆成柱"）。
     #[test]
     fn update_liquid_spreads_with_production_like_viscosity_cap() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_production_like_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5445,7 +5634,7 @@ mod tests {
     /// 质量离开格子（源格扣 25、flow.x+25），左邻保持真空（不再有实体方格滑落）。
     #[test]
     fn update_liquid_spawns_droplet_at_left_ledge() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5500,7 +5689,7 @@ mod tests {
     /// 左邻设异种液体（元素 2）阻断左分支；右下方对角真空 → 右边缘液滴。
     #[test]
     fn update_liquid_spawns_droplet_at_right_ledge() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5547,7 +5736,7 @@ mod tests {
     /// 液滴门控（不可见）：visibleGrid 全 0 且非 debug 编辑 → spawn 失败 → 回退格子转移。
     #[test]
     fn update_liquid_invisible_ledge_falls_back_to_cell_transfer() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -5591,7 +5780,7 @@ mod tests {
     /// AddLiquid 同元素合并（原版 L134375-134377）：液滴落在同液体格 → 质量吸收为一格。
     #[test]
     fn add_liquid_merges_into_same_element() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5619,7 +5808,7 @@ mod tests {
     /// AddLiquid 真空放置（原版 L134426-134431）。
     #[test]
     fn add_liquid_places_into_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5638,7 +5827,7 @@ mod tests {
     /// AddLiquid 异液体挤压（原版 L134446-134455）：目标格是异液体 → DisplaceLiquid 挤走后放置。
     #[test]
     fn add_liquid_displaces_different_liquid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5672,11 +5861,245 @@ mod tests {
         DestroyElementsTable();
     }
 
+    /// 回归（玩家反馈）：水格四周 4 个液体不可渗透的透气砖格（props=4|2），排气口
+    /// （AddRemoveSubstance → ModifyCell Add → add_gas）向水格注气时，DisplaceLiquid
+    /// 失败 → **水必须保留**，气体落到 [左,右,上] 兜底（左格真空 → 放气）。
+    /// 2026-08-12 修复前：add_gas 忽略 DisplaceLiquid 返回值，水整格被覆写成气体。
+    #[test]
+    fn add_gas_preserves_liquid_when_displace_fails_and_places_in_neighbor() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1); // 水
+                buf.mass.set(14, 1000.0);
+                buf.temperature.set(14, 300.0);
+            }
+            // 四周透气砖：真空 + 液体不可渗透(2)|固体不可渗透(4)
+            for c in [8usize, 13, 15, 20] {
+                let u = &mut *sd.updated_cells.ptr;
+                u.properties.set(c, 6);
+            }
+        }
+        crate::c2_physics::liquid_flow::add_gas(&mut sd, 14, 3, 1.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "水不能被覆写");
+            assert!(
+                (updated.mass.get(14) - 1000.0).abs() < 1e-3,
+                "水质量必须保留，got {}",
+                updated.mass.get(14)
+            );
+            assert_eq!(updated.element_idx.get(13), 3, "气体应落到左格（兜底首选）");
+            assert!((updated.mass.get(13) - 1.0).abs() < 1e-3);
+        }
+        DestroyElementsTable();
+    }
+
+    /// 原版特性（用户实测）：透气砖格全是异类气体且**斜角位移被封死**时，add_gas
+    /// 兜底无处可放 → place_subtract 从液体里扣掉发射质量（水多时保留，只减质量）。
+    /// 注意：正十字布局 + 全同气体时，DisplaceGas 对角子循环必然把一格气体推到
+    /// 另一格（"透气砖短暂真空"的来源）→ 兜底放进腾出的真空格，不扣水；只有斜角
+    /// 被封死（如上侧是实墙）才真正走 place_subtract。此处布局：左/右/下 = 气体 5，
+    /// 上 = 实墙，外围全固体。
+    #[test]
+    fn add_gas_hetero_against_occupied_neighbors_subtracts_liquid_mass() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1); // 水
+                buf.mass.set(14, 1000.0);
+                buf.temperature.set(14, 300.0);
+            }
+            // 除水格外的全部格先填固体（含边界），封死外围
+            for c in 0..30 {
+                if c == 14 {
+                    continue;
+                }
+                let u = &mut *sd.updated_cells.ptr;
+                u.element_idx.set(c, 4);
+                u.mass.set(c, 100.0);
+                u.temperature.set(c, 300.0);
+                u.properties.set(c, 6);
+            }
+            // 透气砖：左(13)/右(15)/下(8) = 气体 5（1kg，异类），液体不可渗透；
+            // 上(20) 保持实墙 → 斜角位移被封死
+            for c in [8usize, 13, 15] {
+                let u = &mut *sd.updated_cells.ptr;
+                u.element_idx.set(c, 5);
+                u.mass.set(c, 1.0);
+                u.temperature.set(c, 300.0);
+                u.properties.set(c, 6);
+            }
+        }
+        // 气体 3 注入水格（与左/右/下 5 异类；上 20 是实墙，兜底 [左,右,上] 无处可放）
+        crate::c2_physics::liquid_flow::add_gas(&mut sd, 14, 3, 1.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "水保留");
+            assert!(
+                (updated.mass.get(14) - 999.0).abs() < 1e-3,
+                "兜底应从水里扣 1kg → 999，got {}",
+                updated.mass.get(14)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// 兜底优先级（原版逐格判断，位置优先）：左格同元素、右格真空 → 气体并入左格，
+    /// 而非放进右格真空（2026-08-12 修正前的"种类优先"会放右格）。
+    #[test]
+    fn add_gas_fallback_prefers_left_same_element_over_right_vacuum() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 1); // 水（挤不动）
+                buf.mass.set(14, 1000.0);
+                buf.temperature.set(14, 300.0);
+            }
+            // 外围封死，防止 DisplaceLiquid 的气体子循环把左格气体推走腾出真空
+            for c in 0..30 {
+                if c == 14 {
+                    continue;
+                }
+                let u = &mut *sd.updated_cells.ptr;
+                u.element_idx.set(c, 4);
+                u.mass.set(c, 100.0);
+                u.temperature.set(c, 300.0);
+                u.properties.set(c, 6);
+            }
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(13, 3); // 左格：同元素气体
+            u.mass.set(13, 1.0);
+            u.temperature.set(13, 300.0);
+            u.element_idx.set(15, 0); // 右格：真空（错误实现会优先放这里）
+            u.mass.set(15, 0.0);
+            u.properties.set(15, 6);
+        }
+        crate::c2_physics::liquid_flow::add_gas(&mut sd, 14, 3, 1.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "水保留");
+            assert!(
+                (updated.mass.get(13) - 2.0).abs() < 1e-3,
+                "同元素左格应合并：1+1=2，got {}",
+                updated.mass.get(13)
+            );
+            assert_eq!(updated.element_idx.get(15), 0, "右格真空不应被放置");
+            assert!((updated.mass.get(15) - 0.0).abs() < 1e-6);
+        }
+        DestroyElementsTable();
+    }
+
+    /// add_liquid 异液体分支成功路径（原版 L134446-134455）：DisplaceLiquid 成功 →
+    /// 新液体**写入目标格**，而非并入同元素邻格（2026-08-12 修正前并入上格 8）。
+    #[test]
+    fn add_liquid_writes_into_target_after_successful_displacement() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 2); // 异种液体（轻液）
+                buf.mass.set(14, 50.0);
+                buf.temperature.set(14, 280.0);
+            }
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(15, 0); // 右格真空（唯一可挤压去向）
+            u.element_idx.set(13, 4); // 左/下固体
+            u.mass.set(13, 100.0);
+            u.element_idx.set(20, 4);
+            u.mass.set(20, 100.0);
+            u.element_idx.set(8, 1); // 下格：新液体同元素（陷阱：修正前并入这里）
+            u.mass.set(8, 10.0);
+            u.temperature.set(8, 300.0);
+        }
+        crate::c2_physics::liquid_flow::add_liquid(&mut sd, 14, 1, 25.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "新液体应写入目标格");
+            assert!(
+                (updated.mass.get(14) - 25.0).abs() < 1e-3,
+                "目标格质量 25，got {}",
+                updated.mass.get(14)
+            );
+            assert_eq!(updated.element_idx.get(15), 2, "原异液体应挤到右格");
+            assert!((updated.mass.get(15) - 50.0).abs() < 1e-2);
+            assert!(
+                (updated.mass.get(8) - 10.0).abs() < 1e-3,
+                "同元素上格不应被并入，got {}",
+                updated.mass.get(8)
+            );
+        }
+        DestroyElementsTable();
+    }
+
+    /// add_liquid 气体分支交换方向（原版 L1191 `iVar11 = width + iVar14`，C# Grid.CellAbove
+    /// = cell+width）：DisplaceGas 失败 → 与**上格**液体交换（气体上移、上格液体下来）。
+    /// 2026-08-12 对照审查修正：此前误用下格（target-width），方向与原版相反。
+    #[test]
+    fn add_liquid_gas_swap_uses_cell_above() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        create_displace_table();
+        let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            for buf in [&mut *sd.cells.ptr, &mut *sd.updated_cells.ptr] {
+                buf.element_idx.set(14, 3); // 目标格：气体（挤不动）
+                buf.mass.set(14, 1.0);
+                buf.temperature.set(14, 300.0);
+            }
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(20, 1); // 上格：液体（原版应与之交换）
+            u.mass.set(20, 50.0);
+            u.temperature.set(20, 300.0);
+            u.element_idx.set(8, 2); // 下格：异类液体（陷阱：错误实现会换这里）
+            u.mass.set(8, 50.0);
+            u.temperature.set(8, 300.0);
+            u.element_idx.set(13, 4); // 左/右/对角固体，封死 DisplaceGas
+            u.mass.set(13, 100.0);
+            u.element_idx.set(15, 4);
+            u.mass.set(15, 100.0);
+            for c in [7usize, 9, 12, 16, 19, 21] {
+                u.element_idx.set(c, 4);
+                u.mass.set(c, 100.0);
+            }
+        }
+        crate::c2_physics::liquid_flow::add_liquid(&mut sd, 14, 2, 25.0, 300.0, 0xFF, 0);
+        unsafe {
+            let updated = &*sd.updated_cells.ptr;
+            assert_eq!(updated.element_idx.get(14), 1, "上格液体应交换到目标格");
+            assert!(
+                (updated.mass.get(14) - 50.0).abs() < 1e-3,
+                "目标格承接上格液体 50，got {}",
+                updated.mass.get(14)
+            );
+            assert_eq!(updated.element_idx.get(20), 3, "气体应上移到上格");
+            assert!((updated.mass.get(20) - 1.0).abs() < 1e-3);
+            assert_eq!(updated.element_idx.get(8), 2, "下格不应被交换");
+            assert!(
+                (updated.mass.get(8) - 75.0).abs() < 1e-3,
+                "新增液体应并入下格同元素：50+25=75，got {}",
+                updated.mass.get(8)
+            );
+        }
+        DestroyElementsTable();
+    }
+
     /// AddSolid Type 0（DoVerticalDisplacement）：先同列上方补满，剩余落到目标格。
     /// 元素表：0=气体 / 1=液体 / 2=固体（max_mass=1000）。
     #[test]
     fn add_solid_vertical_displacement_fills_above_and_places_down() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         {
             let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
@@ -5717,7 +6140,7 @@ mod tests {
     /// AddSolid Type 0：目标格已是同元素固体 → 跳过，继续向下落到气体格。
     #[test]
     fn add_solid_vertical_displacement_skips_solid_and_displaces_gas() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 4 元素表：0=气体 / 1=液体 / 2=固体A（max_mass 1000）/ 3=固体B（不同元素）
         let mut w = BinaryBufferWriter::new();
         w.write_int(4);
@@ -5772,7 +6195,7 @@ mod tests {
     /// AddSolid Type 1（OnlyIfSameElement）：目标固体不同元素 → no-op；同元素 → 合并。
     #[test]
     fn add_solid_only_same_element_solid_noop_and_merge() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -5805,7 +6228,7 @@ mod tests {
     /// AddSolid 其他 Type → no-op。
     #[test]
     fn add_solid_other_type_is_noop() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -5828,7 +6251,7 @@ mod tests {
     /// 也在该守卫内，同样不生效）→ 4 方向全失败 → 进入下方倾倒。
     #[test]
     fn post_process_overpressure_releases_through_open_direction() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5871,7 +6294,7 @@ mod tests {
     /// 提前 return，水既不突破也不倾倒（与用户实测液体行为不符）。
     #[test]
     fn post_process_overpressure_open_direction_falls_through_to_dump() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5919,7 +6342,7 @@ mod tests {
     /// DisplaceLiquid 挤走下方液体后转移 mass×0.49751243。
     #[test]
     fn post_process_overpressure_dumps_down_when_all_blocked() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -5979,7 +6402,7 @@ mod tests {
     /// 原版 threshold = max(maxMass, below×1.01)；旧实现 min → 错误倾倒。
     #[test]
     fn post_process_overpressure_skips_dump_when_below_nearly_full() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6020,7 +6443,7 @@ mod tests {
     /// 超出 10 → 推 5（验证原版 ~1020 封顶原理：三层水底层最多比满格多 ~20kg）。
     #[test]
     fn update_liquid_pushes_excess_up() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6068,7 +6491,7 @@ mod tests {
     /// 但 mass(2000) < 2×threshold(2020) → min(495, viscosity=50) = 50 → 每次推 50。
     #[test]
     fn update_liquid_pushes_excess_up_viscosity_capped() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6108,7 +6531,7 @@ mod tests {
     /// 未超阈值不推：1000 格上方 1000 → threshold = 1010 > 1000 → 无超出。
     #[test]
     fn update_liquid_does_not_push_when_under_threshold() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6145,7 +6568,7 @@ mod tests {
     /// 清成真空 + substance 事件（修复表层 0.0mcg 残留）。
     #[test]
     fn post_process_evaporates_tiny_liquid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6179,7 +6602,7 @@ mod tests {
     /// 但会走 offgas 耗尽路径就地转升华气体（原版 L149821：fVar23−fVar24 < 0.01 分支）。
     #[test]
     fn post_process_keeps_exact_0_01() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6203,7 +6626,7 @@ mod tests {
     /// 下方 void → 源格转 vacuum + 清病菌 + 1 条事件（原版 L775-792）。
     #[test]
     fn update_liquid_void_below_clears_source_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6242,7 +6665,7 @@ mod tests {
     /// 元素表为空 → get_element_pressure_data 返回 None → 函数安全返回 0.0。
     #[test]
     fn update_pressure_no_panic_on_empty_table() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable(); // 元素表为空
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -6260,7 +6683,7 @@ mod tests {
     /// 断言：本格 +112.5、邻格 -112.5、返回 -112.5、同元素液体无事件。
     #[test]
     fn update_pressure_balances_neighbor_masses() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -6306,7 +6729,7 @@ mod tests {
     /// 邻格真空（bVar12=0）→ 元素变为液体 + 1 条 substance 事件（原版 L1601-1607）。
     #[test]
     fn update_pressure_fills_vacuum_cell_with_event() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.void_element_idx = 0xFFFF; // 真空元素 0 不是 void → 走元素变化分支（原版 L1584）
@@ -6356,7 +6779,7 @@ mod tests {
     /// 断言：来源格 1000-125=875、接收格 100+125=225、病菌 idx 不变。
     #[test]
     fn update_pressure_transfers_disease() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -6390,7 +6813,7 @@ mod tests {
         // 2026-08-06 孢子兰"补充质量删病菌"端到端回归：
         // 高压干净气体补充进带菌低压格 → 质量流入、病菌保留（原版 L26178）。
         // 此前 add_disease_to_cell(0xff,0) 走替换 → 病菌被清空（用户实测）。
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_liquid_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -6472,7 +6895,7 @@ mod tests {
     /// 原版压力只在同元素格或真空目标间转移。修复后 update_pressure 应返回 0、质量不变。
     #[test]
     fn update_pressure_does_not_transfer_into_heterogeneous_gas() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_pressure_gas_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6698,7 +7121,7 @@ mod tests {
     /// 简报基线：空元素表下 post_process_cell 不 panic（函数存在性验证）。
     #[test]
     fn post_process_cell_no_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable(); // 元素表为空
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         post_process_cell(&mut sd, 14);
@@ -6707,7 +7130,7 @@ mod tests {
     /// DoSublimation 入口（L148633）：调用格质量 >= 1.8 → 整函数跳过，randomSeed 不消耗。
     #[test]
     fn do_sublimation_skips_when_target_full() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6736,7 +7159,7 @@ mod tests {
     /// SpawnFX(砖, fx=101, rotation=180 上方)；同元素合并无 substance 事件；温度质量加权。
     #[test]
     fn do_sublimation_merges_same_element() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6773,7 +7196,7 @@ mod tests {
     /// f21 = 0.08×(0.01/0.04) = 0.02；目标恰好到 1.8，砖格只扣 0.02。
     #[test]
     fn do_sublimation_caps_at_1_8() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6800,7 +7223,7 @@ mod tests {
     /// substance 事件；砖格扣 0.08、acc[20]+=0.08、SpawnFX 方向 180。
     #[test]
     fn do_sublimation_sets_element_in_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6831,7 +7254,7 @@ mod tests {
     /// 目标得病菌 idx 拷贝 + count=16；砖格病菌剩 84。
     #[test]
     fn do_sublimation_transfers_disease_proportionally() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6863,7 +7286,7 @@ mod tests {
     /// 目标换元素 4、质量 += 0.04；砖 A 扣 0.08。
     #[test]
     fn do_sublimation_displaces_heterogeneous_gas() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6896,7 +7319,7 @@ mod tests {
     /// DisplaceGas 失败且无先前成功（L148758）：四邻全固体/无真空 → 跳过，砖格无损、无事件。
     #[test]
     fn do_sublimation_skips_when_displace_fails_and_no_prior_success() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6934,7 +7357,7 @@ mod tests {
     /// cell14=气体X 0.5；20=砖A(产物4)→先成功（挤到13）；15=砖B(产物5)→挤 4 失败（四邻堵死）。
     #[test]
     fn do_sublimation_quirk_mirrors_mass_loss_after_prior_success() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -6978,7 +7401,7 @@ mod tests {
     /// 质量 ×eff、substance 事件、SpawnFX(0.0)；调用格（真空）不变。
     #[test]
     fn do_sublimation_full_consumption_converts_in_place() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7013,7 +7436,7 @@ mod tests {
     /// 即使目标已被前一邻格换成气体 4。最终元素 = 后邻格产物 5。
     #[test]
     fn do_sublimation_uses_entry_snapshot_for_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7052,7 +7475,7 @@ mod tests {
     /// 随机种子只对有效邻格消耗（L148656-148662）：四邻全为普通固体 → 种子不变。
     #[test]
     fn do_sublimation_consumes_seed_only_for_valid_neighbors() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7078,7 +7501,7 @@ mod tests {
     /// 源格 ClearCell（元素→vacuum、质量/温度清零）；5 条 substance 事件（4 目标 + 1 源）。
     #[test]
     fn displace_liquid_evenly_splits_to_4_neighbors() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7132,7 +7555,7 @@ mod tests {
     /// 右/下/上（15/8/20）各得 100/3 ≈ 33.333。
     #[test]
     fn displace_liquid_splits_to_available_neighbors_only() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7176,7 +7599,7 @@ mod tests {
     /// 事件：源格 1 + 目标格 1 = 2 条。
     #[test]
     fn displace_gas_moves_all_to_single_direction() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7239,7 +7662,7 @@ mod tests {
     /// 期望：cell13 变为液体（元素1）、气体（元素3）全量移到候选格、源格质量减少。
     #[test]
     fn update_liquid_displaces_gas_horizontally() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7300,7 +7723,7 @@ mod tests {
     /// （原版液体走 0.3 概率门，测试直接调用函数本体）。
     #[test]
     fn do_density_displacement_swaps_heavy_above_light() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -7330,7 +7753,7 @@ mod tests {
     /// combined = (100×300 + 200×400) / 300 = 366.67，两格同温、元素不变、无事件。
     #[test]
     fn do_density_displacement_same_element_combines_temperature() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -7373,7 +7796,7 @@ mod tests {
     /// → fVar24 = min(0.5×100, 1.0) = 1.0，下方格 20 真空（mass<1.8）。
     #[test]
     fn post_process_cell_accumulates_flow_on_sublimation_path() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7406,7 +7829,7 @@ mod tests {
     /// room = 1.8 - 1.0 = 0.8 < 1.0 → fVar24 = 1.0 × (0.8/1.0) = 0.8 → acc[14] = 0.8。
     #[test]
     fn post_process_cell_accumulates_scaled_flow_when_below_mass_high() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7436,7 +7859,7 @@ mod tests {
     /// tick=0 候选 [下26,左19,右21,上14]，26 真空 → 气体从 20 移到 26；acc[14] 仍 += 1.0。
     #[test]
     fn post_process_cell_displaces_heterogeneous_gas_below() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7477,7 +7900,7 @@ mod tests {
     /// 剩余 = 0.6-0.5 = 0.1 ≥ 0.01 → acc[14] = 0.5（若误用下方格则得 0.3）。
     #[test]
     fn post_process_cell_recomputes_flow_from_up_cell_mass() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7508,7 +7931,7 @@ mod tests {
     /// 随机气体邻居置换，质量 1.0 不在 [1e-9, 0.001) 挤压区间，不蒸发不清格）。
     #[test]
     fn post_process_cell_gas_cell_no_corruption() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7537,7 +7960,7 @@ mod tests {
     /// idx0=15 是气体且 molar(8)<molar(16) → 交换。断言：cell14→轻气体 5、cell15→气体 3、2 条事件。
     #[test]
     fn post_process_cell_gas_with_solid_flag_still_displaces() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7578,7 +8001,7 @@ mod tests {
     /// （min(offGas×mass, 1.0) = 1.0）。修复前 update_liquids 不调 post_process_cell → 恒 0。
     #[test]
     fn update_liquids_hooks_post_process_cell_sublimation_path() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_displace_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7611,7 +8034,7 @@ mod tests {
     /// sim14（row2,col2）→ game 5；字段 = {cell_idx, fx_id, rotation}（12B，L7251-7253）。
     #[test]
     fn push_spawn_fx_converts_cell_and_fields() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -7639,7 +8062,7 @@ mod tests {
     /// 病菌按比例 1；液体格扣 1.0/病菌 1；acc[14] += 1.0；SpawnFX(14, 107, 0.0)。
     #[test]
     fn offgas_main_path_emits_into_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7686,7 +8109,7 @@ mod tests {
     /// 病菌 10+1=11；无 substance 事件（同元素）。
     #[test]
     fn offgas_main_path_merges_same_gas_and_disease() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7722,7 +8145,7 @@ mod tests {
     /// f24 = 0.8；目标恰好 1.8；液体扣 0.8；acc[14] = 0.8。
     #[test]
     fn offgas_main_path_scales_to_room() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7752,7 +8175,7 @@ mod tests {
     /// 目标 20 = 气体3（≠产物5），其四邻 [26,19,21,14] 全为固体/液体 → 挤不走。
     #[test]
     fn offgas_main_path_returns_when_displace_fails() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7789,7 +8212,7 @@ mod tests {
     /// 而非 250kg（0.5×mass 的错误量级）。
     #[test]
     fn offgas_realistic_dirty_water_emits_500g_from_500kg() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 自建 3 元素表：0=真空、1=液体（offGas=0.001/eff=1.0/prob=1.0，prob 用 1.0 使测试确定）、2=气体
         let mut w = BinaryBufferWriter::new();
         w.write_int(3);
@@ -7873,7 +8296,7 @@ mod tests {
     /// 耗尽路径**不累积** accumulated_flow；SpawnFX(14, 107, 0.0)。
     #[test]
     fn offgas_depleted_path_converts_in_place_with_top_up() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7912,7 +8335,7 @@ mod tests {
     /// 只就地转化（质量 0.015），无第二段调用。
     #[test]
     fn offgas_depleted_path_without_top_up() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_sublimate_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.vacuum_element_idx = 0;
@@ -7966,7 +8389,7 @@ mod tests {
 
     #[test]
     fn add_disease_to_cell_same_disease_accumulates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -7984,7 +8407,7 @@ mod tests {
 
     #[test]
     fn add_disease_to_cell_one_side_invalid_replaces() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         uninstall_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8002,7 +8425,7 @@ mod tests {
         // 原版 L26178 逗号表达式：bVar1 != 0xff 时先"保留当前"(iVar9=iVar6, bVar7=bVar1)，
         // 再判 param_3 != 0xff —— 干净质量（0xff,0）流入已有病菌格 → 保留当前病菌。
         // 2026-08-06 孢子兰"补充质量删病菌"根因：此前输入 0xff 走替换 → 病菌被清空。
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8026,7 +8449,7 @@ mod tests {
     #[test]
     fn add_disease_to_cell_mixing_keep_current_when_weaker_new() {
         // cur(0,100,s2) + new(1,50,s4): f10=200<=f11=200, cur>=0 → 保留当前 (0,100)
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8043,7 +8466,7 @@ mod tests {
     #[test]
     fn add_disease_to_cell_mixing_negative_cur_count_switches() {
         // cur(0,-100,s2) + new(1,50,s4): f10=-200<=200, cur<0 → (-cur=100, idx=1)
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8060,7 +8483,7 @@ mod tests {
     #[test]
     fn add_disease_to_cell_mixing_negative_d_keeps_current() {
         // cur(0,100,s2) + new(2,100,s1): f10=200>100, d=100-(200/100)*100=-100 → (100, idx=0)
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8077,7 +8500,7 @@ mod tests {
     #[test]
     fn add_disease_to_cell_mixing_positive_d_replaces() {
         // cur(0,100,s2) + new(2,150,s1): f10=200>150, d=150-(200/150)*100=16 → (16, idx=2)
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8093,7 +8516,7 @@ mod tests {
 
     #[test]
     fn add_disease_to_cell_mixing_changes_idx_resets_infestation() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8110,7 +8533,7 @@ mod tests {
 
     #[test]
     fn add_disease_to_cell_result_nonpositive_clears() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8131,7 +8554,7 @@ mod tests {
     #[test]
     fn add_disease_to_cell_without_table_keeps_current() {
         // G_DISEASE 为 null（无病菌表）时双真实病菌 → 防御保留当前（原版越界断言语义）
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         uninstall_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -8171,7 +8594,7 @@ mod tests {
 
     #[test]
     fn stable_ticks_reroll_decrement_and_zero() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
             let timers_ptr = sd.timers.ptr as *mut u8;
@@ -8193,7 +8616,7 @@ mod tests {
 
     #[test]
     fn unstable_check_gas_below_falls_and_pushes_event() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -8236,7 +8659,7 @@ mod tests {
 
     #[test]
     fn unstable_check_solid_below_no_fall_sets_timer() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -8267,7 +8690,7 @@ mod tests {
 
     #[test]
     fn unstable_check_void_below_no_fall() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -8292,7 +8715,7 @@ mod tests {
 
     #[test]
     fn unstable_check_stable_ticks_delay_blocks_fall() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -8321,7 +8744,7 @@ mod tests {
 
     #[test]
     fn unstable_check_headless_swaps_down() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(8, 8, 1, false, true); // headless
         sd.vacuum_element_idx = 0;
@@ -8352,7 +8775,7 @@ mod tests {
 
     #[test]
     fn unstable_check_with_diagonals_below_empty_falls_full() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -8390,7 +8813,7 @@ mod tests {
 
     #[test]
     fn unstable_check_with_diagonals_side_empty_half_falls() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
         sd.vacuum_element_idx = 0;
@@ -8429,7 +8852,7 @@ mod tests {
 
     #[test]
     fn post_process_cell_unstable_solid_falls_via_gate() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_unstable_table();
         let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
         sd.vacuum_element_idx = 0;

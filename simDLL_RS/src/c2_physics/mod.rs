@@ -18,27 +18,20 @@ pub mod region_rng;
 
 /// 阶段 A：区域网格物理（d3 三段式；parallel=true 时温度内联 + 区域局部 CopyFrom）。
 /// 串行路径（parallel=false）行为与原版/现状逐字节一致。
-///
-/// `skip_temperature`：D4 切片路径专用 —— 温度已由
-/// `d4_slice::temperature::run_temperature_sliced_collect` 跨全部区域统一跑完，
-/// 本区域任务只做其余阶段。⚠️ 必须连同**前置的 derive** 一起跳过：
-/// D4 分支已在温度之前逐区域做过 `derive_natural_solid_strength`（顺序陷阱：
-/// derive 必须先于温度，见 `update_data` 的 D4 分支注释），这里再跑一遍不仅浪费，
-/// 而且语义就错了（会对温度相变后的新元素求解强度）。
 pub(crate) fn run_region_physics_a(
     sim_data: &mut SimData,
     bounds: crate::d1_activity::RegionBounds,
     cosmic_intensity: f32,
     parallel: bool,
-    skip_temperature: bool,
 ) {
     if bounds.is_empty() {
         return;
     }
-    if !skip_temperature {
-        // 自然固体强度推导（原版在固体生成/加载时赋予质量型抗压字节；每帧按活动区域兜底，
-        // 覆盖岩浆凝固/沙盒生成等运行时新出现的固体，随后压力分支据此计算抗压阈值）。
-        crate::c_simulation::sim_data_ops::derive_natural_solid_strength(sim_data, bounds);
+    // 自然固体强度推导（原版在固体生成/加载时赋予质量型抗压字节；每帧按活动区域兜底，
+    // 覆盖岩浆凝固/沙盒生成等运行时新出现的固体，随后压力分支据此计算抗压阈值）。
+    crate::c_simulation::sim_data_ops::derive_natural_solid_strength(sim_data, bounds);
+    // 温度段（含并行/串行两分支与队列调度开销——都归属温度阶段成本）
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_TEMPERATURE, {
         if parallel {
             // d3 并行路径：温度在区域任务内联整区（不经全局共享队列，避免嵌套并行争抢）。
             crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
@@ -78,28 +71,45 @@ pub(crate) fn run_region_physics_a(
                 crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
             }
         }
-    }
-    if parallel {
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
-    } else {
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
-    }
-    crate::c2_physics::gas_flow::run_gas_pressure_task(sim_data, bounds);
-    crate::c2_physics::gas_flow::run_gas_displacement_task(sim_data, bounds);
-    if parallel {
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
-    } else {
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
-    }
-    crate::c2_physics::liquid_flow::update_liquid_loop(sim_data, bounds);
-    crate::c2_physics::liquid_flow::run_liquid_displacement_task(sim_data, bounds);
-    if parallel {
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
-    } else {
-        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
-    }
-    crate::c2_physics::disease::run_disease_diffusion_task(sim_data, bounds);
-    crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
+    });
+    crate::sim_stage_timed!(
+        crate::a_framework::stage_profiler::STAGE_COPY,
+        if parallel {
+            crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
+        } else {
+            crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+        }
+    );
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_GAS_PRESSURE, {
+        crate::c2_physics::gas_flow::run_gas_pressure_task(sim_data, bounds);
+        crate::c2_physics::gas_flow::run_gas_displacement_task(sim_data, bounds);
+    });
+    crate::sim_stage_timed!(
+        crate::a_framework::stage_profiler::STAGE_COPY,
+        if parallel {
+            crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
+        } else {
+            crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+        }
+    );
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_LIQUID, {
+        crate::c2_physics::liquid_flow::update_liquid_loop(sim_data, bounds);
+        crate::c2_physics::liquid_flow::run_liquid_displacement_task(sim_data, bounds);
+    });
+    crate::sim_stage_timed!(
+        crate::a_framework::stage_profiler::STAGE_COPY,
+        if parallel {
+            crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells_region(sim_data, &bounds);
+        } else {
+            crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+        }
+    );
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_DISEASE_DIFFUSE, {
+        crate::c2_physics::disease::run_disease_diffusion_task(sim_data, bounds);
+    });
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_RADIATION, {
+        crate::c2_physics::radiation::run_radiation_task(sim_data, bounds, cosmic_intensity);
+    });
 }
 
 /// 阶段 B：区域组件（★4 注册顺序；串行。d3 并行路径也按区域序串行执行，
@@ -111,23 +121,25 @@ pub(crate) fn run_region_emitters(
     if bounds.is_empty() {
         return;
     }
-    crate::c_simulation::frame_processor::process_element_consumers(sim_data, bounds);
-    crate::c_simulation::element_emitter::update_element_emitters(
-        sim_data,
-        0.2,
-        sim_data.width,
-        bounds,
-    );
-    crate::c_simulation::radiation_emitter::update_radiation_emitters_global(sim_data, 0.2, bounds);
-    crate::c_simulation::element_chunk::update_element_chunks(
-        sim_data,
-        0.2,
-        sim_data.width,
-        bounds,
-    );
-    crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data, bounds);
-    crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2, bounds);
-    crate::c_simulation::disease_component::update_disease_emitters(sim_data, 0.2, bounds);
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_EMITTERS, {
+        crate::c_simulation::frame_processor::process_element_consumers(sim_data, bounds);
+        crate::c_simulation::element_emitter::update_element_emitters(
+            sim_data,
+            0.2,
+            sim_data.width,
+            bounds,
+        );
+        crate::c_simulation::radiation_emitter::update_radiation_emitters_global(sim_data, 0.2, bounds);
+        crate::c_simulation::element_chunk::update_element_chunks(
+            sim_data,
+            0.2,
+            sim_data.width,
+            bounds,
+        );
+        crate::c_simulation::building_temperature::update_building_heat_exchange(sim_data, bounds);
+        crate::c_simulation::building_to_building::update_building_to_building(sim_data, 0.2, bounds);
+        crate::c_simulation::disease_component::update_disease_emitters(sim_data, 0.2, bounds);
+    });
 }
 
 /// 阶段 C：区域收尾（太空真空 → PostProcess → 病菌生长）。
@@ -148,9 +160,12 @@ pub(crate) fn run_region_physics_c(
     // 遍历边界用 **PostProcess 边界**（32 格块对齐 + max+1），即世界上方/右方
     // 1 格（太空格）也在删除范围内；此前误用普通区域边界 → 顶部格层气体扩散到
     // 世界上方太空格后不被删除，删除主格后残留随机闪现、缓慢消失。
-    crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, pp_bounds);
-    crate::c2_physics::liquid_flow::post_process_loop(sim_data, pp_bounds);
-    crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);
+    let _t0 = std::time::Instant::now();
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_POSTPROCESS, {
+        crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, pp_bounds);
+        crate::c2_physics::liquid_flow::post_process_loop(sim_data, pp_bounds);
+        crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);
+    });
 }
 
 /// SimBase::UpdateData —— 主物理更新入口。
@@ -165,7 +180,9 @@ pub fn update_data(sim_data: &mut SimData) {
     sim_data.iterate_direction = -sim_data.iterate_direction;
 
     // 原版 UpdateData L144415：每子步开头 CopyFrom(cells, updatedCells)
-    crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_COPY, {
+        crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(sim_data);
+    });
 
     // 2026-08-04 D1：主物理循环按活动区域（已发现世界矩形）裁剪。
     // 原版 L144410-144430：遍历 activeRegions，每个区域内依次执行
@@ -201,44 +218,6 @@ pub fn update_data(sim_data: &mut SimData) {
     let pp_list: Vec<_> = region_bounds.iter().map(|x| x.1).collect();
     let cosmic_list: Vec<_> = region_bounds.iter().map(|x| x.2).collect();
     let region_count = bounds_list.len();
-
-    // D4：切片并行（实验性，feature "d4-slice" 门控）。命中则温度跨**全部区域**
-    // 统一切片、一个并行作用域跑完（方案 B：切片粒度随面积增长，单个大区域也能
-    // 铺满多核 —— 这是 d3 按区域并行做不到的），其余阶段仍走下方现有
-    // D1/D2/串行路径（skip_temperature=true，温度与前置 derive 一并跳过）。
-    //
-    // ⚠️ 顺序陷阱：`derive_natural_solid_strength` 必须在温度**之前**逐区域完成 ——
-    // 温度里的 `do_state_transition` 会改元素索引，derive 落到温度之后会对新元素
-    // 求解，结果与原版不同。故这里先逐区域 derive，再全局温度。
-    //
-    // 温度事件按区域收集（`run_temperature_sliced_collect`），随后随区域一起进
-    // 阶段 A 缓冲（并行）或先于其余阶段落盘（串行），保证全局事件顺序仍是
-    // 原版的「逐区域：温度事件 → 气体/液体事件」交错，而非「全部温度事件在前」。
-    #[cfg(feature = "d4-slice")]
-    let (d4_handled, d4_temp_events): (bool, Vec<crate::c2_physics::region_events::RegionEvents>) = {
-        let physical_cores = crate::d3_rayon::affinity::CpuTopology::cached().physical_cores;
-        if crate::d4_slice::should_slice(physical_cores) {
-            for b in &bounds_list {
-                if b.is_empty() {
-                    continue;
-                }
-                crate::c_simulation::sim_data_ops::derive_natural_solid_strength(sim_data, *b);
-            }
-            let events = crate::d4_slice::temperature::run_temperature_sliced_collect(
-                sim_data,
-                &bounds_list,
-                crate::d4_slice::current_slice_size(),
-                true,
-            );
-            (true, events)
-        } else {
-            (false, Vec::new())
-        }
-    };
-    #[cfg(not(feature = "d4-slice"))]
-    let (d4_handled, d4_temp_events): (bool, Vec<crate::c2_physics::region_events::RegionEvents>) =
-        (false, Vec::new());
-
     // d3 并行分支（feature "d3-rayon" 门控）：多区域 → 三段式并行；否则串行。
     #[cfg(feature = "d3-rayon")]
     {
@@ -253,21 +232,12 @@ pub fn update_data(sim_data: &mut SimData) {
                     bounds_list,
                     pp_list,
                     cosmic_list,
-                    &d4_temp_events,
-                    d4_handled,
                 );
             }
             SchedulerMode::D1 => {
                 if region_count <= 1 {
                     // 单区域/单星永远走串行（与原版一致）。
-                    run_serial_regions(
-                        sim_data,
-                        bounds_list,
-                        pp_list,
-                        cosmic_list,
-                        d4_temp_events,
-                        d4_handled,
-                    );
+                    run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
                 } else {
                     let topo = crate::d3_rayon::affinity::CpuTopology::cached();
                     let reserve = crate::d3_rayon::reserve_cores();
@@ -281,8 +251,6 @@ pub fn update_data(sim_data: &mut SimData) {
                             &pp_list,
                             &cosmic_list,
                             &groups,
-                            &d4_temp_events,
-                            d4_handled,
                         );
                     } else {
                         // 分组失败（无 HT/拓扑异常）→ 回退 D2。
@@ -291,8 +259,6 @@ pub fn update_data(sim_data: &mut SimData) {
                             bounds_list,
                             pp_list,
                             cosmic_list,
-                            &d4_temp_events,
-                            d4_handled,
                         );
                     }
                 }
@@ -305,18 +271,9 @@ pub fn update_data(sim_data: &mut SimData) {
                         bounds_list,
                         pp_list,
                         cosmic_list,
-                        &d4_temp_events,
-                        d4_handled,
                     );
                 } else {
-                    run_serial_regions(
-                        sim_data,
-                        bounds_list,
-                        pp_list,
-                        cosmic_list,
-                        d4_temp_events,
-                        d4_handled,
-                    );
+                    run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
                 }
             }
         }
@@ -334,14 +291,7 @@ pub fn update_data(sim_data: &mut SimData) {
     }
     #[cfg(not(feature = "d3-rayon"))]
     {
-        run_serial_regions(
-            sim_data,
-            bounds_list,
-            pp_list,
-            cosmic_list,
-            Vec::new(),
-            d4_handled,
-        );
+        run_serial_regions(sim_data, bounds_list, pp_list, cosmic_list);
     }
     // 原版 UpdateData L43033：`param_1->tickCount = param_1->tickCount + 1`（每子步一次）。
     // DisplaceGas / DisplaceLiquid 的候选方向按 tickCount 旋转（"随机单方向"确定性实现）；
@@ -351,30 +301,18 @@ pub fn update_data(sim_data: &mut SimData) {
 }
 
 /// 串行区域循环（d3 关闭或单区域时执行；行为与原版逐帧一致）。
-///
-/// `temp_events` / `skip_temperature`：D4 切片路径专用（其余调用方传 `Vec::new()` / `false`）。
-/// D4 命中时温度已全局跑完，这里在区域 i 的其余阶段**之前**把该区域的温度事件
-/// `merge_into` 全局 —— 串行原版的顺序是「逐区域：温度事件 → 气体/液体事件」，
-/// 事件落盘顺序必须保持这个交错，不能整批挪到所有区域之后。
 fn run_serial_regions(
     sim_data: &mut SimData,
     bounds_list: Vec<crate::d1_activity::RegionBounds>,
     pp_list: Vec<crate::d1_activity::RegionBounds>,
     cosmic_list: Vec<f32>,
-    mut temp_events: Vec<crate::c2_physics::region_events::RegionEvents>,
-    skip_temperature: bool,
 ) {
     for i in 0..bounds_list.len() {
         let bounds = bounds_list[i];
         if bounds.is_empty() {
             continue;
         }
-        if skip_temperature {
-            if let Some(te) = temp_events.get_mut(i) {
-                te.merge_into(sim_data);
-            }
-        }
-        run_region_physics_a(sim_data, bounds, cosmic_list[i], false, skip_temperature);
+        run_region_physics_a(sim_data, bounds, cosmic_list[i], false);
         run_region_emitters(sim_data, bounds);
         run_region_physics_c(sim_data, bounds, pp_list[i]);
     }
@@ -517,7 +455,7 @@ mod tests {
     ///   转移），会提前把真空填成液体，破坏 update_liquid 分支 3 角落判定（已移除）。
     #[test]
     fn update_data_spreads_liquid_to_vacuum_neighbor() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pressure_table();
         let mut sd = make_sim_data();
         fill_both(&mut sd, |b| {
@@ -584,7 +522,7 @@ mod tests {
     /// （原版无液体源压力循环；update_liquid 对全固体邻格惰性）。
     #[test]
     fn update_data_liquid_all_solid_neighbors_inert() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pressure_table();
         let mut sd = make_sim_data();
         fill_both(&mut sd, |b| {
@@ -611,7 +549,7 @@ mod tests {
 
     #[test]
     fn update_data_syncs_cells_before_temperature_each_substep() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_task_table();
         let mut sd = make_sim_data();
         // cell14 水 300、cell15 砖 400（相邻换热）；两者四周全是同温固体 → 液体流/压力惰性，
@@ -655,7 +593,7 @@ mod tests {
     /// 存储场景"真空固定右格/左格固定累积"，与原版随帧轮转不符）。
     #[test]
     fn update_data_increments_tick_count_once() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pressure_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.tick_count = 0;
@@ -663,144 +601,6 @@ mod tests {
         assert_eq!(sd.tick_count, 1, "第一个子步 tick_count 应为 1");
         update_data(&mut sd);
         assert_eq!(sd.tick_count, 2, "第二个子步 tick_count 应为 2");
-        crate::b_elements::elements_table::DestroyElementsTable();
-    }
-
-    /// D4 端到端验收（方案 B）：串行帧 vs D4 形态帧，**全部可观测输出逐位一致**。
-    ///
-    /// D4 形态 = `update_data` D4 分支的调用序列：
-    ///   逐区域 derive → 全局切片温度（事件按区域收集）→ 其余阶段走
-    ///   `run_serial_regions`（skip_temperature=true，温度事件先于该区域气体/液体落盘）。
-    /// 串行基线 = 同一初始态走 `run_serial_regions(skip=false)`（温度内联，现状路径）。
-    ///
-    /// 比对五件事：updated_cells（f32 to_bits）、backwall、**全部 5 类事件的条数/内容/
-    /// 追加顺序**（跨阶段交错是 D4 提升温度后新增的风险点：全局温度会把全部温度事件
-    /// 堆到最前，若不按区域前置进阶段 A 缓冲，此处必红）。
-    #[cfg(feature = "d4-slice")]
-    #[test]
-    fn d4_sliced_frame_matches_serial_frame_bitwise() {
-        use crate::c2_physics::region_events::RegionEvents;
-        use crate::d4_slice::temperature::run_temperature_sliced_collect;
-        use crate::d4_slice::DEFAULT_SLICE_SIZE;
-
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
-        init_temp_task_table();
-        // 让水 >90°C 相变为固体（元素 2）：唯一目的是让温度阶段真实产生
-        // substance_change 事件（串行与 D4 同表同初始态，相变结果本身不关心）。
-        // 不加这条，两侧事件序列全空 → 事件顺序断言恒真（假绿）。
-        {
-            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
-            table.temperature_data[1].high_temp = 90.0;
-            table.temperature_data[1].high_temp_transition_idx = 2;
-        }
-
-        // 70×70，两个不相邻区域：region0 39×39（切 32 → 2×2 片）、
-        // region1 28×68（→ 1×3 片）。多区域 + 多切片 + 区域间有真实水体（halo 生效）。
-        let build = || {
-            let mut sd = SimData::new_for_allocate(70, 70, 1, false, true);
-            sd.vacuum_element_idx = 0;
-            sd.void_element_idx = 0xFFFF;
-            let w = 70usize;
-            for y in 1..69usize {
-                for x in 1..69usize {
-                    let cell = y * w + x;
-                    let in_r0 = x < 40;
-                    // 区域间留 1 列真空带（x==40）与 y==40 分界……不，直接让两区域之间
-                    // 的格保持真空（element 0），区域外一圈是真实水体 → halo 判定全走到。
-                    let elem = if in_r0 || x > 40 {
-                        1 // 水
-                    } else {
-                        0
-                    };
-                    fill_both(&mut sd, |b| {
-                        b.element_idx.set(cell, elem);
-                        b.mass.set(cell, if elem == 1 { 50.0 } else { 0.0 });
-                        let t = 20.0 + ((x * 7919 + y * 104729) % 997) as f32 * 0.137;
-                        b.temperature.set(cell, t);
-                        b.insulation.set(cell, 255);
-                    });
-                }
-            }
-            crate::c_simulation::sim_data_ops::copy_updated_cells_to_cells(&mut sd);
-            sd
-        };
-        let regions = vec![
-            crate::d1_activity::RegionBounds { min_x: 1, min_y: 1, max_x: 40, max_y: 40 },
-            crate::d1_activity::RegionBounds { min_x: 41, min_y: 1, max_x: 69, max_y: 69 },
-        ];
-        let pp_bounds = regions.clone();
-        let cosmic = vec![0.0f32, 0.0f32];
-
-        // —— 串行基线 ——
-        let mut serial = build();
-        run_serial_regions(&mut serial, regions.clone(), pp_bounds.clone(), cosmic.clone(), Vec::new(), false);
-
-        // —— D4 形态（update_data D4 分支的调用序列）——
-        let mut d4 = build();
-        for b in &regions {
-            if b.is_empty() {
-                continue;
-            }
-            crate::c_simulation::sim_data_ops::derive_natural_solid_strength(&mut d4, *b);
-        }
-        let temp_events = run_temperature_sliced_collect(&mut d4, &regions, DEFAULT_SLICE_SIZE, true);
-        run_serial_regions(&mut d4, regions.clone(), pp_bounds, cosmic, temp_events, true);
-
-        // —— 逐位比对 ——
-        let (ua, ub) = unsafe { (&*serial.updated_cells.ptr, &*d4.updated_cells.ptr) };
-        assert_eq!(ua.temperature.len(), ub.temperature.len());
-        for i in 0..ua.temperature.len() {
-            assert_eq!(ua.temperature.get(i).to_bits(), ub.temperature.get(i).to_bits(), "temperature 第 {i} 格");
-            assert_eq!(ua.mass.get(i).to_bits(), ub.mass.get(i).to_bits(), "mass 第 {i} 格");
-            assert_eq!(ua.element_idx.get(i), ub.element_idx.get(i), "element_idx 第 {i} 格");
-        }
-        let (ba, bb) = unsafe { (&*serial.backwall.ptr, &*d4.backwall.ptr) };
-        for i in 0..ba.temperature.len() {
-            assert_eq!(ba.temperature.get(i).to_bits(), bb.temperature.get(i).to_bits(), "backwall.temperature 第 {i} 格");
-            assert_eq!(ba.mass.get(i).to_bits(), bb.mass.get(i).to_bits(), "backwall.mass 第 {i} 格");
-            assert_eq!(ba.element_idx.get(i), bb.element_idx.get(i), "backwall.element_idx 第 {i} 格");
-        }
-        let (ea, eb) = unsafe { (&*serial.sim_events.ptr, &*d4.sim_events.ptr) };
-        let sc = |e: &crate::a_framework::sim_events::SimEvents| {
-            (0..e.substance_change_info.len())
-                .map(|i| {
-                    let s = e.substance_change_info.get(i);
-                    (s.cell_idx, s.old_element_idx, s.new_element_idx)
-                })
-                .collect::<Vec<_>>()
-        };
-        let melted = |e: &crate::a_framework::sim_events::SimEvents| {
-            (0..e.cell_melted_info.len()).map(|i| e.cell_melted_info.get(i).game_cell).collect::<Vec<_>>()
-        };
-        let ore = |e: &crate::a_framework::sim_events::SimEvents| {
-            (0..e.spawn_ore_info.len())
-                .map(|i| {
-                    let s = e.spawn_ore_info.get(i);
-                    (s.cell_idx, s.elem_idx, s.mass.to_bits())
-                })
-                .collect::<Vec<_>>()
-        };
-        let liquid = |e: &crate::a_framework::sim_events::SimEvents| {
-            (0..e.spawn_liquid_info.len())
-                .map(|i| {
-                    let s = e.spawn_liquid_info.get(i);
-                    (s.cell_idx, s.element_idx, s.mass.to_bits())
-                })
-                .collect::<Vec<_>>()
-        };
-        let bw = |e: &crate::a_framework::sim_events::SimEvents| {
-            (0..e.backwall_should_transition_info.len())
-                .map(|i| e.backwall_should_transition_info.get(i).game_cell)
-                .collect::<Vec<_>>()
-        };
-        // 反假绿：温度必须真的产生了事件，否则顺序断言恒真。
-        assert!(!sc(ea).is_empty(), "串行侧未产生 substance_change 事件，本用例退化为空断言");
-        assert_eq!(sc(ea), sc(eb), "substance_change 序列不一致（含顺序）");
-        assert_eq!(melted(ea), melted(eb), "cell_melted 序列不一致（含顺序）");
-        assert_eq!(ore(ea), ore(eb), "spawn_ore 序列不一致（含顺序）");
-        assert_eq!(liquid(ea), liquid(eb), "spawn_liquid 序列不一致（含顺序）");
-        assert_eq!(bw(ea), bw(eb), "backwall_should_transition 序列不一致（含顺序）");
-        let _ = RegionEvents::default; // 保持导入被使用（比较辅助均在上方闭包内联）
         crate::b_elements::elements_table::DestroyElementsTable();
     }
 }

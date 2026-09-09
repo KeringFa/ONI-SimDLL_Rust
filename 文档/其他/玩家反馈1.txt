@@ -1,0 +1,12 @@
+Hi, I tested SimDLL_Rust on my system and noticed a possible CPU topology detection issue.
+My CPU is AMD Ryzen 7 7800X3D, 8 cores / 16 threads, but Player.log shows:
+[SimDLL_Rust] CpuInfo: HT present, cores=1 flags=1
+FPS sometimes stays around 60-70, but sometimes drops to 30-40 with unstable frame pacing. I suspect the mod may be detecting only 1 physical core, then choosing the wrong thread scheduling mode or Rayon worker count.
+Possible improvements:
+Fix GetLogicalProcessorInformationEx parsing and verify physical core / logical processor counting.
+Add a manual worker thread count option, for example Auto / 4 / 6 / 8 / 12 / 16.
+For Auto mode, avoid relying only on physical core count; use available logical processors and leave 1-2 threads for the game main/render thread.
+Add per-stage timing logs for simulation phases and frame_sync wait time, so users can see whether FPS drops are caused by worker imbalance or main-thread waiting.
+Avoid rebuilding Rayon global thread pools after restart/reload; use a stable local pool or OnceLock-style initialization.
+If Hyper-Threading optimization is enabled, please allow fallback or manual override when CPU topology detection looks wrong.
+This may help make FPS more stable on 8c/16t CPUs like 7800X3D.

@@ -1,0 +1,37 @@
+发布前预备
+================================
+
+状态：2026-08-10 已实施（提交 4b7c2b9 / 41d3442），回归实测通过。
+附加：simdll_perf.log 已改为受日志开关控制（默认关，开启日志才写）——
+未启用日志时零文件生成（simdll.log / simdll_perf.log / 目录探针均受控）。
+
+一、日志输出策略（2026-08-09 用户决策）
+---------------------------------------------------------------------
+1. 发布版启用日志后，只保留对"玩家崩溃取证"有价值的输出：
+   - 生命周期/存档：SIM_Initialize/Shutdown、AllocateCells、Load、Start、
+     BeginSave/EndSave、CreateElementsTable/DiseaseTable、DefineWorldOffsets、
+     ClearUnoccupiedCells、ResizeAndInitializeVacuumCells 等；
+   - 消息流：SIM_HandleMessage 处理的 id/size/处理结果（用于定位崩在哪条消息）；
+   - 组件事件：building_temperature add/remove、element_emitter blocked/unblocked、
+     PrepareGameData callback_info count（极低概率崩溃取证埋点）。
+2. 噪音（每帧 SIM_HandleMessage entry/done 高频输出、低价值 trace 等）：
+   **保留在代码中但禁用**，且玩家配置**无法勾选启用**（只允许内部手段开启，
+   如环境变量或编译期 debug 开关）。【已实施】噪音降为 debug/trace 级，
+   发布版固定 info 级不输出；内部调试设环境变量 SIMDLL_LOG_VERBOSE=1 可见。
+3. 玩家配置屏幕仅保留"启用日志"总开关（默认关）。
+
+二、日志等级制度删除（2026-08-09 用户决策：等级制度不再需要）
+---------------------------------------------------------------------
+1. Rust 侧：RS_SetLogLevel(off/error/warn/info/debug/trace) 等级机制删除，
+   改为纯开关 RS_SetLogEnabled(bool)。【已实施】等级解析/reload 逻辑已清理，
+   init 固定 info（SIMDLL_LOG_VERBOSE=1 → debug）。
+2. C# 侧：ModConfig.LogLevel / VALID_LOG_LEVELS / SetLogLevel 删除，
+   config.json 只保留 LogEnabled 字段。【已实施】旧 config.json 的 LogLevel
+   字段由 Newtonsoft 默认忽略，无需迁移。
+3. 与"一、日志输出策略"一并实施。
+
+三、备注
+---------------------------------------------------------------------
+- 诊断埋点（极低概率崩溃）保持 info 级可输出，属"有价值"类。
+- 实施后需回归：默认不生成日志文件；勾选启用 → OK → 重启 → 生成日志；
+  日志内容仅为有价值类（无每帧 entry/done 噪音）。

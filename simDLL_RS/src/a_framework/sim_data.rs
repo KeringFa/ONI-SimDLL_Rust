@@ -879,6 +879,7 @@ mod tests {
 
     #[test]
     fn new_for_allocate_sets_special_indices_and_radiation_constants() {
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         let sd = SimData::new_for_allocate(6, 5, 42, true, true);
         // 对照源码 L22385-22390
         assert_eq!(sd.void_element_idx, elements_table::get_element_index_pub(0xa9360b34));
@@ -898,6 +899,7 @@ mod tests {
     /// 由 SetWorldZones 消息分配）。
     #[test]
     fn new_for_allocate_allocates_timers_visible_grid_keeps_world_zones_null() {
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         let sd = SimData::new_for_allocate(6, 5, 0, false, false);
         assert!(!sd.timers.ptr.is_null(), "timers 应分配");
         assert!(!sd.visible_grid.ptr.is_null(), "visible_grid 应分配");
@@ -922,6 +924,7 @@ mod tests {
 
     #[test]
     fn initialize_boundary_sets_top_bottom_rows_both_buffers() {
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         let mut sd = SimData::new_for_allocate(6, 5, 0, false, false);
         sd.initialize_boundary();
         let unob = elements_table::get_element_index_pub(0x6d95058c);
@@ -959,6 +962,7 @@ mod tests {
 
     #[test]
     fn settle_thermal_boundaries_averages_neighbor_temperatures() {
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         let mut sd = SimData::new_for_allocate(6, 5, 0, false, false);
         let void_idx = elements_table::get_element_index_pub(0x3fe0146e);
         let unob_idx = elements_table::get_element_index_pub(0x6d95058c);
@@ -996,6 +1000,7 @@ mod tests {
 
     #[test]
     fn new_for_allocate_allocates_flow_buffers() {
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         let sd = SimData::new_for_allocate(6, 5, 0x12345678, true, false);
         assert!(!sd.flow.ptr.is_null(), "flow 应已分配");
         assert!(!sd.accumulated_flow.ptr.is_null(), "accumulated_flow 应已分配");

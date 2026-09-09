@@ -3,9 +3,10 @@
 //! 对照源码 08_sim_frame_manager.c L1178-1899（ProcessFrame）和
 //! 06_process_messages.c（各 Process* 子函数）。
 //!
-//! C1 策略：
-//! - 非物理消息处理（Dig/ModifyCell/SetInsulation 等）真实实现
-//! - 物理消息处理（CellEnergy/MassConsumption/MassEmission 等）为桩，只清空 vector
+//! 消息处理现状（2026-08-10 更新）：
+//! - Dig/ModifyCell/SetInsulation/CellEnergy/MassConsumption/MassEmission 等
+//!   均已真实实现并带回归测试（早期 C1 阶段曾为"只清空 vector"桩）。
+//! - 残留桩：consolidate_events（单 worker 下行为等价，见 c2_physics/mod.rs）。
 
 use crate::a_framework::sim_data::SimData;
 use crate::a_framework::sim_frame_manager::SimFrameInfo;
@@ -86,6 +87,7 @@ pub fn process_frame(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
     // 原版 ProcessFrame 末尾（L117034-117046）：frame.debugProperties → simData.debugProperties。
     // 缺失导致 building_temperature_scale 恒 0 → 建筑↔格子换热 k=0 失效，is_debug_editing 恒 false。
     sim_data.debug_properties = frame.debug_properties;
+
 }
 
 /// ProcessDigPoints：处理挖掘点。
@@ -652,7 +654,10 @@ fn process_cell_energy_modifications(frame: &mut SimFrameInfo, sim_data: &mut Si
             continue; // 真空
         }
         let mass = updated.mass.get(cell);
-        if mass <= 0.001 || kj <= 0.0 {
+        // 原版 06_process_messages.c L172：守卫是 mass > 0.001 && maxTemp > 0，
+        // 完全不检查 kJ 符号——负 kJ（降温，如 DebugCool/HeatBulb）必须照常处理。
+        // 2026-08-10 修复：此前误加 kj <= 0.0 判断，把全部降温消息整条丢弃。
+        if mass <= 0.001 || max_temp <= 0.0 {
             continue;
         }
         let temp = updated.temperature.get(cell);
@@ -804,48 +809,58 @@ fn flood_removed(
     let w = sim_data.width as usize;
     let h = sim_data.height as usize;
     let total = w * h;
-    let mut visited = vec![false; total];
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back((x, y, 0usize));
-    if x < w && y < h {
-        visited[y * w + x] = true;
-    }
-    while let Some((cx, cy, depth)) = queue.pop_front() {
-        if *mass_to_remove <= 0.0 {
-            break;
+    // visited 用线程本地世代戳池复用（省每次 218KB 分配+清零，行为等价）。
+    crate::c_simulation::bfs_scratch::with_visited_scratch(total, |visited, generation| {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((x, y, 0usize));
+        if x < w && y < h {
+            visited[y * w + x] = generation;
         }
-        if depth >= radius {
-            continue;
-        }
-        let cell = cy * w + cx;
-        let state = {
-            let updated = unsafe { &*sim_data.updated_cells.ptr };
-            if cell >= updated.element_idx.len() {
+        while let Some((cx, cy, depth)) = queue.pop_front() {
+            if *mass_to_remove <= 0.0 {
+                break;
+            }
+            if depth >= radius {
                 continue;
             }
-            elements_table::get_element_post_process_data(updated.element_idx.get(cell))
-                .map(|p| p.state & 3)
-                .unwrap_or(0xFF)
-        };
-        if (skip_solid && state == 3) || (skip_liquid && state == 2) || (skip_gas && state == 1) {
-            continue;
-        }
-        remove_mass_from_cell(sim_data, cell, elem, mass_to_remove, removed);
-        for (nx, ny) in [
-            (cx + 1, cy),
-            (cx.wrapping_sub(1), cy),
-            (cx, cy + 1),
-            (cx, cy.wrapping_sub(1)),
-        ] {
-            if nx < w && ny < h {
-                let n = ny * w + nx;
-                if !visited[n] {
-                    visited[n] = true;
-                    queue.push_back((nx, ny, depth + 1));
+            // 原版 Flood（L135332）出队门控：跳过 x==0 / y==0 边界格才 do_remove。
+            // 2026-09-05 补齐（与 find_reachable_state 同一处原版语义）。
+            if cx == 0 || cy == 0 || cx >= w || cy >= h {
+                continue;
+            }
+            let cell = cy * w + cx;
+            let state = {
+                let updated = unsafe { &*sim_data.updated_cells.ptr };
+                if cell >= updated.element_idx.len() {
+                    continue;
+                }
+                elements_table::get_element_post_process_data(updated.element_idx.get(cell))
+                    .map(|p| p.state & 3)
+                    .unwrap_or(0xFF)
+            };
+            if (skip_solid && state == 3) || (skip_liquid && state == 2) || (skip_gas && state == 1)
+            {
+                continue;
+            }
+            remove_mass_from_cell(sim_data, cell, elem, mass_to_remove, removed);
+            // BFS 邻居顺序 = 原版 Flood<>（L135332）入队序：上 → 左 → 右 → 下。
+            // 2026-09-05 修复：此前误用 [右,左,下,上]（与原版不一致）。
+            for (nx, ny) in [
+                (cx, cy.wrapping_sub(1)), // 上
+                (cx.wrapping_sub(1), cy), // 左
+                (cx + 1, cy),             // 右
+                (cx, cy + 1),             // 下
+            ] {
+                if nx < w && ny < h {
+                    let n = ny * w + nx;
+                    if visited[n] != generation {
+                        visited[n] = generation;
+                        queue.push_back((nx, ny, depth + 1));
+                    }
                 }
             }
         }
-    }
+    });
 }
 
 /// ProcessMassConsumption（原版 SimDLL_Source.c L117050-117185）。
@@ -1384,34 +1399,59 @@ fn find_reachable_state(
     let w = sim.width as usize;
     let h = sim.height as usize;
     let total = w * h;
-    let mut visited = vec![false; total];
     let mut reachable: Vec<usize> = Vec::new();
-    let mut queue = std::collections::VecDeque::new();
-    queue.push_back((x, y, 0usize));
-    if x < w && y < h {
-        visited[y * w + x] = true;
-    }
-    while let Some((cx, cy, depth)) = queue.pop_front() {
-        if depth >= radius {
-            continue;
+    // visited 用线程本地世代戳池复用（省每次 218KB 分配+清零，行为等价）。
+    crate::c_simulation::bfs_scratch::with_visited_scratch(total, |visited, generation| {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((x, y, 0usize));
+        if x < w && y < h {
+            visited[y * w + x] = generation;
         }
-        let cell = cy * w + cx;
-        reachable.push(cell);
-        for (nx, ny) in [
-            (cx + 1, cy),
-            (cx.wrapping_sub(1), cy),
-            (cx, cy + 1),
-            (cx, cy.wrapping_sub(1)),
-        ] {
-            if nx < w && ny < h {
-                let n = ny * w + nx;
-                if !visited[n] {
-                    visited[n] = true;
-                    queue.push_back((nx, ny, depth + 1));
+        while let Some((cx, cy, depth)) = queue.pop_front() {
+            if depth >= radius {
+                continue;
+            }
+            // 原版 Flood 出队门控：跳过 x==0 / y==0 边界格（SimDLL_Source.c L135568-135571：
+            // `x != 0 && x < width && y != 0 && y < height` 才处理）。2026-09-05 补齐
+            // （此前 Rust 误把 0 边界格纳入可达候选，顺序与原版不一致）。
+            if cx == 0 || cy == 0 || cx >= w || cy >= h {
+                continue;
+            }
+            let cell = cy * w + cx;
+            // 原版 GetReachableCells → Flood(skip_solid=true)（ElementConsumer::Update
+            // L140819 传 param_8=true）：元素 state&3==3（固体）的格**不入候选、不穿越**
+            // （SimDLL_Source.c L135436-135442 `!param_5 || (state&3)!=3` 才进入收集块，
+            // 邻居 enqueue 也在块内 → 固体挡 BFS 扩展）。2026-09-05 补齐。
+            // 只判元素相态（ElementPostProcessData.state），不读格子的 properties 位
+            // （砖格的可渗透/容纳由液体/气体模块按 properties 判定，与选格无关）。
+            let cell_elem = unsafe { (*sim.updated_cells.ptr).element_idx.get(cell) };
+            let cell_state = elements_table::get_element_post_process_data(cell_elem)
+                .map(|p| p.state & 3)
+                .unwrap_or(0xFF);
+            if cell_state == 3 {
+                continue; // 固体：不入候选，也不扩展（挡路）
+            }
+            reachable.push(cell);
+            // BFS 邻居顺序 = 原版 Flood<> 的入队序：上 → 左 → 右 → 下
+            // （SimDLL_Source.c L135666-135678 / L135493-135501）。
+            // 2026-09-05 修复：此前误用 [右,左,下,上]，导致泵抽吸顺序与原版不一致
+            // （玩家实测"右侧优先于下侧"——原版应 上/左 优先）。
+            for (nx, ny) in [
+                (cx, cy.wrapping_sub(1)), // 上
+                (cx.wrapping_sub(1), cy), // 左
+                (cx + 1, cy),             // 右
+                (cx, cy + 1),             // 下
+            ] {
+                if nx < w && ny < h {
+                    let n = ny * w + nx;
+                    if visited[n] != generation {
+                        visited[n] = generation;
+                        queue.push_back((nx, ny, depth + 1));
+                    }
                 }
             }
         }
-    }
+    });
     let n = reachable.len();
     if n == 0 {
         return None;
@@ -1989,7 +2029,7 @@ mod tests {
     /// type 0→linger、2→base、3→density、4→constructed、5→maxMass，其余（1 等）跳过。
     #[test]
     fn radiation_params_applies_mapping_and_skips_unknown() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         assert!((sd.radiation_linger_rate - 1.1).abs() < 1e-6);
         assert!((sd.radiation_base_weight - 0.3).abs() < 1e-6);
@@ -2021,7 +2061,7 @@ mod tests {
     /// delta 累加、≤0 清零、callbackIdx≠-1 → 消费回调。
     #[test]
     fn cell_radiation_modification_applies_delta_and_callback() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
             (*sd.updated_cells.ptr).radiation.set(13, 5.0);
@@ -2054,7 +2094,7 @@ mod tests {
     /// **原值**（原版 06_process_messages.c：fVar11 = fVar1），而非 delta。
     #[test]
     fn cell_radiation_clamped_callback_reports_original_value() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
             (*sd.updated_cells.ptr).radiation.set(13, 5.0);
@@ -2087,7 +2127,7 @@ mod tests {
 
     #[test]
     fn cell_energy_modification_heats_cell_and_caps() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -2146,7 +2186,7 @@ mod tests {
 
     #[test]
     fn cell_energy_modification_skips_vacuum_and_tiny_mass() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -2177,9 +2217,51 @@ mod tests {
         assert_eq!(u.temperature.get(7), 300.0, "真空不应加热");
     }
 
+    /// 2026-08-10 回归：负 kJ（降温）消息必须生效——原版 06_process_messages.c L172
+    /// 只检查 mass > 0.001 && maxTemp > 0，不看 kJ 符号。此前误加 kj <= 0.0 判断
+    /// 导致 DebugCool / HeatBulb 等全部降温路径失效（对应漏洞.txt #1）。
+    #[test]
+    fn cell_energy_modification_negative_kj_cools_cell() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_displace_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.resize(4, Default::default());
+            table.temperature_data[1].state = 2; // 液体
+            table.temperature_data[1].specific_heat_capacity = 4.179;
+            table.temperature_data[1].low_temp = 0.0;
+            table.temperature_data[1].high_temp = 1000.0;
+        }
+        // gameCell 0 → sim cell 7；50kg 液体 300K
+        let mut sd = make_test_sim_data();
+        unsafe {
+            let u = &mut *sd.updated_cells.ptr;
+            u.element_idx.set(7, 1);
+            u.mass.set(7, 50.0);
+            u.temperature.set(7, 300.0);
+        }
+        // 负 kJ：ΔT = -500/(50×4.179) ≈ -2.39 → 297.61
+        let mut frame = SimFrameInfo::default();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        buf.extend_from_slice(&(-500.0f32).to_le_bytes());
+        buf.extend_from_slice(&3200.0f32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes());
+        for b in buf {
+            frame.cell_energy_modifications.push(b);
+        }
+        process_cell_energy_modifications(&mut frame, &mut sd);
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert!(
+            (u.temperature.get(7) - 297.61).abs() < 0.05,
+            "负 kJ 应降温 → 297.61，got {}",
+            u.temperature.get(7)
+        );
+    }
+
     #[test]
     fn process_frame_copies_debug_properties_to_sim_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         use crate::a_framework::sim_data::DebugProperties;
         let mut frame = SimFrameInfo::default();
         frame.debug_properties = DebugProperties {
@@ -2201,7 +2283,7 @@ mod tests {
     /// （含太空格真空背墙），此前丢弃 → 太空删除判定恒失败。
     #[test]
     fn process_element_chunk_processes_modify_backwall_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
         // 16B：gameCell=0, elemIdx=5, pad=0, mass=1.5, temperature=300
@@ -2235,7 +2317,7 @@ mod tests {
 
     #[test]
     fn process_element_chunk_add_message_registers_chunk() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         crate::c_simulation::element_chunk::reset_for_test();
         // 元素表：elem5 水（SHC=2、TC=4）
         {
@@ -2283,7 +2365,7 @@ mod tests {
 
     #[test]
     fn process_building_to_building_messages_registers_contacts_and_callbacks() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 元素表：elem5 供热数据
         {
             use crate::b_elements::element::ElementTemperatureData;
@@ -2435,7 +2517,7 @@ mod tests {
 
     #[test]
     fn process_dig_points_clears_solid_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2483,7 +2565,7 @@ mod tests {
 
     #[test]
     fn process_dig_points_skips_non_solid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2514,7 +2596,7 @@ mod tests {
 
     #[test]
     fn process_dig_points_with_callback_pushes_callback_info() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2551,7 +2633,7 @@ mod tests {
     /// （add_liquid 真空分支，原版 L134426-134431），并产生 substance 事件。
     #[test]
     fn process_cell_modifications_add_liquid_to_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2592,7 +2674,7 @@ mod tests {
     /// 前两格清空、第三格剩 50、第四格不动；callback 推送 removed 质量 250。
     #[test]
     fn process_mass_consumption_rectangular_removes_region() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         let mut sd = make_test_sim_data();
         sd.vacuum_element_idx = 0;
@@ -2645,7 +2727,7 @@ mod tests {
     /// → 移除 100+100+50，前两格清空、第三格剩 50；callback=-1 → 无回调。
     #[test]
     fn process_mass_consumption_flood_radius_removes_connected() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         let mut sd = make_test_sim_data();
         sd.vacuum_element_idx = 0;
@@ -2687,7 +2769,7 @@ mod tests {
     /// consumedMassInfo 携带正确 sim_handle（C# 泵靠它把水送进水管）。
     #[test]
     fn element_consumer_consumes_and_reports_mass() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         let mut sd = make_test_sim_data();
         sd.vacuum_element_idx = 0;
@@ -2764,7 +2846,7 @@ mod tests {
     /// offset=0 → 从 idx0 扫 → cell8 命中液体1；offset=2 → 从 idx2 扫 → cell6 命中液体2。
     #[test]
     fn find_reachable_state_rotates_by_offset() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 自定义 4 元素表：0=真空(state0)、1=液体(state2)、2=液体(state2)、3=固体(state3)
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -2796,14 +2878,16 @@ mod tests {
         sd.vacuum_element_idx = 0;
         unsafe {
             let updated = &mut *sd.updated_cells.ptr;
-            updated.element_idx.set(8, 1); // 液体1 @ 可达列表 idx1
+            updated.element_idx.set(8, 1); // 液体1 @ 右邻 (x=2,y=1)
             updated.mass.set(8, 100.0);
             updated.temperature.set(8, 300.0);
-            updated.element_idx.set(6, 2); // 液体2 @ 可达列表 idx2
-            updated.mass.set(6, 100.0);
-            updated.temperature.set(6, 300.0);
+            updated.element_idx.set(13, 2); // 液体2 @ 下邻 (x=1,y=2)
+            updated.mass.set(13, 100.0);
+            updated.temperature.set(13, 300.0);
         }
-        // 消费者内部格 7 = (row1,col1)，radius 2，target=液体(state2)
+        // 消费者内部格 7 = (x=1,y=1)，radius 2，target=液体(state2)。
+        // 原版 Flood 跳过 x==0/y==0 边界格 → 可达候选仅 {7, 8(右), 13(下)}，
+        // BFS 邻居序上→左→右→下中仅 右(8)、下(13) 未被边界挡 → 候选序 [7, 8, 13]。
         assert_eq!(
             find_reachable_state(&sd, 1, 1, 2, 2, 0),
             Some(1),
@@ -2822,11 +2906,62 @@ mod tests {
         DestroyElementsTable();
     }
 
+    /// 固体格挡 BFS 扩展（原版 GetReachableCells → Flood skip_solid=true）：
+    /// 泵格 (1,1) 下方 (1,2)=cell13 放固体 → 墙后 (1,3)=cell19 的液体**选不到**。
+    /// 若 BFS 不挡固体（改动前），cell19 会进候选并被 offset 扫到。
+    #[test]
+    fn find_reachable_state_solid_blocks_bfs_extension() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.element_names.clear();
+            table.state_data.clear();
+            table.liquid_data.clear();
+            table.pressure_data.clear();
+            table.post_process_data.clear();
+            table.temperature_data.clear();
+            for (id, state) in [(0i32, 0u8), (1i32, 2u8), (2i32, 3u8)] {
+                let mut elem = Element::default();
+                elem.id = id;
+                elem.state = state;
+                table.elements.push(elem);
+                table.state_data.push(ElementStateData { state });
+                table
+                    .liquid_data
+                    .push(ElementLiquidData { state, flow: 0.0, ..Default::default() });
+                table
+                    .pressure_data
+                    .push(ElementPressureData { state, flow: 0.0 });
+                table
+                    .post_process_data
+                    .push(ElementPostProcessData { state, ..Default::default() });
+            }
+        }
+        let mut sd = make_test_sim_data();
+        sd.vacuum_element_idx = 0;
+        unsafe {
+            let updated = &mut *sd.updated_cells.ptr;
+            updated.element_idx.set(13, 2); // 固体 @ (1,2) = 泵正下方，挡路
+            updated.mass.set(13, 100.0);
+            updated.element_idx.set(19, 1); // 液体 @ (1,3) = 墙后
+            updated.mass.set(19, 100.0);
+            updated.temperature.set(19, 300.0);
+        }
+        // radius 3 足够越过 (1,3)；若固体不挡路应能选到液体1
+        assert_eq!(
+            find_reachable_state(&sd, 1, 1, 3, 2, 0),
+            None,
+            "固体格 (1,2) 应挡 BFS，(1,3) 液体不可达"
+        );
+        DestroyElementsTable();
+    }
+
     /// ProcessMassEmission（2026-08-02 喷口输出）：向真空格发射 5kg 液体 →
     /// 元素/质量/温度写入 + MassEmittedCallback 推送（emitted=1）。
     #[test]
     fn mass_emission_adds_mass_and_callback() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         let mut sd = make_test_sim_data();
         sd.vacuum_element_idx = 0;
@@ -2862,7 +2997,7 @@ mod tests {
     /// 原版不加质量、推失败回调（emitted=0、elem=0xffff、全零）——此前无条件加质量。
     #[test]
     fn mass_emission_failure_pushes_failure_callback_without_adding() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         let mut sd = make_test_sim_data();
         sd.vacuum_element_idx = 0;
@@ -2907,7 +3042,7 @@ mod tests {
 
     #[test]
     fn process_cell_modifications_replace_vacuum_destroys_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2950,7 +3085,7 @@ mod tests {
 
     #[test]
     fn process_cell_modifications_replace_solid_spawns_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elements_table();
         let mut sd = make_test_sim_data();
         let mut frame = SimFrameInfo::default();
@@ -2991,7 +3126,7 @@ mod tests {
     /// 源格 ClearCell；随后新字段（固体元素 2）写入目标格。
     #[test]
     fn process_cell_modifications_replace_and_displace_squeezes_liquid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_displace_table();
         let mut sd = make_test_sim_data();
         sd.vacuum_element_idx = 0;

@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn sim_initialize_with_null_handler_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         SIM_Initialize(None);
         // 验证 gSim 已创建
         let sim_ptr = crate::globals::G_SIM.lock().0;
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn sim_initialize_creates_gsim_with_frame_sync() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         SIM_Initialize(None);
 
         // 验证 gSim 已创建且 frame_sync 字段指向 G_FRAME_SYNC 内部
@@ -355,13 +355,13 @@ mod tests {
 
     #[test]
     fn sim_shutdown_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         SIM_Shutdown();
     }
 
     #[test]
     fn sim_handle_message_null_data_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // gSim 未创建（null）→ 返回 null
         crate::a_framework::save_load::clean_up();
         let result = SIM_HandleMessage(0, 0, std::ptr::null_mut());
@@ -370,14 +370,14 @@ mod tests {
 
     #[test]
     fn sim_handle_messages_zero_count_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let result = SIM_HandleMessages(0, 0, 0, std::ptr::null_mut());
         assert!(result.is_null());
     }
 
     #[test]
     fn sim_handle_message_unknown_id_returns_null_after_init() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         SIM_Initialize(None);
 
         // 构造未知 ID 的消息（不在 14 项 handler 表中）
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn sim_handle_message_allocate_cells_returns_non_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         SIM_Initialize(None);
 
         // 构造 AllocateCells 数据包：width=2, height=2, flag1=false, flag2=false
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn sim_begin_save_null_sim_data_returns_null_and_zero_size() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         save_load::clean_up();
         let mut size: c_int = -1;
         let result = SIM_BeginSave(&mut size, 0, 0);
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn sim_begin_save_with_null_out_size_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         save_load::clean_up();
         let result = SIM_BeginSave(std::ptr::null_mut(), 0, 0);
         assert!(result.is_null());
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn sim_end_save_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         save_load::clean_up();
         SIM_EndSave();
         save_load::clean_up();
@@ -449,13 +449,13 @@ mod tests {
 
     #[test]
     fn sim_debug_crash_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         SIM_DebugCrash();
     }
 
     #[test]
     fn sysinfo_acquire_returns_non_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let ptr = SYSINFO_Acquire();
         assert!(!ptr.is_null());
         SYSINFO_Release();
@@ -463,13 +463,13 @@ mod tests {
 
     #[test]
     fn sysinfo_release_no_arg_is_safe() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         SYSINFO_Release();
     }
 
     #[test]
     fn sim_begin_save_returns_null_via_ffi() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         save_load::clean_up();
         let mut size: c_int = -1;
         let result = SIM_BeginSave(&mut size, 0, 0);

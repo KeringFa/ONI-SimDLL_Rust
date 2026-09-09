@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn get_diffusion_scale_gates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         install_disease_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn update_cells_same_disease_equilibrates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         install_disease_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn update_cells_empty_a_absorbs_from_b() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         install_disease_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn update_cells_empty_b_receives_from_a() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         install_disease_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn update_cells_different_disease_stronger_flows() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         install_disease_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn update_cells_element_state_gate_blocks() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         install_disease_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn run_disease_diffusion_task_loops_right_and_down() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_state_table();
         install_disease_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn post_process_optimal_temp_within_population_range() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_growth_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         // temp=30（最优带 → f=1.0）、count=500、mass=1.0（min=100≤500≤1000）、acc=0
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn post_process_below_min_viable_decays() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_growth_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         // temp=-10 → hl[0]=5 → f=2^-0.04=0.97265495
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn post_process_under_population_constant_death() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_growth_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         // count=50 < min=100 → growth=-1.0×0.2=-0.2；temp 最优 → f=1.0
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn post_process_over_population_half_life() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_growth_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         // count=2000 > max=1000 → growth=(2^-0.02-1)×2000=-27.5346
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn post_process_accumulated_error_carries() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_growth_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         // acc=0.4、count=500、temp 最优 → f25=0.4-6.88365=-6.48365 → count=494、acc=-0.48365
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn post_process_radiation_kills_when_enabled() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_growth_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         // radiation_enabled=true、radiation=10、killRate=0.5
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn post_process_second_pass_clears_and_increments_tick() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         install_growth_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
         // count=0、tick=0、acc=0.5：第一遍 f25=0.3 → count 仍 0；
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn update_data_hooks_disease_diffusion_after_liquid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_solid_table();
         install_integration_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, false, false);
@@ -976,27 +976,27 @@ mod tests {
 
     #[test]
     fn calculate_range_half_life_optimal_band_is_infinity() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         assert_eq!(calculate_range_half_life(30.0, &test_range(), &test_hl()), f32::INFINITY);
     }
 
     #[test]
     fn calculate_range_half_life_interpolates_band() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // temp=10 ∈ [0,20)：t=0.5 → lerp(100,200)=150
         assert_eq!(calculate_range_half_life(10.0, &test_range(), &test_hl()), 150.0);
     }
 
     #[test]
     fn calculate_range_half_life_clamps_below_and_above() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         assert_eq!(calculate_range_half_life(-5.0, &test_range(), &test_hl()), 100.0);
         assert_eq!(calculate_range_half_life(80.0, &test_range(), &test_hl()), 400.0);
     }
 
     #[test]
     fn calculate_range_half_life_inf_propagates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let hl = RangeInfo {
             min_viable: f32::INFINITY,
             ..test_hl()

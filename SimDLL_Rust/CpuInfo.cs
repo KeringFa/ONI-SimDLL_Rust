@@ -25,6 +25,12 @@ namespace SimDLL_Rust
         /// <summary>CPU 是否启用了超线程（任一物理核的逻辑处理器数 &gt; 1）。</summary>
         public static bool HasHyperThreading()
         {
+            // Linux：Rust 侧拓扑检测同样回退 fallback（D1 不启用、自动回退 D2），
+            // 这里短路防止 kernel32 P/Invoke 在非 Windows 平台崩溃。
+            if (!Native.IsWindowsPlatform())
+            {
+                return false;
+            }
             try
             {
                 uint len = 0;

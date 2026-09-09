@@ -36,12 +36,12 @@ impl RegionBounds {
     }
 }
 
-/// 由 ActiveRegion 计算循环边界。
+/// 由 ActiveRegion 计算普通区域循环边界（物理任务用）。
 ///
-/// 对照原版 L145435-145460 的边界推导：`local_17c..local_18c` 是区域坐标的
-/// 32 格块（floor 除法），边界 = 块×32+1 与 区域±1 取 min/max，再钳制到
-/// width-1/height-1；循环用 `<` 上界 → 实际最大行/列 = min(region.max, w-2/h-2)。
-/// 对正常区域（宽高 ≥ 32）该运算等价于：区域矩形直接钳制到内部格。
+/// 对照原版 UpdateData：物理任务（温度/气体/液体/辐射）直接用区域原始边界
+/// （sim 坐标 +1 偏移），本函数仅做内部格钳制 [1, w-2]×[1, h-2]。
+/// ⚠️ 注意：/32 格块运算属于 **PostProcess 专属**（见 compute_post_process_bounds），
+/// 不适用于本函数（2026-08-10 文档修正，D-9）。
 pub fn compute_region_bounds(sim: &SimData, region: &ActiveRegion) -> RegionBounds {
     let w = sim.width as i64;
     let h = sim.height as i64;

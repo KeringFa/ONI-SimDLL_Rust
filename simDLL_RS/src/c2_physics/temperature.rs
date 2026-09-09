@@ -152,8 +152,12 @@ pub(crate) fn do_partial_heat_transition(sim: &mut SimData, cell: usize, neighbo
     };
     let cell_high = cell_el.high_temp;
     let neigh_low = neigh_el.low_temp;
-    let cell_tc = cell_el.thermal_conductivity;
-    let neigh_tc = neigh_el.thermal_conductivity;
+    // Original L2156/L2160 reads Element@0x0c = specificHeatCapacity
+    // (NOT thermalConductivity@0x10). 2026-08-10 fix: using TC made the
+    // heat-affordability gate far too permissive, so the forced transition
+    // fired while the oil was still ~220C; original waits until ~350C.
+    let cell_shc = cell_el.specific_heat_capacity;
+    let neigh_shc = neigh_el.specific_heat_capacity;
     let cell_temp = updated.temperature.get(cell);
     let neigh_temp = updated.temperature.get(neighbor);
     let f22 = cell_high + 3.0;
@@ -167,11 +171,11 @@ pub(crate) fn do_partial_heat_transition(sim: &mut SimData, cell: usize, neighbo
     if cell_high - 3.0 <= cell_temp {
         return false;
     }
-    // 原版 L2156：heat = (f22 − cell_temp) × cell_tc × 5.0
-    let heat = (f22 - cell_temp) * cell_tc * 5.0;
-    // 原版 L2158-2162：f21 = mass[neighbor] × neigh_tc；f21×10 < heat → false
+    // 原版 L2156：heat = (f22 − cell_temp) × cell_SHC × 5.0
+    let heat = (f22 - cell_temp) * cell_shc * 5.0;
+    // 原版 L2158-2162：f21 = mass[neighbor] × neigh_SHC；f21×10 < heat → false
     let mass_neigh = updated.mass.get(neighbor);
-    let mut f21 = mass_neigh * neigh_tc;
+    let mut f21 = mass_neigh * neigh_shc;
     if f21 * 10.0 < heat {
         return false;
     }
@@ -336,11 +340,11 @@ pub(crate) fn do_partial_melt(sim: &mut SimData, cell: usize, neighbor: usize) -
     if (target_el.state & 3) != 2 {
         return false;
     }
-    // 原版 L2521：heat = (f19 − neigh_temp) × 目标TC × 5.0
-    let heat = (f19 - neigh_temp) * target_el.thermal_conductivity * 5.0;
-    // 原版 L2523-2525：f17 = mass[cell] × cell_TC；(cell_temp − (cell_low+6)) × f17 < heat → false
-    let cell_tc = cell_el.thermal_conductivity;
-    let mut f17 = updated.mass.get(cell) * cell_tc;
+    // 原版 L2521：heat = (f19 − neigh_temp) × 目标SHC × 5.0
+    let heat = (f19 - neigh_temp) * target_el.specific_heat_capacity * 5.0;
+    // 原版 L2523-2525：f17 = mass[cell] × cell_SHC；(cell_temp − (cell_low+6)) × f17 < heat → false
+    let cell_shc = cell_el.specific_heat_capacity;
+    let mut f17 = updated.mass.get(cell) * cell_shc;
     if (cell_temp - (cell_el.low_temp + 6.0)) * f17 < heat {
         return false;
     }
@@ -571,8 +575,11 @@ pub(crate) fn do_state_transition(
 /// CalculateTemperatureExchange_precise（原版 L133110-133170）。
 ///
 /// heat = min((T_b−T_a)×k×dt, (T_b−T_a)×rate×HC_a, (T_b−T_a)×rate×HC_b)；
-/// 新温度 = ±heat/HC + 原温度，钳制不越过加权均衡；double 计算、f32 输出。
+/// 新温度 = ±heat/HC + 原温度，钳制不越过加权均衡。
 /// 返回 (new_第一参, new_第二参)。
+/// 2026-09-06 对齐修正：原版全程 float（SimDLL_Source.c L133833+ 的 fVar 序列），
+/// 此前 Rust 用 f64 中间计算属于精度偏差（非增强）——改回 f32 与原版一致，
+/// 同时消除 6 次/调用的 cvt 转换并解除 SIMD 向量化阻碍。
 pub(crate) fn calculate_temperature_exchange_precise(
     rate: f32,
     k: f32,
@@ -582,11 +589,8 @@ pub(crate) fn calculate_temperature_exchange_precise(
     t_b: f32,
     hc_b: f32,
 ) -> (f32, f32) {
-    let (t_a, hc_a) = (t_a as f64, hc_a as f64);
-    let (t_b, hc_b) = (t_b as f64, hc_b as f64);
-    let (rate, k, dt) = (rate as f64, k as f64, dt as f64);
     if hc_a <= 0.0 || hc_b <= 0.0 {
-        return (t_a as f32, t_b as f32);
+        return (t_a, t_b);
     }
     let equilibrium = (t_a * hc_a + t_b * hc_b) / (hc_a + hc_b);
     let d = t_b - t_a;
@@ -599,17 +603,29 @@ pub(crate) fn calculate_temperature_exchange_precise(
     if new_b <= equilibrium {
         new_b = equilibrium;
     }
-    (new_a as f32, new_b as f32)
+    (new_a, new_b)
 }
+
+/// insulation 中间值 LUT（#16，2026-09-06）：iv = ins² × 1.53787e-05。
+/// insulation 是 u8（256 种输入），热路径每对邻格重复计算——预计算查表。
+/// const 求值与运行时 IEEE 乘法逐位一致（同表达式同顺序），下方单测护栏。
+static INSULATION_IV_LUT: [f32; 256] = {
+    let mut lut = [0.0f32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let ins = i as f32;
+        lut[i] = ins * ins * 1.53787e-05;
+        i += 1;
+    }
+    lut
+};
 
 /// 合并导率（原版 UpdateTemperature L133833-133847）：任一侧 insulation 值
 /// （ins²×1.53787e-05）<1.0 → min(k_a,k_b)；否则几何平均。
 /// 注：ins=255 时 f32 下 iv 舍入为 1.0（非 <1）→ 几何平均分支可达。
 fn combine_conductivity(ins_a: u8, tc_a: f32, ins_b: u8, tc_b: f32) -> f32 {
-    let ins_a = ins_a as f32;
-    let ins_b = ins_b as f32;
-    let iv_a = ins_a * ins_a * 1.53787e-05;
-    let iv_b = ins_b * ins_b * 1.53787e-05;
+    let iv_a = INSULATION_IV_LUT[ins_a as usize];
+    let iv_b = INSULATION_IV_LUT[ins_b as usize];
     let k_a = iv_a * tc_a;
     let k_b = iv_b * tc_b;
     if iv_a < 1.0 || iv_b < 1.0 {
@@ -640,74 +656,65 @@ fn surface_multiplier_backwall(this: &ElementTemperatureData, other_state: u8) -
 }
 
 /// UpdateTemperature（原版 L133737-134004）：读 `cells` 稳定缓冲，写 `updatedCells` 增量 + [1,10000] 钳制。
-///
-/// 现为 [`compute_pair_delta`] + [`apply_delta`] 的薄封装（D4 拆分，行为不变）。
 pub(crate) fn update_temperature_pair(sim: &mut SimData, cell_a: usize, cell_b: usize) {
-    // 原函数不判边界门控（由调用方 `run_temperature_band` 的 col+1/row+1 判断负责），
-    // 此处沿用：boundary_ok = true。
-    if let Some((da, db)) = compute_pair_delta(sim, cell_a, cell_b, true) {
-        apply_delta(sim, cell_a, da);
-        apply_delta(sim, cell_b, db);
+    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
+        return;
     }
+    let (etd_a, etd_b) = {
+        let c = unsafe { &*sim.cells.ptr };
+        if cell_a >= c.temperature.len() || cell_b >= c.temperature.len() {
+            return;
+        }
+        match (
+            get_element_temperature_data(c.element_idx.get(cell_a)),
+            get_element_temperature_data(c.element_idx.get(cell_b)),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return,
+        }
+    };
+    update_temperature_pair_with(sim, cell_a, cell_b, &etd_a, &etd_b);
 }
 
-/// 计算一对格子间的温度交换增量。**只读 `sim.cells` 不可变快照**，无副作用。
-///
-/// `boundary_ok` 由调用方传入 —— 边界门控按方向而异，不能统一套用；
-/// `|ΔT| >= 1` 与 `pair_allowed` 两道数值门控在本函数内部判定。
-///
-/// 返回 `(delta_a, delta_b)`；门控不通过返回 `None`。
-pub(crate) fn compute_pair_delta(
-    sim: &SimData,
-    a: usize,
-    b: usize,
-    boundary_ok: bool,
-) -> Option<(f32, f32)> {
-    if !boundary_ok {
-        return None;
-    }
-    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
-        return None;
-    }
-    if !pair_allowed(sim, a, b) {
-        return None;
-    }
-
+/// #13 查表复用版：调用方（run_temperature_band）已持有双方 ETD 时免重查。
+/// 门控与写入顺序与原 update_temperature_pair 逐位一致——只是省掉重复的
+/// 2 次 get_element_temperature_data（AtomicPtr 加载 + 索引检查）。
+fn update_temperature_pair_with(
+    sim: &mut SimData,
+    cell_a: usize,
+    cell_b: usize,
+    etd_a: &ElementTemperatureData,
+    etd_b: &ElementTemperatureData,
+) {
     let (t_a, t_b, hc_a, hc_b, k_total) = {
         let c = unsafe { &*sim.cells.ptr };
-        if a >= c.temperature.len() || b >= c.temperature.len() {
-            return None;
+        if cell_a >= c.temperature.len() || cell_b >= c.temperature.len() {
+            return;
         }
-        let (t_a, t_b) = (c.temperature.get(a), c.temperature.get(b));
-        if (t_a - t_b).abs() < 1.0 {
-            return None;
-        }
-        let (elem_a, elem_b) = (c.element_idx.get(a), c.element_idx.get(b));
-        let (Some(etd_a), Some(etd_b)) = (
-            get_element_temperature_data(elem_a),
-            get_element_temperature_data(elem_b),
-        ) else {
-            return None;
-        };
         let (hc_a, hc_b) = (
-            c.mass.get(a) * etd_a.specific_heat_capacity,
-            c.mass.get(b) * etd_b.specific_heat_capacity,
+            c.mass.get(cell_a) * etd_a.specific_heat_capacity,
+            c.mass.get(cell_b) * etd_b.specific_heat_capacity,
         );
         if hc_a <= 0.0 || hc_b <= 0.0 {
-            return None;
+            return;
         }
         let k = combine_conductivity(
-            c.insulation.get(a),
+            c.insulation.get(cell_a),
             etd_a.thermal_conductivity,
-            c.insulation.get(b),
+            c.insulation.get(cell_b),
             etd_b.thermal_conductivity,
         );
-        let mult_a = surface_multiplier_pair(&etd_a, etd_b.state);
-        let mult_b = surface_multiplier_pair(&etd_b, etd_a.state);
-        (t_a, t_b, hc_a, hc_b, k * mult_a * mult_b)
+        let mult_a = surface_multiplier_pair(etd_a, etd_b.state);
+        let mult_b = surface_multiplier_pair(etd_b, etd_a.state);
+        (
+            c.temperature.get(cell_a),
+            c.temperature.get(cell_b),
+            hc_a,
+            hc_b,
+            k * mult_a * mult_b,
+        )
     };
-
-    // 原版约定：冷侧在前（T_a ≤ T_b）调用 precise；否则 swapped 后映射回
+    // 原版约定：冷侧在前（T_a ≤ T_b）调用 precise；否则 swapped 后映射回 (new_cell, new_neighbor)
     let (new_a, new_b) = if t_a <= t_b {
         calculate_temperature_exchange_precise(0.25, k_total, 0.2, t_a, hc_a, t_b, hc_b)
     } else {
@@ -715,26 +722,15 @@ pub(crate) fn compute_pair_delta(
             calculate_temperature_exchange_precise(0.25, k_total, 0.2, t_b, hc_b, t_a, hc_a);
         (na, nb)
     };
-
-    let c = unsafe { &*sim.cells.ptr };
-    Some((new_a - c.temperature.get(a), new_b - c.temperature.get(b)))
-}
-
-/// 把 `delta` 累加进**一个**格子。调用方保证该格子归自己所有。
-///
-/// 钳制 `[1.0, 10000.0]` 与串行版 `update_temperature_pair` 的逐次钳制一致
-/// （串行也是每次应用后钳制，不是累加完再钳）。
-pub(crate) fn apply_delta(sim: &mut SimData, cell: usize, delta: f32) {
-    if sim.cells.ptr.is_null() || sim.updated_cells.ptr.is_null() {
-        return;
-    }
     unsafe {
         let u = &mut *sim.updated_cells.ptr;
-        if cell >= u.temperature.len() {
-            return;
-        }
-        let v = delta + u.temperature.get(cell);
-        u.temperature.set(cell, v.max(1.0).min(10000.0));
+        let c = &*sim.cells.ptr;
+        let mut va = (new_a - c.temperature.get(cell_a)) + u.temperature.get(cell_a);
+        va = va.max(1.0).min(10000.0);
+        u.temperature.set(cell_a, va);
+        let mut vb = (new_b - c.temperature.get(cell_b)) + u.temperature.get(cell_b);
+        vb = vb.max(1.0).min(10000.0);
+        u.temperature.set(cell_b, vb);
     }
 }
 
@@ -855,12 +851,18 @@ pub(crate) fn update_temperature_for_backwall(sim: &mut SimData, cell: usize) {
 /// 邻格换热门控（原版 L144246-144258）：双方元素 ETD 有效、TC>0、state 无 TemperatureInsulated(0x10)。
 fn pair_allowed(sim: &SimData, a: usize, b: usize) -> bool {
     let c = unsafe { &*sim.cells.ptr };
-    let (Some(etd_a), Some(etd_b)) = (
+    match (
         get_element_temperature_data(c.element_idx.get(a)),
         get_element_temperature_data(c.element_idx.get(b)),
-    ) else {
-        return false;
-    };
+    ) {
+        (Some(etd_a), Some(etd_b)) => pair_allowed_etd(&etd_a, &etd_b),
+        _ => false,
+    }
+}
+
+/// 纯判定版（#13 查表复用）：调用方已持有双方 ETD 时零查表判定。
+/// 门控顺序与原 pair_allowed 逐位一致。
+fn pair_allowed_etd(etd_a: &ElementTemperatureData, etd_b: &ElementTemperatureData) -> bool {
     etd_a.thermal_conductivity > 0.0
         && etd_b.thermal_conductivity > 0.0
         && (etd_a.state | etd_b.state) & 0x10 == 0
@@ -923,13 +925,30 @@ pub(crate) fn run_temperature_band(
                     c.temperature.get(cell + w),
                 )
             };
-            if col + 1 < w - 1 && (t_self - t_right).abs() >= 1.0 && pair_allowed(sim, cell, cell + 1)
-            {
-                update_temperature_pair(sim, cell, cell + 1);
+            // #13 查表复用：|ΔT| 门控通过后才查 ETD（保持惰性——温差小的格零查表），
+            // 每方向查到的 ETD 同时用于 pair_allowed_etd 判定与 update_temperature_pair_with，
+            // 消除原 update_temperature_pair 内部的 2 次重复查表。
+            if col + 1 < w - 1 && (t_self - t_right).abs() >= 1.0 {
+                let c = unsafe { &*sim.cells.ptr };
+                if let (Some(ea), Some(eb)) = (
+                    get_element_temperature_data(c.element_idx.get(cell)),
+                    get_element_temperature_data(c.element_idx.get(cell + 1)),
+                ) {
+                    if pair_allowed_etd(&ea, &eb) {
+                        update_temperature_pair_with(sim, cell, cell + 1, &ea, &eb);
+                    }
+                }
             }
-            if row + 1 < h - 1 && (t_self - t_below).abs() >= 1.0 && pair_allowed(sim, cell, cell + w)
-            {
-                update_temperature_pair(sim, cell, cell + w);
+            if row + 1 < h - 1 && (t_self - t_below).abs() >= 1.0 {
+                let c = unsafe { &*sim.cells.ptr };
+                if let (Some(ea), Some(eb)) = (
+                    get_element_temperature_data(c.element_idx.get(cell)),
+                    get_element_temperature_data(c.element_idx.get(cell + w)),
+                ) {
+                    if pair_allowed_etd(&ea, &eb) {
+                        update_temperature_pair_with(sim, cell, cell + w, &ea, &eb);
+                    }
+                }
             }
             // 4. DoStateTransition（每格，原版 L144293-144306）
             let elem = unsafe { (*sim.cells.ptr).element_idx.get(cell) };
@@ -959,6 +978,20 @@ mod tests {
     use crate::b_elements::elements_table::G_ELEMENTS_TABLE;
     use crate::b_elements::element::Element;
     use crate::LIB_TESTS_LOCK;
+
+    /// #16 LUT 一致性护栏：256 个预计算值必须与现算表达式逐位全等
+    /// （ins*ins*1.53787e-05，同乘法顺序）。任何一侧改写导致舍入差异即红。
+    #[test]
+    fn insulation_iv_lut_matches_inline_computation() {
+        for i in 0..=255usize {
+            let ins = i as f32;
+            let expected = ins * ins * 1.53787e-05;
+            assert_eq!(
+                INSULATION_IV_LUT[i], expected,
+                "LUT[{i}] 与现算不一致（逐位）"
+            );
+        }
+    }
 
     fn make_sim() -> SimData {
         let mut sd = SimData::new_for_allocate(6, 6, 1, false, false);
@@ -1020,7 +1053,7 @@ mod tests {
 
     #[test]
     fn high_transition_switches_element_and_emits_substance_change() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 14, 1, 10.0, 105.0); // 水 105℃ ≥ high+3
@@ -1033,9 +1066,43 @@ mod tests {
         assert_eq!(events.substance_change_info.len(), 1);
     }
 
+    /// 2026-08-10 玩家报告回归：原油 CrudeOil 高温相变不成石油 Petroleum。
+    /// 液体→液体（无 ore）走与原版一致的高温分支：温度 −1.5、元素切换、质量不变。
+    /// CrudeOil 真实参数：highTemp=673K、highTempTransitionTarget=Petroleum、无 ore。
+    #[test]
+    fn high_transition_liquid_to_liquid_switches_element_keeps_mass() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_phase_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.temperature_data.resize(6, Default::default());
+            table.elements.resize(6, Element::default());
+            // 原油(4) → 石油(5)
+            table.temperature_data[4].state = 2;
+            table.temperature_data[4].low_temp = 233.0;
+            table.temperature_data[4].high_temp = 673.0;
+            table.temperature_data[4].high_temp_transition_idx = 5;
+            table.temperature_data[5].state = 2;
+            table.temperature_data[5].low_temp = 216.0;
+            table.temperature_data[5].high_temp = 812.0;
+            table.elements[4].state = 2;
+            table.elements[5].state = 2;
+        }
+        let mut sd = make_sim();
+        fill(&mut sd, 14, 4, 870.0, 677.0); // 原油 677K > 673+3
+        let etd = get_element_temperature_data(4).unwrap();
+        assert!(do_state_transition(&mut sd, 14, &etd));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        assert_eq!(u.element_idx.get(14), 5, "原油应→石油");
+        assert!((u.temperature.get(14) - 675.5).abs() < 1e-4, "温度 -1.5 → 675.5，got {}", u.temperature.get(14));
+        assert!((u.mass.get(14) - 870.0).abs() < 1e-4, "液体→液体质量不变，got {}", u.mass.get(14));
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.substance_change_info.len(), 1);
+    }
+
     #[test]
     fn low_transition_solid_clears_cell_when_mass_ratio_small() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 14, 1, 100.0, -5.0); // 水 -5℃ < low-3，低变=冰（固态）
@@ -1051,7 +1118,7 @@ mod tests {
 
     #[test]
     fn low_transition_non_solid_drips_liquid_when_visible() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 20, 3, 5.0, 95.0); // 蒸汽 95℃ < low-3，低变=水（非固态）
@@ -1069,7 +1136,7 @@ mod tests {
     /// 新温度 max(0, -4+1.5)=0 ∈ [-3, 103] → 原版 push 液滴（T=0、整格质量、清格）。
     #[test]
     fn low_transition_range_check_uses_new_temperature() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 20, 3, 5.0, -4.0); // 蒸汽 → 低变=水（非固态）
@@ -1091,7 +1158,7 @@ mod tests {
 
     #[test]
     fn transition_gate_keeps_within_plus_minus_three() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 14, 1, 10.0, 102.9); // 100+3 内 → 不转变
@@ -1104,7 +1171,7 @@ mod tests {
 
     #[test]
     fn load_time_transition_high_converts_element_and_cools() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 14, 1, 10.0, 105.0); // 水 105℃ > high+3(103)
@@ -1116,7 +1183,7 @@ mod tests {
 
     #[test]
     fn load_time_transition_low_converts_element_and_warms() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 14, 1, 10.0, -5.0); // 水 -5℃ < low-3(-3)
@@ -1128,7 +1195,7 @@ mod tests {
 
     #[test]
     fn load_time_transition_within_window_and_boundary_is_noop() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         let mut sd = make_sim();
         fill(&mut sd, 14, 1, 10.0, 97.0); // 窗口内
@@ -1150,7 +1217,7 @@ mod tests {
 
     #[test]
     fn load_time_transition_without_target_is_noop() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_phase_table();
         // 冰(2) 无转换目标：手动置 0xFFFF
         {
@@ -1178,21 +1245,22 @@ mod tests {
         let mut table = G_ELEMENTS_TABLE.lock().unwrap();
         table.elements.clear();
         table.temperature_data.clear();
-        let mut mk = |state: u8, low: f32, high: f32, tc: f32, high_trans: u16| {
+        let mut mk = |state: u8, low: f32, high: f32, tc: f32, shc: f32, high_trans: u16| {
             let mut e = Element::default();
             e.state = state;
             e.low_temp = low;
             e.high_temp = high;
             e.thermal_conductivity = tc;
+            e.specific_heat_capacity = shc;
             e.high_temp_transition_idx = high_trans;
             e
         };
         table.elements.push(Element::default()); // 0 dummy
-        table.elements.push(mk(2, 0.0, 100.0, 1.0, 3)); // 1 水 → 蒸汽
+        table.elements.push(mk(2, 0.0, 100.0, 1.0, 1.0, 3)); // 1 水 → 蒸汽
         table.elements.push(Element::default()); // 2 冰
-        table.elements.push(mk(1, 100.0, 999.0, 1.0, 0)); // 3 蒸汽
-        table.elements.push(mk(3, -100.0, 500.0, 1.0, 0xFFFF)); // 4 热固体
-        table.elements.push(mk(2, 0.0, 500.0, 1.0, 0)); // 5 熔岩
+        table.elements.push(mk(1, 100.0, 999.0, 1.0, 1.0, 0)); // 3 蒸汽
+        table.elements.push(mk(3, -100.0, 500.0, 1.0, 1.0, 0xFFFF)); // 4 热固体
+        table.elements.push(mk(2, 0.0, 500.0, 1.0, 1.0, 0)); // 5 熔岩
         // temperature_data 与 elements 同序（液滴温度范围检查会读 low/high）
         let td = [
             (0.0f32, 0.0f32),   // 0 dummy
@@ -1228,7 +1296,7 @@ mod tests {
 
     #[test]
     fn partial_heat_gas_target_places_below() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_partial_heat_table();
         let mut sd = make_sim();
         // cell14=水 10kg 20℃；neighbor15=热固体 100kg 600℃；below20=蒸汽
@@ -1258,7 +1326,7 @@ mod tests {
 
     #[test]
     fn partial_heat_liquid_target_spawns_droplet() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_partial_heat_table();
         let mut sd = make_sim();
         // 水 → 目标改为熔岩(5)：水(1).high_trans=5
@@ -1283,9 +1351,135 @@ mod tests {
         assert!((drop.temperature - 103.0).abs() < 1e-4);
     }
 
+    /// 2026-08-10 玩家报告：原油 CrudeOil 强制相变生成的石油温度不对（334℃ 而非 403℃）。
+    /// 用真实参数验证：CrudeOil(6) high=673K → Petroleum(7)；Magma(8) low=1683K。
+    #[test]
+    fn partial_heat_crude_oil_to_petroleum_droplet_at_high_plus_3() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_partial_heat_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.resize(9, Element::default());
+            table.temperature_data.resize(9, Default::default());
+            // CrudeOil(6)：液体、high=673K → Petroleum(7)、TC=2
+            table.elements[6].state = 2;
+            table.elements[6].low_temp = 233.0;
+            table.elements[6].high_temp = 673.0;
+            table.elements[6].thermal_conductivity = 2.0;
+            table.elements[6].high_temp_transition_idx = 7;
+            table.temperature_data[6].state = 2;
+            table.temperature_data[6].low_temp = 233.0;
+            table.temperature_data[6].high_temp = 673.0;
+            // Petroleum(7)：液体
+            table.elements[7].state = 2;
+            table.elements[7].low_temp = 216.0;
+            table.elements[7].high_temp = 812.0;
+            table.temperature_data[7].state = 2;
+            table.temperature_data[7].low_temp = 216.0;
+            table.temperature_data[7].high_temp = 812.0;
+            // Magma(8)：液体、low=1683K、TC=1
+            table.elements[8].state = 2;
+            table.elements[8].low_temp = 1683.0;
+            table.elements[8].high_temp = 2630.0;
+            table.elements[8].thermal_conductivity = 1.0;
+            table.temperature_data[8].state = 2;
+            table.temperature_data[8].low_temp = 1683.0;
+            table.temperature_data[8].high_temp = 2630.0;
+            // post_process/liquid/state 补齐 state
+            for idx in [6usize, 7, 8] {
+                table.post_process_data.resize(idx + 1, Default::default());
+                table.liquid_data.resize(idx + 1, Default::default());
+                table.state_data.resize(idx + 1, Default::default());
+                table.post_process_data[idx].state = 2;
+                table.liquid_data[idx].state = 2;
+                table.state_data[idx].state = 2;
+            }
+        }
+        let mut sd = make_sim();
+        // 原油 100kg @ 600K（327℃），岩浆 1000kg @ 1800K
+        fill(&mut sd, 14, 6, 100.0, 600.0);
+        fill(&mut sd, 15, 8, 1000.0, 1800.0);
+        assert!(do_partial_heat_transition(&mut sd, 14, 15));
+        let u = unsafe { &*sd.updated_cells.ptr };
+        // 液体目标分支 DisplaceLiquid 排空本格（原版同）
+        assert!(u.mass.get(14) < 0.01, "本格应被排空，got {}", u.mass.get(14));
+        let events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(events.spawn_liquid_info.len(), 1);
+        let drop = events.spawn_liquid_info.get(0);
+        assert_eq!(drop.element_idx, 7, "液滴应为石油");
+        assert!((drop.mass - 5.0).abs() < 1e-4);
+        assert!(
+            (drop.temperature - 676.0).abs() < 1e-3,
+            "石油应 676K（high+3=673+3），got {}K",
+            drop.temperature
+        );
+    }
+
+    #[test]
+    fn partial_heat_affordability_gate_uses_specific_heat_capacity() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_partial_heat_table();
+        {
+            let mut table = G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.resize(9, Element::default());
+            table.temperature_data.resize(9, Default::default());
+            // CrudeOil(6): liquid, high=673K -> Petroleum(7); SHC=1.69, TC=2
+            table.elements[6].state = 2;
+            table.elements[6].low_temp = 233.0;
+            table.elements[6].high_temp = 673.0;
+            table.elements[6].specific_heat_capacity = 1.69;
+            table.elements[6].thermal_conductivity = 2.0;
+            table.elements[6].high_temp_transition_idx = 7;
+            table.temperature_data[6].state = 2;
+            table.temperature_data[6].low_temp = 233.0;
+            table.temperature_data[6].high_temp = 673.0;
+            // Petroleum(7): liquid
+            table.elements[7].state = 2;
+            table.elements[7].low_temp = 216.0;
+            table.elements[7].high_temp = 812.0;
+            table.elements[7].specific_heat_capacity = 1.69;
+            table.temperature_data[7].state = 2;
+            table.temperature_data[7].low_temp = 216.0;
+            table.temperature_data[7].high_temp = 812.0;
+            // Hot solid(8): 100kg scenario, SHC=1, TC=2 (like Igneous Rock)
+            table.elements[8].state = 3;
+            table.elements[8].low_temp = 0.0;
+            table.elements[8].high_temp = 10000.0;
+            table.elements[8].specific_heat_capacity = 1.0;
+            table.elements[8].thermal_conductivity = 2.0;
+            table.temperature_data[8].state = 3;
+            table.temperature_data[8].low_temp = 0.0;
+            table.temperature_data[8].high_temp = 10000.0;
+            for idx in [6usize, 7, 8] {
+                table.post_process_data.resize(idx + 1, Default::default());
+                table.liquid_data.resize(idx + 1, Default::default());
+                table.state_data.resize(idx + 1, Default::default());
+                table.post_process_data[idx].state = table.elements[idx].state;
+                table.liquid_data[idx].state = table.elements[idx].state;
+                table.state_data[idx].state = table.elements[idx].state;
+            }
+        }
+        let mut sd = make_sim();
+        // Oil 220C (493K) + 100kg solid at 416C (689K):
+        // original gate mass*SHC*10 >= (676-T)*SHC_cell*5
+        //   1000 >= 8.45*(676-493)=1546  -> REJECT (old TC bug accepted: 2000 >= 1830)
+        fill(&mut sd, 14, 6, 100.0, 493.0);
+        fill(&mut sd, 15, 8, 100.0, 689.0);
+        assert!(
+            !do_partial_heat_transition(&mut sd, 14, 15),
+            "oil at 220C must be rejected by the SHC affordability gate"
+        );
+        // Oil 300C (573K): heat=8.45*(676-573)=870 <= 1000 -> PASS
+        fill(&mut sd, 14, 6, 100.0, 573.0);
+        assert!(
+            do_partial_heat_transition(&mut sd, 14, 15),
+            "oil at 300C must pass the SHC affordability gate"
+        );
+    }
+
     #[test]
     fn partial_heat_precondition_gates_and_restore() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_partial_heat_table();
         let mut sd = make_sim();
         // 质量 < 5 → false
@@ -1323,7 +1517,7 @@ mod tests {
     /// < high−3 时不会触发 DoStateTransition（产盐路径）。原版同款行为。
     #[test]
     fn partial_evaporation_completes_without_ore() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_partial_heat_table();
         let mut sd = make_sim();
         // cell14=盐水(水 1：high=100 → 蒸汽 3) 100kg 20°C；cell15=热固体 600°C；
@@ -1365,7 +1559,7 @@ mod tests {
 
     #[test]
     fn partial_melt_spawns_droplet_and_deducts_solid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_partial_heat_table();
         // 热固体(4) 需 high_temp_transition_idx → 熔岩(5)；蒸汽(3) 作为高温气体格
         {
@@ -1404,7 +1598,7 @@ mod tests {
 
     #[test]
     fn partial_melt_precondition_gates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_partial_heat_table();
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -1426,7 +1620,7 @@ mod tests {
 
     #[test]
     fn spawn_ore_pushes_event_with_game_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_sim();
         // cell14 = sim(row2,col2) → game = 1×4+1 = 5
         assert!(spawn_ore(&mut sd, 14, 7, 5.0, 300.0, 0xFF, 0, false));
@@ -1445,7 +1639,7 @@ mod tests {
 
     #[test]
     fn spawn_ore_skips_invisible_cell_unless_debug_editing() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_sim();
         // game cell 5 置为不可见（visible_grid 初始全 0xFF 兜底）
         unsafe {
@@ -1459,7 +1653,7 @@ mod tests {
 
     #[test]
     fn spawn_ore_rejects_out_of_bounds_game_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_sim();
         // sim 尺寸 6×6（含边界）：内部行 1..4；cell0 = row0 边界 → game = -5 → false
         assert!(!spawn_ore(&mut sd, 0, 7, 5.0, 300.0, 0xFF, 0, true));
@@ -1544,7 +1738,7 @@ mod tests {
 
     #[test]
     fn update_temperature_pair_exchanges_and_conserves_energy() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pair_table();
         let mut sd = make_sim();
         // ins=255：f32 下 iv = 255²×1.53787e-05 舍入为 1.0（非 <1）→ 几何平均路径
@@ -1571,7 +1765,7 @@ mod tests {
 
     #[test]
     fn update_temperature_pair_applies_surface_multiplier() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pair_table();
         let mut sd = make_sim();
         fill_pair_cells(&mut sd, &[(14, 1, 100.0, 300.0, 255), (15, 2, 200.0, 400.0, 255)]);
@@ -1590,78 +1784,9 @@ mod tests {
         assert!((d2 / d1 - 10.0).abs() < 0.5, "倍率未生效：d1={d1} d2={d2}");
     }
 
-    /// 成对换热等价性测试用的格号（6×6 世界内部格，与上面两个 pair 测试同格）。
-    const CELL: usize = 14;
-
-    /// 构造一份「格 14 = 液态水 300℃、格 15 = 固态砖 400℃、ins=255」的 sim。
-    /// 会重置全局元素表（其他测试可能改过倍率），保证入参确定。
-    fn make_temperature_pair_sim() -> SimData {
-        init_pair_table();
-        let mut sd = make_sim();
-        fill_pair_cells(
-            &mut sd,
-            &[(CELL, 1, 100.0, 300.0, 255), (CELL + 1, 2, 200.0, 400.0, 255)],
-        );
-        sd
-    }
-
-    #[test]
-    fn split_pair_helpers_match_original() {
-        let _lock = LIB_TESTS_LOCK.lock();
-        let mut a = make_temperature_pair_sim();
-        let mut b = make_temperature_pair_sim();
-
-        // 原函数
-        update_temperature_pair(&mut a, CELL, CELL + 1);
-
-        // 拆分后等价
-        if let Some((da, db)) = compute_pair_delta(&b, CELL, CELL + 1, true) {
-            apply_delta(&mut b, CELL, da);
-            apply_delta(&mut b, CELL + 1, db);
-        }
-
-        let ua = unsafe { &*a.updated_cells.ptr };
-        let ub = unsafe { &*b.updated_cells.ptr };
-        assert_eq!(
-            ua.temperature.get(CELL).to_bits(),
-            ub.temperature.get(CELL).to_bits()
-        );
-        assert_eq!(
-            ua.temperature.get(CELL + 1).to_bits(),
-            ub.temperature.get(CELL + 1).to_bits()
-        );
-
-        // 防假绿：两侧同时变成空操作时上面两条也会"相等"，此处确认确实发生了换热
-        let t0 = unsafe { (*a.cells.ptr).temperature.get(CELL) };
-        let t1 = unsafe { (*a.updated_cells.ptr).temperature.get(CELL) };
-        assert_ne!(t0.to_bits(), t1.to_bits(), "未发生换热，等价性比对无意义");
-    }
-
-    /// `apply_delta` 必须是「每次应用后钳制」，不是「累加完再钳」。
-    /// 上面的等价性用例（300/400℃）碰不到钳制边界，这里单独锁死该语义。
-    #[test]
-    fn apply_delta_clamps_on_every_application() {
-        let _lock = LIB_TESTS_LOCK.lock();
-        init_pair_table();
-        let mut sd = make_sim();
-        fill_pair_cells(
-            &mut sd,
-            &[(20, 1, 100.0, 500.0, 255), (21, 1, 100.0, 500.0, 255)],
-        );
-        // 格 20：+20000 → 20500 钳到 10000；再 -20000 → -10000 钳到 1.0。
-        // 若改成"累加完再钳"，这里会得到 500.0（未越界），从而暴露回归。
-        apply_delta(&mut sd, 20, 20000.0);
-        assert_eq!(unsafe { (*sd.updated_cells.ptr).temperature.get(20) }, 10000.0);
-        apply_delta(&mut sd, 20, -20000.0);
-        assert_eq!(unsafe { (*sd.updated_cells.ptr).temperature.get(20) }, 1.0);
-        // 格 21：单次大幅降温，下界钳制
-        apply_delta(&mut sd, 21, -20000.0);
-        assert_eq!(unsafe { (*sd.updated_cells.ptr).temperature.get(21) }, 1.0);
-    }
-
     #[test]
     fn backwall_exchange_writes_both_and_emits_transition() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pair_table();
         let mut sd = make_sim();
         unsafe {
@@ -1708,7 +1833,7 @@ mod tests {
     /// 修复后：格子微升（<310）、背墙微降（>490）。
     #[test]
     fn backwall_exchange_cell_gets_cell_temp_not_backwall() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pair_table();
         let mut sd = make_sim();
         unsafe {
@@ -1750,7 +1875,7 @@ mod tests {
 
     #[test]
     fn backwall_exchange_skips_vacuum_or_void() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pair_table();
         let mut sd = make_sim();
         unsafe {
@@ -1778,7 +1903,7 @@ mod tests {
 
     #[test]
     fn temperature_task_exchanges_adjacent_pairs_with_gates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pair_table();
         let mut sd = make_sim();
         // cell14(row2,col2 水 300) 与 cell15(row2,col3 砖 400) 相邻（ΔT=100 ≥ 1）→ 换热；
@@ -1805,7 +1930,7 @@ mod tests {
 
     #[test]
     fn temperature_task_skips_temperature_insulated_state() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_pair_table();
         // 砖加 TemperatureInsulated(0x10) 位
         {

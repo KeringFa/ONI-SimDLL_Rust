@@ -1,0 +1,51 @@
+# simDLL_RS 与原版的已知差异记录
+
+## 1. 液面 alpha：×0.001 vs ÷1000.0（f32 ULP 级，视觉不可见）
+
+- 日期：2026-08-10
+- 位置：src/c2_physics/property_texture.rs `liquid_mass_ratio`
+- 原版两处 powf 参数计算**本身就不统一**：
+  - UpdateLiquidPropertyTexture（@0x1800486CA）：`mass × 0.001f`（mulss，常量 0.001f）
+  - GetEstimatedLiquidGradientValue（@0x180047CC6）：`mass ÷ 1000.0f`（divss，param_6=1000）
+- 项目统一采用 `mass / 1000.0`：梯度路径与原版完全一致；alpha 路径与原版差 ≤1 ULP
+- 实测 12 个质量样本仅 2 个差 1 ULP，u8 alpha 全部相同；×255 截断后视觉不可感知
+- 纯纹理（propertyTextureLiquid alpha），不碰物理/存档/温度，每帧独立计算不累积
+- 决策：保持现状，不对齐（对齐需拆两个函数分别 ×0.001 / ÷1000，收益为零）
+
+## 2. 定点整数改造设想（已讨论否决）
+
+- 日期：2026-08-10
+- 设想：气体/液体数值从 f32 改为定点整数，追求绝对质量守恒
+- 否决理由：
+  1. ABI 硬约束——C# 端 CellSOA 契约是 float[]，游戏本体不可改；
+     存储仍 f32 则定点白转，彻底改 ABI 则破坏存档/模组兼容
+  2. 与原版"逐帧位级一致"目标冲突——powf/压力公式等全部变成定点近似，
+     回放一致性与原版对比失效
+  3. 性能预期相反——x86-64 SSE/AVX 的 f32 吞吐与整数相当，瓶颈在内存带宽
+     与 C# 端渲染；定点还要付出缩放/溢出防护开销
+  4. 质量守恒问题定点未必解决——向下舍入同样损失质量，需保序舍入策略
+     （又是一套与原版不同的行为）；原版本身也有蒸汽微量漂移（原版特性）
+- 结论：不换数法，优先优化
+
+## 3. 玩家性能优化建议评估（2026-08-21）
+
+- 来源：Steam 工坊玩家反馈（日志/玩家反馈1~3.txt），疑为资深开发者/AI 撰写的
+  通用性能建议清单；未指出项目结构性错误，两条并行路线（D1/D2）保持现状。
+- 已实现/覆盖项（无需改动）：
+  1. CPU 拓扑完整扫描：Rust affinity.rs 用 Ex API + GROUP_AFFINITY Mask 计数；
+     C# CpuInfo 日志误导（cores=1）已修，完整扫描后输出总核数。
+  2. rayon 池持久化：G_RAYON_POOL 为 OnceLock，玩家担心的
+     GlobalPoolAlreadyInitialized 恰是持久池证据。
+  3. 手动线程控制：ReserveCores（1~4，默认 1）等效实现"手动 worker 覆盖"。
+  4. 大块缓存友好调度：D2 按 region 组装箱（组数 ≤ 线程数），避免小 job。
+  5. 复用缓冲/避免逐帧分配：性能专项已大量 clear_keep_capacity。
+  6. 基础时序日志：simdll_perf.log。
+- 已采纳：Rust 拓扑 fallback 加固（affinity.rs）——Ex API 解析成功但物理核 ≤1
+  且系统逻辑核 ≥4 时按逻辑核/2 近似，避免调度路径把 CPU 当 1 核。
+- 明确不采纳：
+  1. WorkerThreads 直接覆盖（与 ReserveCores 重复，YAGNI）。
+  2. 脏区域/活跃 chunk 追踪（改变原版逐格模拟语义，之前已否决）。
+  3. 阶段细分计时日志（perf_probe 已有基础版，发布后可选增强）。
+- 测试注意：d3_rayon 模块受 feature "d3-rayon" 门控，验证必须用
+  `cargo test --lib --features d3-rayon`（不带 feature 不编译该模块，
+  2026-08-21 因此一度漏跑新增测试并暴露断言错误）。

@@ -44,3 +44,9 @@ other/
 OxygenNotIncluded_Source/0Harmony/
 OxygenNotIncluded_Source/UnityEngine.CoreModule/
 OxygenNotIncluded_Source/UnityEngine.ImageConversionModule/
+
+# 部署与原生二进制产物
+Local/
+*.sim
+*.so
+*.exe

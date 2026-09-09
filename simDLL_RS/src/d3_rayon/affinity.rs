@@ -126,9 +126,17 @@ impl CpuTopology {
             }
         };
 
-        // 用 GetLogicalProcessorInformationEx（RelationProcessorCore）+ 手写偏移读取，
+        // Windows：用 GetLogicalProcessorInformationEx（RelationProcessorCore）+ 手写偏移读取，
         // 与 C# CpuInfo 一致——旧 API GetLogicalProcessorInformation 在本机
         // （Win11/部分环境）返回全 Group（无 ProcessorCore 条目），检测恒 false。
+        // Linux：暂用 fallback（physical=logical → has_hyper_threading=false →
+        // D1 调度不启用、自动回退 D2，行为安全）；后续可用
+        // /sys/devices/system/cpu/cpu*/topology/thread_siblings_list 实装。
+        #[cfg(target_os = "linux")]
+        {
+            return fallback();
+        }
+        #[cfg(windows)]
         unsafe {
             let mut len: u32 = 0;
             // 第一次调用查询所需缓冲区大小（预期失败，len 被设置）。

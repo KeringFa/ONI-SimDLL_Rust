@@ -510,12 +510,6 @@ pub fn process_disease_consumer_messages(
 /// 从 (x,y) 起，深度 < range 的格全部可达（三个 state 过滤 flag 全 false →
 /// 不过滤元素内容）；跳过 x==0/y==0/越界格（原版 L33506-33513 边界检查）。
 /// 返回可达 sim 格索引（BFS 顺序：上、左、右、下）。
-///
-/// # 每帧分配控制
-/// `visited`（width×height 的 `vec![false; ...]`，大网格 218KB）与 `queue`
-/// 改为**线程本地复用缓冲 + 世代戳**：`visited` 存 u32 世代号而非 bool，
-/// 每调用递增 `GEN`，无需清零（世代号 != 当前代即视为未访问）。
-/// 返回值 `reachable` 仍是新建 Vec（调用方持有并迭代，不能返回共享缓冲）。
 pub(crate) fn get_reachable_cells(sim: &SimData, x: usize, y: usize, range: usize) -> Vec<usize> {
     let width = sim.width as usize;
     let height = sim.height as usize;
@@ -523,47 +517,13 @@ pub(crate) fn get_reachable_cells(sim: &SimData, x: usize, y: usize, range: usiz
     if range == 0 || x >= width || y >= height || width == 0 || height == 0 {
         return reachable;
     }
-    thread_local! {
-        /// 世代戳 visited 缓冲：u32 而非 bool，靠世代号区分"本次已访问"，
-        /// 免去每次 BFS 前 width×height 清零（世代戳在发射器每触发一次的
-        /// 高频路径上是收益大头）。
-        static BFS_SCRATCH: std::cell::RefCell<BfsScratch> =
-            std::cell::RefCell::new(BfsScratch::default());
-    }
-    // 借用检查：BufScratch 的 borrow_mut 要活到 BFS 结束。
-    struct BfsScratch {
-        visited: Vec<u32>,
-        queue: std::collections::VecDeque<(usize, usize, usize)>,
-        generation: u32,
-    }
-    impl Default for BfsScratch {
-        fn default() -> Self {
-            Self {
-                visited: Vec::new(),
-                queue: std::collections::VecDeque::new(),
-                generation: 1,
-            }
-        }
-    }
-    BFS_SCRATCH.with(|cell| {
-        let mut scratch = cell.borrow_mut();
-        let total = width * height;
-        if scratch.visited.len() < total {
-            scratch.visited.resize(total, 0);
-        }
-        let gen = scratch.generation;
-        // 世代号递增（wrapping 防溢出后强制清空重建）
-        scratch.generation = gen.wrapping_add(1);
-        if scratch.generation == 0 {
-            scratch.visited.fill(0);
-            scratch.generation = 1;
-        }
-        let gen = scratch.generation;
-        scratch.queue.clear();
-
-        scratch.visited[y * width + x] = gen;
-        scratch.queue.push_back((x, y, 0usize));
-        while let Some((cx, cy, depth)) = scratch.queue.pop_front() {
+    let total = width * height;
+    // visited 用线程本地世代戳池复用（省每次 218KB 分配+清零，行为等价）。
+    crate::c_simulation::bfs_scratch::with_visited_scratch(total, |visited, generation| {
+        let mut queue = std::collections::VecDeque::new();
+        visited[y * width + x] = generation;
+        queue.push_back((x, y, 0usize));
+        while let Some((cx, cy, depth)) = queue.pop_front() {
             if depth >= range {
                 continue;
             }
@@ -580,9 +540,9 @@ pub(crate) fn get_reachable_cells(sim: &SimData, x: usize, y: usize, range: usiz
             for (nx, ny) in neighbors {
                 if nx < width && ny < height {
                     let nc = ny * width + nx;
-                    if scratch.visited[nc] != gen {
-                        scratch.visited[nc] = gen;
-                        scratch.queue.push_back((nx, ny, depth + 1));
+                    if visited[nc] != generation {
+                        visited[nc] = generation;
+                        queue.push_back((nx, ny, depth + 1));
                     }
                 }
             }
@@ -769,7 +729,7 @@ mod tests {
 
     #[test]
     fn get_reachable_cells_depth_gate_and_bounds() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let sd = make_sim();
         // 起点 (2,2)=cell14；range=2 → 14 + 上8 + 左13 + 右15 + 下20
         let r = get_reachable_cells(&sd, 2, 2, 2);
@@ -783,9 +743,27 @@ mod tests {
         assert!(!r3.contains(&6usize), "y==0 排除");
     }
 
+    /// visited 世代戳池的隔离性：同一参数**连续多次调用**必须结果完全一致。
+    /// 若世代戳失效（残留世代被误判为"已访问"），第 2/3 次调用会返回空/缺格。
+    #[test]
+    fn get_reachable_cells_repeated_calls_are_isolated() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        let sd = make_sim();
+        let expected = vec![14usize, 8, 13, 15, 20];
+        for i in 0..3 {
+            let r = get_reachable_cells(&sd, 2, 2, 2);
+            assert_eq!(r, expected, "第 {} 次调用应与首次完全一致（世代戳隔离）", i + 1);
+        }
+        // 交叉参数再验证：不同起点/范围混用后回到首参数，结果仍一致
+        let _ = get_reachable_cells(&sd, 1, 1, 3);
+        let _ = get_reachable_cells(&sd, 3, 3, 1);
+        let r = get_reachable_cells(&sd, 2, 2, 2);
+        assert_eq!(r, expected, "交叉调用后结果仍须一致");
+    }
+
     #[test]
     fn consume_disease_rounds_and_clamps() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_solid_table();
         install_disease_table();
         let mut sd = make_sim();
@@ -825,7 +803,7 @@ mod tests {
 
     #[test]
     fn consume_disease_clears_and_reports_zero() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_solid_table();
         install_disease_table();
         let mut sd = make_sim();
@@ -860,7 +838,7 @@ mod tests {
 
     #[test]
     fn cell_disease_modification_direct_and_mixed() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_solid_table();
         install_disease_table();
         let mut sd = make_sim();
@@ -952,7 +930,7 @@ mod tests {
 
     #[test]
     fn disease_emitter_register_modify_remove() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clear_disease_emitters();
         create_solid_table();
         install_disease_table();
@@ -1010,7 +988,7 @@ mod tests {
 
     #[test]
     fn disease_emitter_update_emits_on_interval() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clear_disease_emitters();
         create_solid_table();
         install_disease_table();
@@ -1051,7 +1029,7 @@ mod tests {
 
     #[test]
     fn disease_emitter_negative_count_only_same_disease() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clear_disease_emitters();
         create_solid_table();
         install_disease_table();
@@ -1089,7 +1067,7 @@ mod tests {
 
     #[test]
     fn disease_emitter_region_gate_skips_outside() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clear_disease_emitters();
         create_solid_table();
         install_disease_table();
@@ -1123,7 +1101,7 @@ mod tests {
 
     #[test]
     fn disease_consumer_messages_register_and_remove() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clear_disease_consumers();
         create_solid_table();
         install_disease_table();
@@ -1202,7 +1180,7 @@ mod tests {
 
     #[test]
     fn update_data_emits_disease_via_emitter() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clear_disease_emitters();
         create_solid_table();
         install_integration_table();
@@ -1339,7 +1317,7 @@ mod tests {
     /// 与"真实病菌表数据解析错误"）。
     #[test]
     fn zombie_spores_in_co2_survive_one_substep() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_gas_table();
         install_zombie_table();
         let mut sd = SimData::new_for_allocate(8, 8, 1, false, false);
@@ -1399,7 +1377,7 @@ mod tests {
     /// 无干净质量补充 → 病菌应基本保留（原版行为，用户实测原版保留在一格）。
     #[test]
     fn zombie_spores_100k_burst_survives_update_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_gas_table();
         install_zombie_table();
         let w = 16usize;

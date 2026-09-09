@@ -8,40 +8,60 @@ using KMod;
 namespace SimDLL_Rust
 {
     /// <summary>
-    /// mod 入口：加载原生 Rust simDLL（SimDLL_RS.sim，位于本 mod 目录），
-    /// 然后调用 RS_LoaderInstall 用原生 detour 接管原版 SimDLL.dll 的导出。
+    /// mod 入口：加载原生 Rust simDLL（Windows: SimDLL_RS.sim /
+    /// Linux: SimDLL_RS.so，位于本 mod 目录），然后调用 RS_LoaderInstall
+    /// 用原生 detour 接管原版 SimDLL 的导出。
     ///
     /// 加载方式说明：游戏经 Assembly-CSharp 的 Sim/ConduitTemperatureManager
     /// extern 直调原版 SimDLL.dll；当前游戏版本的 Harmony 无法 patch extern
     /// （P/Invoke，无 IL 体，实测 U59 抛 InvalidProgramException），因此改用
     /// 原生 detour：RS_LoaderInstall 把原版 16 个导出函数入口改写为绝对跳转，
     /// 重定向到本 mod 的 Rust 实现。
-    /// 原版 SimDLL.dll 保持在 Plugins/x86_64 原位，但永远不会被调用。
+    /// 原版 SimDLL 保持在 Plugins/x86_64 原位，但永远不会被调用。
+    ///
+    /// 跨平台（2026-09-09）：
+    /// - Windows：kernel32 LoadLibrary（.sim 扩展名绕过 KMod.DLLLoader 的托管
+    ///   程序集扫描——原生 PE 被当托管加载会抛 BadImageFormatException）。
+    /// - Linux：libc dlopen（绝对路径 + RTLD_NOW|RTLD_GLOBAL，dlopen 对扩展名
+    ///   无要求；RTLD_GLOBAL 使原版 SimDLL.so 的导出进入全局符号表，与游戏
+    ///   extern 绑定行为一致）。
+    /// - 其余平台（macOS 等）：优雅降级——跳过原生加载，mod 保持空实现，
+    ///   游戏回落原版 sim，不崩溃。
     /// </summary>
     public class Loader : UserMod2
     {
         private static IntPtr nativeModule;
 
+        /// 原生库是否加载并解析成功。false 时 Native 入口全部短路
+        /// （如 macOS 兜底、或未来架构不支持的兜底）。
+        internal static bool SimAvailable { get; private set; }
+
         public override void OnLoad(Harmony harmony)
         {
-            // 显式 LoadLibrary 原生实现（mod 目录），使 DllImport 解析命中。
-            // 扩展名必须是 .sim 而非 .dll——ONI 的 KMod.DLLLoader 会把 mod
-            // 目录内所有 .dll 当托管程序集加载（原生 PE 抛 BadImageFormatException
-            // 导致 mod 禁用）；.sim 绕过该扫描，且 Windows LoadLibrary 支持任意扩展名。
-            string directory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-            string nativePath = Path.Combine(directory ?? ".", "SimDLL_RS.sim");
-            if (!File.Exists(nativePath))
+            if (Native.IsWindowsPlatform())
             {
-                throw new FileNotFoundException("SimDLL_Rust: 未找到原生实现 " + nativePath);
+                LoadWindows();
             }
-            nativeModule = NativeMethods.LoadLibrary(nativePath);
-            if (nativeModule == IntPtr.Zero)
+            else if (Environment.OSVersion.Platform == PlatformID.Unix)
             {
-                throw new InvalidOperationException(
-                    "SimDLL_Rust: LoadLibrary 失败 (" + Marshal.GetLastWin32Error() + "): " + nativePath);
+                // ONI Linux 版运行于 Mono/Unix；macOS 也是 Unix——dlopen 失败
+                // （无 .so）时自然落入优雅降级分支。
+                LoadLinux();
+            }
+            else
+            {
+                Debug.LogWarning(
+                    "[SimDLL_Rust] 本 mod 的原生实现提供 Windows / Linux 版本；当前平台不受支持，已跳过加载（回落原版模拟，游戏正常运行）。");
+                SimAvailable = false;
+                return;
             }
 
-            // 安装原生 detour：接管原版 SimDLL.dll 的 16 个导出。
+            if (!SimAvailable)
+            {
+                return;
+            }
+
+            // 安装原生 detour：接管原版 SimDLL 的 16 个导出。
             // 不再调用 base.OnLoad（其 PatchAll 会因 Harmony 无法 patch extern 而崩溃）。
             int installed = Native.RS_LoaderInstall();
             if (installed <= 0)
@@ -74,10 +94,60 @@ namespace SimDLL_Rust
             harmony.PatchAll(Assembly.GetExecutingAssembly());
         }
 
+        /// Windows 加载：kernel32 LoadLibrary（.sim 绕过 KMod 托管程序集扫描）。
+        private void LoadWindows()
+        {
+            string directory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            string nativePath = Path.Combine(directory ?? ".", "SimDLL_RS.sim");
+            if (!File.Exists(nativePath))
+            {
+                throw new FileNotFoundException("SimDLL_Rust: 未找到原生实现 " + nativePath);
+            }
+            nativeModule = NativeMethods.LoadLibrary(nativePath);
+            if (nativeModule == IntPtr.Zero)
+            {
+                throw new InvalidOperationException(
+                    "SimDLL_Rust: LoadLibrary 失败 (" + Marshal.GetLastWin32Error() + "): " + nativePath);
+            }
+            Native.Resolve(nativeModule);
+            SimAvailable = Native.IsAvailable;
+        }
+
+        /// Linux 加载：libc dlopen（绝对路径，RTLD_NOW|RTLD_GLOBAL）。
+        /// RTLD_GLOBAL：原版 SimDLL.so 由本路径显式加载时，其导出进入全局符号表，
+        /// 与游戏 extern 绑定行为一致。
+        private void LoadLinux()
+        {
+            string directory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            string nativePath = Path.Combine(directory ?? ".", "SimDLL_RS.so");
+            if (!File.Exists(nativePath))
+            {
+                Debug.LogWarning(
+                    "[SimDLL_Rust] 未找到 Linux 原生实现 " + nativePath + "（本包可能只含 Windows 版），已回落原版模拟。");
+                SimAvailable = false;
+                return;
+            }
+            // RTLD_NOW=2 | RTLD_GLOBAL=0x100
+            nativeModule = NativeMethods.dlopen(nativePath, 2 | 0x100);
+            if (nativeModule == IntPtr.Zero)
+            {
+                Debug.LogError("[SimDLL_Rust] dlopen 失败: " + nativePath + "——已回落原版模拟。");
+                SimAvailable = false;
+                return;
+            }
+            Native.Resolve(nativeModule);
+            SimAvailable = Native.IsAvailable;
+        }
+
         private static class NativeMethods
         {
             [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
             public static extern IntPtr LoadLibrary(string lpFileName);
+
+            // Linux：libc.so.6 必然已被主进程加载（ONI Linux 版基于 glibc 发行版），
+            // dlopen 短名命中已加载副本。
+            [DllImport("libc.so.6", SetLastError = true)]
+            public static extern IntPtr dlopen(string filename, int flags);
         }
     }
 }

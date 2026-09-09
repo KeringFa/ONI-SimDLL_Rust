@@ -591,11 +591,6 @@ mod tests {
     /// 建最小元素表：elem5 液态 SHC=2.0、TC=4.0、highTemp=5000、lowTemp=200。
     /// 调用方需持 LIB_TESTS_LOCK。
     fn init_temp_table() {
-        // ⚠️ 先清空全局 BUILDING_TEMPERATURE_MANAGER：它是 Lazy 单例，跨用例共享。
-        // 若前一用例断言失败 panic（remove_building 被跳过），handle/记录残留，
-        // 会让本用例的 handle 编号漂移或 record() 读到脏数据 —— 这是该模块
-        // flaky 的历史根因（8-30 记录）。统一在 setup 清空，从干净状态开始。
-        clear_building_temperature();
         let mut table = G_ELEMENTS_TABLE.lock().unwrap();
         table.elements.clear();
         table.element_names.clear();
@@ -641,7 +636,7 @@ mod tests {
 
     #[test]
     fn add_allocates_versioned_handles() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
@@ -654,7 +649,7 @@ mod tests {
 
     #[test]
     fn modify_updates_record() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h = mgr.add(&add_msg(10, 300.0));
@@ -664,7 +659,7 @@ mod tests {
 
     #[test]
     fn remove_frees_and_reuses_with_version_bump() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
@@ -684,7 +679,7 @@ mod tests {
 
     #[test]
     fn write_output_is_indexed_by_handle() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
@@ -707,7 +702,7 @@ mod tests {
 
     #[test]
     fn write_output_freed_slot_is_minus_one() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h0 = mgr.add(&add_msg(10, 300.0));
@@ -722,7 +717,7 @@ mod tests {
 
     #[test]
     fn build_record_derives_fields_from_message() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let msg = add_msg(10, 300.0); // min(1,2) max(2,3) → 面积 1，mass=100
         let r = build_record_from_msg(&msg).expect("valid building");
@@ -739,7 +734,7 @@ mod tests {
 
     #[test]
     fn build_record_rejects_zero_area_and_bad_temperature() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut zero = add_msg(10, 300.0);
         zero.min_x = 2;
@@ -754,7 +749,7 @@ mod tests {
 
     #[test]
     fn modify_building_energy_applies_delta_and_clamps() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let mut msg = add_msg(10, 300.0);
@@ -776,7 +771,7 @@ mod tests {
 
     #[test]
     fn modify_building_energy_rejects_invalid_final_temperature() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut mgr = BuildingTemperatureManager::new();
         let h = mgr.add(&add_msg(10, 300.0)); // 面积 1，perCellHC = 200
@@ -787,7 +782,7 @@ mod tests {
 
     #[test]
     fn modify_pushes_no_longer_overheated_at_boundary() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut events = SimEvents::default();
         let mut mgr = BuildingTemperatureManager::new();
@@ -809,7 +804,7 @@ mod tests {
 
     #[test]
     fn change_building_temperature_updates_record() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let h = add_building(&add_msg(10, 300.0));
         assert!(change_building_temperature(h, 350.0));
@@ -831,7 +826,7 @@ mod tests {
     /// simMax <= region.max）。
     #[test]
     fn building_exchange_only_processes_in_region() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table(); // elem5：SHC=2、TC=4、highTemp=5000
         let mut sd = make_exchange_sim();
         unsafe {
@@ -881,7 +876,7 @@ mod tests {
 
     #[test]
     fn building_exchange_skips_vacuum_and_exchanges_with_matter_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table(); // elem5：SHC=2、TC=4、highTemp=5000
         let mut sd = make_exchange_sim();
         // 建筑 sim 范围 (2,3)-(3,5)：cell20(row3,col2) 有质量、cell26(row4,col2) 真空
@@ -918,7 +913,7 @@ mod tests {
 
     #[test]
     fn building_exchange_emits_overheat_and_melted_events() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut sd = make_exchange_sim();
         unsafe {
@@ -949,7 +944,7 @@ mod tests {
 
     #[test]
     fn building_exchange_emits_no_longer_overheated_when_cooled() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_temp_table();
         let mut sd = make_exchange_sim();
         unsafe {

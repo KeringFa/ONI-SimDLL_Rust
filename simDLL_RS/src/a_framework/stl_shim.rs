@@ -367,8 +367,12 @@ pub struct MsvcFunction {
 
 /// MSVC std::mutex 等价物（80 字节，align 8）。
 ///
-/// 内部使用 SRWLOCK（8 字节）实现互斥，前 8 字节作为 SRWLOCK 存储，
-/// 其余 72 字节为 padding 以匹配 MSVC _Mtx_internal_imp_t 的 80 字节布局。
+/// 布局约束：80 字节 / align 8 是 SimData 结构布局的一部分（单测锁死），跨平台不变。
+/// - Windows：内部使用 SRWLOCK（8 字节）实现互斥，前 8 字节作为 SRWLOCK 存储，
+///   其余 72 字节为 padding 以匹配 MSVC _Mtx_internal_imp_t 的 80 字节布局。
+/// - Linux：bytes[0..40] 作为 glibc `pthread_mutex_t`（40B；全零 == PTHREAD_MUTEX_INITIALIZER，
+///   与 Windows SRWLOCK 同样支持零初始化语义），其余 padding。SimDLL 已完整替换原版
+///   C++ 代码，锁只被 Rust 侧操作，无需匹配 glibc 的 _Mtx 布局。
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 pub struct MsvcMutex {
@@ -383,12 +387,19 @@ pub struct MsvcMutexGuard<'a> {
 impl MsvcMutex {
     /// 获取互斥锁（阻塞）。返回 guard，Drop 时自动释放。
     ///
-    /// 对照源码 _Mtx_lock。使用 SRWLOCK 独占锁。
+    /// 对照源码 _Mtx_lock。Windows 用 SRWLOCK 独占锁，Linux 用 pthread_mutex_lock。
     pub fn lock(&self) -> MsvcMutexGuard<'_> {
+        #[cfg(windows)]
         unsafe {
             windows::Win32::System::Threading::AcquireSRWLockExclusive(
                 self.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
             );
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let m = self.bytes.as_ptr() as *mut libc::pthread_mutex_t;
+            let r = libc::pthread_mutex_lock(m);
+            debug_assert_eq!(r, 0, "pthread_mutex_lock 失败: {r}");
         }
         MsvcMutexGuard { mutex: self }
     }
@@ -398,61 +409,156 @@ impl MsvcMutex {
     /// 用于 SimSync/GameSync 等需要在持有锁时调用 `MsvcCondVar::wait` 的场景
     /// （wait 会自动释放并重新获取锁，guard 的自动 Drop 会导致双重释放）。
     pub fn lock_raw(&self) {
+        #[cfg(windows)]
         unsafe {
             windows::Win32::System::Threading::AcquireSRWLockExclusive(
                 self.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
             );
         }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let m = self.bytes.as_ptr() as *mut libc::pthread_mutex_t;
+            let r = libc::pthread_mutex_lock(m);
+            debug_assert_eq!(r, 0, "pthread_mutex_lock 失败: {r}");
+        }
     }
 
     /// 释放互斥锁（配合 `lock_raw` 使用）。
     pub fn unlock_raw(&self) {
+        #[cfg(windows)]
         unsafe {
             windows::Win32::System::Threading::ReleaseSRWLockExclusive(
                 self.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
             );
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let m = self.bytes.as_ptr() as *mut libc::pthread_mutex_t;
+            let r = libc::pthread_mutex_unlock(m);
+            debug_assert_eq!(r, 0, "pthread_mutex_unlock 失败: {r}");
         }
     }
 }
 
 impl Drop for MsvcMutexGuard<'_> {
     fn drop(&mut self) {
+        #[cfg(windows)]
         unsafe {
             windows::Win32::System::Threading::ReleaseSRWLockExclusive(
                 self.mutex.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
             );
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let m = self.mutex.bytes.as_ptr() as *mut libc::pthread_mutex_t;
+            let r = libc::pthread_mutex_unlock(m);
+            debug_assert_eq!(r, 0, "pthread_mutex_unlock 失败: {r}");
         }
     }
 }
 
 /// MSVC std::condition_variable 等价物（8 字节，align 8）。
 ///
-/// 内部使用 Windows CONDITION_VARIABLE（8 字节）。零初始化即为有效状态
-/// （INITIALIZE_CONDITION_VARIABLE 实际就是置零）。
+/// - Windows：内部使用 CONDITION_VARIABLE（8 字节）。零初始化即为有效状态
+///   （INITIALIZE_CONDITION_VARIABLE 实际就是置零）。
+/// - Linux：bytes[0..4] 作为 futex 字（u32 序号）。pthread_cond_t 48B 装不进
+///   8 字节布局，改用经典 futex 条件变量（Drepper 模式）：
+///   wait 读序号 → 放锁 → futex_wait(序号未变) → 重取锁；
+///   signal/broadcast 递增序号后 futex_wake。序号在放锁前读取，
+///   放锁与 futex_wait 之间到达的 signal 会使序号变化 → futex_wait
+///   立即返回 → 不丢唤醒。
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 pub struct MsvcCondVar {
     pub bytes: [u8; 8],
 }
 
+#[cfg(target_os = "linux")]
+mod condvar_futex {
+    #[inline]
+    fn futex_word(cv: &super::MsvcCondVar) -> *mut u32 {
+        cv.bytes.as_ptr() as *mut u32
+    }
+
+    /// futex(FUTEX_WAIT_PRIVATE, 期望值)。值已变（被唤醒过）→ EAGAIN 立即返回。
+    pub fn futex_wait(cv: &super::MsvcCondVar, expected: u32) {
+        unsafe {
+            loop {
+                let r = libc::syscall(
+                    libc::SYS_futex,
+                    futex_word(cv),
+                    libc::FUTEX_WAIT_PRIVATE,
+                    expected,
+                    std::ptr::null::<libc::timespec>(),
+                );
+                if r == 0 {
+                    return; // 被唤醒
+                }
+                let err = *libc::__errno_location();
+                if err == libc::EAGAIN {
+                    return; // 序号已变 → 不丢唤醒
+                }
+                if err == libc::EINTR {
+                    continue; // 信号打断 → 重试
+                }
+                return; // 其他错误：保守返回（退化为此处无阻塞）
+            }
+        }
+    }
+
+    /// futex(FUTEX_WAKE_PRIVATE, n)。
+    pub fn futex_wake(cv: &super::MsvcCondVar, n: i32) {
+        unsafe {
+            libc::syscall(libc::SYS_futex, futex_word(cv), libc::FUTEX_WAKE_PRIVATE, n);
+        }
+    }
+
+    #[inline]
+    pub fn load_seq(cv: &super::MsvcCondVar) -> u32 {
+        unsafe { futex_word(cv).read_volatile() }
+    }
+
+    #[inline]
+    pub fn bump_seq(cv: &super::MsvcCondVar) -> u32 {
+        unsafe {
+            let p = futex_word(cv);
+            let old = p.read_volatile();
+            p.write_volatile(old.wrapping_add(1));
+            old.wrapping_add(1)
+        }
+    }
+}
+
 impl MsvcCondVar {
     /// 唤醒一个等待此条件变量的线程。
     /// 对照 MSVC _Cnd_signal → WakeConditionVariable。
     pub fn signal(&self) {
+        #[cfg(windows)]
         unsafe {
             windows::Win32::System::Threading::WakeConditionVariable(
                 self.bytes.as_ptr() as *mut windows::Win32::System::Threading::CONDITION_VARIABLE,
             );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            condvar_futex::bump_seq(self);
+            condvar_futex::futex_wake(self, 1);
         }
     }
 
     /// 唤醒所有等待此条件变量的线程。
     /// 对照 MSVC _Cnd_broadcast → WakeAllConditionVariable。
     pub fn broadcast(&self) {
+        #[cfg(windows)]
         unsafe {
             windows::Win32::System::Threading::WakeAllConditionVariable(
                 self.bytes.as_ptr() as *mut windows::Win32::System::Threading::CONDITION_VARIABLE,
             );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            condvar_futex::bump_seq(self);
+            condvar_futex::futex_wake(self, i32::MAX);
         }
     }
 
@@ -462,6 +568,7 @@ impl MsvcCondVar {
     /// 会自动释放 `mutex` 并阻塞，被 `signal`/`broadcast` 唤醒后重新获取 `mutex`。
     /// 返回 `true` 表示成功等到信号，`false` 表示系统错误。
     pub fn wait(&self, mutex: &MsvcMutex) -> bool {
+        #[cfg(windows)]
         unsafe {
             // windows 0.58: SleepConditionVariableSRW 返回 Result<(), Error>
             // INFINITE = 0xFFFFFFFF (u32)
@@ -469,8 +576,18 @@ impl MsvcCondVar {
                 self.bytes.as_ptr() as *mut windows::Win32::System::Threading::CONDITION_VARIABLE,
                 mutex.bytes.as_ptr() as *mut windows::Win32::System::Threading::SRWLOCK,
                 0xFFFFFFFFu32, // INFINITE
-                0, // 0 = exclusive lock
-            ).is_ok()
+                0,             // 0 = exclusive lock
+            )
+            .is_ok()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // 经典 futex condvar：读序号 → 放锁 → 等序号变化 → 取锁。
+            let seq = condvar_futex::load_seq(self);
+            mutex.unlock_raw();
+            condvar_futex::futex_wait(self, seq);
+            mutex.lock_raw();
+            true
         }
     }
 }

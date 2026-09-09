@@ -18,8 +18,9 @@ pub const INVALID_ELEMENT_HASH: u32 = 0x2d39bf75;
 
 /// 无效元素索引（u16 最大值）。
 /// 源码 03_elements.c GetElementIndex L470：uVar4 = 0xffff（默认值）。
-/// Rust 安全增强：源码找不到时调用 _invalid_parameter_noinfo_noreturn（崩溃），
-/// Rust 实现改为返回此值，避免崩溃。
+/// 找不到元素时原版**直接返回 0xffff**（不崩溃；仅哈希容器自身损坏才走
+/// _invalid_parameter_noinfo_noreturn）。Rust 行为与原版一致
+/// （2026-08-10 注释更正：此前误称"Rust 安全增强"）。
 pub const INVALID_ELEMENT_INDEX: u16 = 0xffff;
 
 /// CreateElementInteractions 中 entry 的 signature 值。

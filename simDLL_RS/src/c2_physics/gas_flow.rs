@@ -37,7 +37,9 @@ pub(crate) fn run_gas_pressure_task(
     let x_max = (bounds.max_x as i32).min(w - 1);
     let y_min = bounds.min_y.max(1) as i32;
     let y_max = (bounds.max_y as i32).min(h - 1);
-    if x_min > x_max || y_min > y_max {
+    // 排他上界：源格迭代 [min, max)（原版 L144576+ 用 `< max`，RegionBounds 亦排他）。
+    // 2026-08-10 修复（D-M2）：此前用 ..= 每区域多处理最右 1 列 + 最下 1 行。
+    if x_min >= x_max || y_min >= y_max {
         return;
     }
     let iterate_dir = sim.iterate_direction;
@@ -48,27 +50,29 @@ pub(crate) fn run_gas_pressure_task(
     };
     let mut flow = flow; // 供可变借用
 
-    for y in y_min..=y_max {
+    for y in y_min..y_max {
         // iterateDirection 控制水平扫描方向（原版 L144606-144611）：
         // >=0 从左到右，<0 从右到左 → 每帧翻转形成"圆形振荡"。
-        let width_scan = x_max - x_min + 1;
+        let width_scan = x_max - x_min;
         for i in 0..width_scan {
-            let x = if iterate_dir >= 0 { x_min + i } else { x_max - i };
+            let x = if iterate_dir >= 0 { x_min + i } else { x_max - 1 - i };
             let src = (y * w + x) as usize;
 
-            let (src_elem, src_state, src_mass) = {
+            let (src_elem, src_state, src_pd) = {
                 let cells = unsafe { &*sim.cells.ptr };
                 let e = cells.element_idx.get(src);
-                let s = match elements_table::get_element_pressure_data(e) {
-                    Some(pd) => pd.state & 3,
+                let pd = match elements_table::get_element_pressure_data(e) {
+                    Some(pd) => pd,
                     None => continue,
                 };
+                let s = pd.state & 3;
                 if s >= 2 {
                     continue; // 只处理真空(0)/气体(1)
                 }
-                (e, s, cells.mass.get(src))
+                // T6（#21）：原此处还读了 cells.mass.get(src) 但 `let _ = src_mass`
+                // 未使用——已删（原版 UpdatePressure 内部重读，调用方不用）。
+                (e, s, pd)
             };
-            let _ = src_mass;
 
             // 源格可渗透 + 快照一致（原版 L144604-144605）
             {
@@ -86,8 +90,10 @@ pub(crate) fn run_gas_pressure_task(
             let nx = x + iterate_dir;
             if (1..=w - 2).contains(&nx) {
                 let dst = (y * w + nx) as usize;
-                if gas_pair_ok(sim, src, dst, src_elem, src_state) {
-                    let f = crate::c2_physics::liquid_flow::update_pressure(sim, src, dst);
+                if let Some((dst_elem, dst_pd)) = gas_pair_ok(sim, src, dst, src_elem, src_state) {
+                    let f = crate::c2_physics::liquid_flow::update_pressure_with(
+                        sim, src, dst, src_elem, dst_elem, &src_pd, &dst_pd,
+                    );
                     if let Some(fl) = flow.as_deref_mut() {
                         fl[src].y += iterate_dir as f32 * f;
                         fl[dst].x -= iterate_dir as f32 * f;
@@ -106,8 +112,10 @@ pub(crate) fn run_gas_pressure_task(
             // —— 垂直方向（+width，上方）——
             if y + 1 <= y_max {
                 let dst = src + w as usize;
-                if gas_pair_ok(sim, src, dst, src_elem, src_state) {
-                    let f = crate::c2_physics::liquid_flow::update_pressure(sim, src, dst);
+                if let Some((dst_elem, dst_pd)) = gas_pair_ok(sim, src, dst, src_elem, src_state) {
+                    let f = crate::c2_physics::liquid_flow::update_pressure_with(
+                        sim, src, dst, src_elem, dst_elem, &src_pd, &dst_pd,
+                    );
                     if let Some(fl) = flow.as_deref_mut() {
                         fl[src].z += f;
                         fl[dst].w -= f;
@@ -139,11 +147,16 @@ pub(crate) fn run_gas_pressure_task(
                         .unwrap_or(3);
                     ((hs | vs) & 3) == 3
                 };
-                if !corner_blocked && gas_pair_ok(sim, src, dst, src_elem, src_state) {
-                    let f = crate::c2_physics::liquid_flow::update_pressure(sim, src, dst);
-                    if let Some(fl) = flow.as_deref_mut() {
-                        fl[src].z += f;
-                        fl[dst].w -= f;
+                if !corner_blocked {
+                    if let Some((dst_elem, dst_pd)) =
+                        gas_pair_ok(sim, src, dst, src_elem, src_state)
+                    {
+                        // 2026-08-10 审查修正：原版 L144706-144713 对角 pair **只调用
+                        // UpdatePressure、不写 flow**（flow 纹理仅由水平/垂直 pair 记账）。
+                        // 此前多写 z/w → 对角扩散被计入垂直 flow，气体纹理方向感异常。
+                        let _ = crate::c2_physics::liquid_flow::update_pressure_with(
+                            sim, src, dst, src_elem, dst_elem, &src_pd, &dst_pd,
+                        );
                     }
                 }
             }
@@ -153,39 +166,41 @@ pub(crate) fn run_gas_pressure_task(
 
 /// 气体对检查（同元素压力均衡的邻格条件，原版 L144610-144630 等）：
 /// 邻格可渗透、快照一致、state<2、非真空-真空、非"异元素同状态"。
+/// #18 查表复用：通过时返回 (dst_elem, dst_pd) 供 update_pressure_with 免重查。
 fn gas_pair_ok(
     sim: &SimData,
     src: usize,
     dst: usize,
     src_elem: u16,
     src_state: u8,
-) -> bool {
+) -> Option<(u16, crate::b_elements::element::ElementPressureData)> {
     let cells = unsafe { &*sim.cells.ptr };
     let updated = unsafe { &*sim.updated_cells.ptr };
     if dst >= cells.element_idx.len() {
-        return false;
+        return None;
     }
     let dst_elem = cells.element_idx.get(dst);
-    let dst_state = match elements_table::get_element_pressure_data(dst_elem) {
-        Some(pd) => pd.state & 3,
-        None => return false,
+    let dst_pd = match elements_table::get_element_pressure_data(dst_elem) {
+        Some(pd) => pd,
+        None => return None,
     };
+    let dst_state = dst_pd.state & 3;
     if cells.properties.get(dst) & 1 != 0 {
-        return false;
+        return None;
     }
     if updated.element_idx.get(dst) != dst_elem {
-        return false;
+        return None;
     }
     if dst_state >= 2 {
-        return false;
+        return None;
     }
     if src_state == 0 && dst_state == 0 {
-        return false; // 真空-真空：flow=0
+        return None; // 真空-真空：flow=0
     }
     if src_elem != dst_elem && dst_state == src_state {
-        return false; // 异元素同状态由异元素置换处理
+        return None; // 异元素同状态由异元素置换处理
     }
-    true
+    Some((dst_elem, dst_pd))
 }
 
 /// 异元素气体压力置换（原版 L144780-144950 调用方 + DoGasPressureDisplacement L147441）。
@@ -206,7 +221,8 @@ pub(crate) fn run_gas_displacement_task(
     let x_max = (bounds.max_x as i32).min(w - 3);
     let y_min = bounds.min_y.max(3) as i32;
     let y_max = (bounds.max_y as i32).min(h - 3);
-    if x_min > x_max || y_min > y_max {
+    // 排他上界（同 run_gas_pressure_task，D-M2 2026-08-10）。
+    if x_min >= x_max || y_min >= y_max {
         return;
     }
     let iterate_dir = sim.iterate_direction;
@@ -218,8 +234,8 @@ pub(crate) fn run_gas_displacement_task(
         (iterate_dir, 2 * iterate_dir),
         (w, 2 * w),
     ];
-    for y in y_min..=y_max {
-        for x in x_min..=x_max {
+    for y in y_min..y_max {
+        for x in x_min..x_max {
             let src = (y * w + x) as usize;
             let src_elem = {
                 let cells = unsafe { &*sim.cells.ptr };
@@ -403,7 +419,7 @@ mod tests {
 
     #[test]
     fn gas_same_element_horizontal_balance_moves_mass() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_gas_table();
         let mut sd = make_sim();
         // cell 27 (row3,col3)=气体A 100kg；cell 28 (row3,col4)=气体A 0kg
@@ -433,7 +449,7 @@ mod tests {
 
     #[test]
     fn gas_diffuses_into_vacuum_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_gas_table();
         let mut sd = make_sim();
         // cell 27 = 气体A 100kg；cell 28 = 真空
@@ -455,7 +471,7 @@ mod tests {
 
     #[test]
     fn different_gas_displacement_pushes_beyond_gas() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_gas_table();
         let mut sd = make_sim();
         // cell 27 = 气体A 100kg；cell 28 = 气体B 10kg；cell 29 = 气体B 0kg（beyond）
@@ -484,7 +500,7 @@ mod tests {
 
     #[test]
     fn different_gas_displacement_beyond_vacuum_allowed() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_gas_table();
         let mut sd = make_sim();
         // cell 27 = 气体A 100kg；cell 28 = 气体B 10kg；cell 29 = 真空（beyond）
@@ -514,7 +530,7 @@ mod tests {
 
     #[test]
     fn iterate_direction_flips_each_update() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_gas_table();
         let mut sd = make_sim();
         assert_eq!(sd.iterate_direction, -1);
@@ -580,7 +596,7 @@ mod tests {
     /// 修复后约束挂在下方候选（原版标志位 [false,false,true]）→ CO2 全部沉底。
     #[test]
     fn gas_stratification_co2_sinks_below_o2() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_stratify_table();
         let mut sd = SimData::new_for_allocate(14, 10, 12345, false, true);
         sd.vacuum_element_idx = 0;
@@ -659,7 +675,7 @@ mod tests {
     /// copy；断言平衡后 raw flow 纹理趋近 0（不再有历史累积）。
     #[test]
     fn flow_texture_returns_to_rest_when_cleared_each_frame() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 表：0=真空(state0)、1=气体(state1, flow=0.1 真实值)、3=固体
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap_or_else(|e| e.into_inner());

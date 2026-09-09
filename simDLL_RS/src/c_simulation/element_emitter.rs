@@ -292,31 +292,36 @@ fn get_reachable_cells(
             Some(p) if (p.state & 3) == 3
         )
     };
-    let mut visited = vec![false; total];
-    let mut queue = std::collections::VecDeque::new();
-    visited[start] = true;
-    queue.push_back((start, 0usize));
-    while let Some((c, depth)) = queue.pop_front() {
-        if is_solid(c) {
-            continue; // 原版 Flood param_5=true：固体格不收集不穿越
-        }
-        out.push(c);
-        if depth + 1 >= max_depth {
-            continue;
-        }
-        for nb in [
-            c.wrapping_sub(width),
-            c + 1,
-            c.wrapping_sub(1),
-            c + width,
-        ] {
-            if nb >= total || visited[nb] {
+    // visited 用线程本地世代戳池复用（省每次 218KB 分配+清零，行为等价）。
+    crate::c_simulation::bfs_scratch::with_visited_scratch(total, |visited, generation| {
+        let mut queue = std::collections::VecDeque::new();
+        visited[start] = generation;
+        queue.push_back((start, 0usize));
+        while let Some((c, depth)) = queue.pop_front() {
+            if is_solid(c) {
+                continue; // 原版 Flood param_5=true：固体格不收集不穿越
+            }
+            out.push(c);
+            if depth + 1 >= max_depth {
                 continue;
             }
-            visited[nb] = true;
-            queue.push_back((nb, depth + 1));
+            // 原版 Flood（11_msvcrt_ignored.c L33623-33638）入队顺序：下(y-1)、左(x-1)、
+            // 右(x+1)、上(y+1)。2026-08-12 对照审查修正：此前为 [下,右,左,上]（右/左互换），
+            // 影响判定点被堵/满压后第二候选的落点（火山熔岩喷发 中下右左上 vs 原版 中下左右上）。
+            for nb in [
+                c.wrapping_sub(width),
+                c.wrapping_sub(1),
+                c + 1,
+                c + width,
+            ] {
+                if nb >= total || visited[nb] == generation {
+                    continue;
+                }
+                visited[nb] = generation;
+                queue.push_back((nb, depth + 1));
+            }
         }
-    }
+    });
     out
 }
 
@@ -372,24 +377,15 @@ impl ElementEmitterManager {
             return;
         }
         let n_items = self.items.len();
-        // 输出按 handle index resize，每帧初始化为空（原版 Register 置 0xffff / copy 后清零）
-        {
-            let out = &mut sim.element_emitter.emitted_mass_info;
-            out.resize(n_items, EmittedMassInfo::default());
-            for idx in 0..n_items {
-                out.set(
-                    idx,
-                    EmittedMassInfo {
-                        elem_idx: 0xFFFF,
-                        disease_idx: 0xFF,
-                        pad: 0,
-                        mass: 0.0,
-                        temperature: 0.0,
-                        disease_count: 0,
-                    },
-                );
-            }
-        }
+        // 输出数组按 handle index 布局，add() 注册时已 resize 并初始化为空条目
+        // （0xFFFF/0，原版 Register 语义）；copy_sim_data_to_game 每帧拷贝后把
+        // sim 侧重置为空（原版 CopySimDataToGame L131564-131570 语义）。
+        // 这里**不再重置**：多 region（多星）下每子步按 region 逐个调用本函数，
+        // 若每个 region 都清空会把前面 region 的排放量冲掉（Geo Vent 喷发正常但
+        // 内部物质不扣减的根因，2026-08-18）。仅兜底扩容（不缩容、不清内容）。
+        sim.element_emitter
+            .emitted_mass_info
+            .resize(n_items, EmittedMassInfo::default());
         let w = width as usize;
         for idx in 0..self.items.len() {
             let ri = self.items[idx];
@@ -519,6 +515,10 @@ fn try_emit(
         return result;
     }
     let count = reachable.len();
+    // 原版 TryEmit 的 param_3 = offsetIdx，但原版 **从不递增** offsetIdx（Update 只读、
+    // TryEmit 只读，Modify 归零）→ 轮转起点恒为 0，候选永远从判定点（BFS 首格）开始。
+    // 2026-08-12 对照审查修正：此前每次发射 +1 轮转 → 中下右左上依次生成，与
+    // 原版"固定从判定点生成"不符（玩家实测：钨火山熔融钨生成到上格熔化金汞齐轨道）。
     let start = rec.offset_idx as usize % count;
     let emit_state = match crate::b_elements::elements_table::get_element_by_idx(rec.elem_idx) {
         Some(e) => e.state & 3,
@@ -614,7 +614,6 @@ fn try_emit(
         result.disease_count = 0;
         break;
     }
-    rec.offset_idx = rec.offset_idx.wrapping_add(1);
     result
 }
 
@@ -678,7 +677,7 @@ mod tests {
 
     #[test]
     fn add_returns_versioned_handle_and_modify_writes_fields() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         let mut sim = SimData::new_for_allocate(6, 6, 1, false, false);
         let msg = AddElementEmitterMsg {
@@ -716,7 +715,7 @@ mod tests {
 
     #[test]
     fn modify_with_zero_mass_sets_blocked_state_ff() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         let sim = SimData::new_for_allocate(6, 6, 1, false, false);
         let mut sim = sim;
@@ -733,7 +732,7 @@ mod tests {
 
     #[test]
     fn remove_frees_and_versions_bump() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         let mut sim = SimData::new_for_allocate(6, 6, 1, false, false);
         let h = add_element_emitter(&mut sim, &AddElementEmitterMsg::default());
@@ -746,7 +745,7 @@ mod tests {
 
     #[test]
     fn add_sizes_output_vector_immediately() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         let mut sim = make_sim();
         assert_eq!(sim.element_emitter.emitted_mass_info.len(), 0);
@@ -767,7 +766,7 @@ mod tests {
     /// prepare_game_data_update 读 GDU —— emitted_mass_entries 必须非空。
     #[test]
     fn register_reaches_gdu_emitted_mass_entries() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         init_table();
         use crate::a_framework::frame_sync::FrameSync;
@@ -833,7 +832,7 @@ mod tests {
 
     #[test]
     fn update_emits_after_interval_and_accumulates_output() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         init_table();
         let mut sim = make_sim();
@@ -867,9 +866,90 @@ mod tests {
         assert_eq!(u.element_idx.get(7), 3);
     }
 
+    /// 回归（2026-08-18）：多 region（多星）下每子步按 region 逐个调用
+    /// update_element_emitters，**不得**把前面 region 已写入的排放量重置掉——
+    /// 此前 update 开头无条件清空整个 emitted_mass_info，后处理 region 会把
+    /// 前面 region 的排放冲掉 → Geo Vent 喷发正常但内部物质不扣减。
+    #[test]
+    fn update_multi_region_preserves_earlier_region_emissions() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        reset_for_test();
+        init_table();
+        let mut sim = make_sim();
+        let ha = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        let hb = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        // A 判定格 = sim 7（row1,col1），B 判定格 = sim 8（row1,col2）
+        let ma = ModifyElementEmitterMsg {
+            handle: ha,
+            cell_idx: 0,
+            emit_interval: 0.2,
+            emit_mass: 0.002,
+            emit_temperature: 350.0,
+            max_pressure: 10.0,
+            disease_count: 0,
+            element_idx: 3,
+            max_depth: 1,
+            disease_idx: 0xFF,
+        };
+        let mb = ModifyElementEmitterMsg {
+            handle: hb,
+            cell_idx: 1,
+            emit_interval: 0.2,
+            emit_mass: 0.002,
+            emit_temperature: 350.0,
+            max_pressure: 10.0,
+            disease_count: 0,
+            element_idx: 3,
+            max_depth: 1,
+            disease_idx: 0xFF,
+        };
+        assert!(modify_element_emitter(&sim, &ma));
+        assert!(modify_element_emitter(&sim, &mb));
+        // region A：含 A（col<=1），不含 B（col2）
+        let ra = crate::d1_activity::RegionBounds {
+            min_x: 0,
+            min_y: 0,
+            max_x: 1,
+            max_y: 5,
+        };
+        update_element_emitters(&mut sim, 0.2, 6, ra);
+        assert!(
+            sim.element_emitter.emitted_mass_info.get(0).mass > 0.0,
+            "region A 排放应写入 out[0]"
+        );
+        // region B：不含 A（col1 < 2）；修复前会重置整个数组冲掉 A
+        let rb = crate::d1_activity::RegionBounds {
+            min_x: 2,
+            min_y: 0,
+            max_x: 5,
+            max_y: 5,
+        };
+        update_element_emitters(&mut sim, 0.2, 6, rb);
+        assert!(
+            sim.element_emitter.emitted_mass_info.get(0).mass > 0.0,
+            "region B 不得冲掉 region A 的排放（多星 Geo Vent 不扣减根因）"
+        );
+        assert!(
+            sim.element_emitter.emitted_mass_info.get(1).mass > 0.0,
+            "region B 排放应写入 out[1]"
+        );
+    }
+
     #[test]
     fn update_fires_blocked_callback_when_no_room() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         init_table();
         let mut sim = make_sim();
@@ -916,7 +996,7 @@ mod tests {
     /// game cell 7 → sim 16（row2,col4）；若 row/col 写反会作用到 sim 26（row4,col2）。
     #[test]
     fn update_emits_into_correct_nonsymmetric_cell() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         init_table();
         let mut sim = make_sim();
@@ -956,10 +1036,12 @@ mod tests {
         );
     }
 
-    /// 回归：Modify 必须重置 offset_idx = 0（原版 L1661 byte 0x1f=0）。
+    /// 回归（2026-08-12 修正）：原版 **从不递增** offsetIdx（Update/TryEmit 均只读、
+    /// Modify 归零）→ 轮转起点恒为 0，候选永远从判定点开始；此前每次发射 +1 轮转
+    /// 导致"中下右左上"依次生成（钨火山熔融钨喷到上格熔化金汞齐轨道）。
     #[test]
     fn modify_resets_offset_idx() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         init_table();
         let mut sim = make_sim();
@@ -984,22 +1066,26 @@ mod tests {
         };
         assert!(modify_element_emitter(&sim, &m));
         let b = crate::d1_activity::full_grid_bounds(&sim);
-        update_element_emitters(&mut sim, 0.2, 6, b); // try_emit 使 offset_idx 0→1
+        update_element_emitters(&mut sim, 0.2, 6, b);
         {
             let mgr = ELEMENT_EMITTER_MANAGER.lock();
-            assert_eq!(mgr.record(h).unwrap().offset_idx, 1, "发射后轮转起点应前进");
+            assert_eq!(
+                mgr.record(h).unwrap().offset_idx,
+                0,
+                "发射后 offset_idx 必须保持 0（原版从不轮转）"
+            );
         }
-        assert!(modify_element_emitter(&sim, &m)); // 再次 Modify → 归零
+        assert!(modify_element_emitter(&sim, &m));
         {
             let mgr = ELEMENT_EMITTER_MANAGER.lock();
-            assert_eq!(mgr.record(h).unwrap().offset_idx, 0, "Modify 应重置 offset_idx");
+            assert_eq!(mgr.record(h).unwrap().offset_idx, 0, "Modify 保持 offset_idx = 0");
         }
     }
 
     /// 回归：emitTemperature < 0 → 用元素 defaultValues.temperature（原版 L1796-1799）。
     #[test]
     fn try_emit_negative_temp_falls_back_to_default() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         reset_for_test();
         init_table();
         {

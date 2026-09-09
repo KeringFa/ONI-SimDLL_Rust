@@ -124,7 +124,8 @@ pub fn sim_main_loop(sim_ptr: *mut Sim) {
         //     缺失此清零 → flow 累积历史总量 → 平衡后动画永不停止
         //     （2026-08-06 气体纹理根因，回归测试 flow_texture_returns_to_rest_when_cleared_each_frame）。
         if !sim_data_ptr.is_null() {
-            unsafe { sim_data_ops::clear_flow(&mut *sim_data_ptr); }
+            // 只清活动区域（省 ~37% 死区 memset）；区域列表空/超限时内部回退全清。
+            unsafe { sim_data_ops::clear_flow_regions(&mut *sim_data_ptr); }
         }
 
         // 6. 处理帧
@@ -201,14 +202,16 @@ pub fn sim_main_loop(sim_ptr: *mut Sim) {
         // 注意：源码传递了 mSimData 和 mGameData 两个参数，但实际只写入 mSimData。
         // GameSync 时 mSimData ↔ mGameData 交换，游戏线程读取 mGameData。
         if !m_sim_data_ptr.is_null() {
-            unsafe {
-                sim_data_ops::copy_sim_data_to_game(
-                    &mut *sim_data_ptr,
-                    &mut *m_sim_data_ptr,
-                    m_game_data_ptr as *const crate::a_framework::game_data::GameData,
-                    active_frame_count,
-                );
-            }
+            crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_SIM_TO_GAME, {
+                unsafe {
+                    sim_data_ops::copy_sim_data_to_game(
+                        &mut *sim_data_ptr,
+                        &mut *m_sim_data_ptr,
+                        m_game_data_ptr as *const crate::a_framework::game_data::GameData,
+                        active_frame_count,
+                    );
+                }
+            });
         } else {
             tracing::warn!("Sim::Main: m_sim_data is null, skip CopySimDataToGame");
         }
@@ -336,7 +339,7 @@ mod tests {
 
     #[test]
     fn sim_exit_flag_defaults_to_false() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 重置
         globals::G_SIM_EXIT_REQUESTED.store(false, Ordering::Release);
         assert!(!globals::G_SIM_EXIT_REQUESTED.load(Ordering::Acquire));
@@ -344,7 +347,7 @@ mod tests {
 
     #[test]
     fn sim_time_remainder_defaults_to_zero() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         globals::G_SIM_TIME_REMAINDER.store(0, Ordering::Release);
         let remainder = f32::from_bits(globals::G_SIM_TIME_REMAINDER.load(Ordering::Acquire));
         assert_eq!(remainder, 0.0);
@@ -352,14 +355,14 @@ mod tests {
 
     #[test]
     fn join_sim_thread_without_start_is_safe() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 未启动 sim 线程时调用 join 应安全返回
         join_sim_thread();
     }
 
     #[test]
     fn start_and_join_sim_thread_with_null_frame_sync() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 创建一个 frame_sync 为 null 的 Sim
         let mut sim = Sim::new_zeroed();
         sim.frame_sync = std::ptr::null_mut();

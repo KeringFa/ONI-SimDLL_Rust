@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn register_derives_fields_from_message() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut mgr = ElementChunkManager::new();
         // 6×6 sim（内部 4×4）：game cell 5 = row1,col1 → sim (2,2) = 2×6+2 = 14
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn modify_energy_and_adjuster_and_move() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut mgr = ElementChunkManager::new();
         let h = mgr.add(6, &add_msg(4, 300.0));
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn exchange_heat_energy_with_world_exchanges_cell_and_chunk() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut sd = make_sim();
         // 格 14：水 300°C mass 100 ins 255（HC=200）；碎片：400°C HC=200 TC=4，factor=1000
@@ -682,7 +682,7 @@ mod tests {
     /// 反向：碎片冷于格子 → 环境失热给碎片 → 返回值为正（环境变冷）。
     #[test]
     fn exchange_heat_energy_with_world_positive_when_cell_loses_heat() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut sd = make_sim();
         unsafe {
@@ -713,7 +713,7 @@ mod tests {
     /// delta（cell 失热）必须为**负**。此前符号反了 → 正 delta → C# 误报炎热。
     #[test]
     fn duplicant_in_cool_air_produces_negative_delta() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         {
             let mut table = G_ELEMENTS_TABLE.lock().unwrap();
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn exchange_heat_energy_with_world_gates() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut sd = make_sim();
         let mut chunk = ElementChunkData {
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn update_uses_adjuster_when_present() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut sd = make_sim();
         let mut mgr = ElementChunkManager::new();
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn update_exchanges_with_solid_cell_below() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut sd = make_sim();
         let mut mgr = ElementChunkManager::new();
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn update_emits_melted_event_on_phase_cross() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table(); // elem5 highTemp=5000 → >5003 触发
         let mut sd = make_sim();
         let mut mgr = ElementChunkManager::new();
@@ -856,7 +856,7 @@ mod tests {
     /// C# 读到 0K → 存储水块冻结成冰 + T(0) 液滴崩溃（用户实测）。
     #[test]
     fn update_reports_temperature_even_with_zero_heat_capacity() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut sd = make_sim();
         let mut mgr = ElementChunkManager::new();
@@ -882,7 +882,7 @@ mod tests {
     /// 不再清零——防止 C# 过期句柄读到 0K。
     #[test]
     fn update_preserves_released_slot_temperature() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut sd = make_sim();
         let mut mgr = ElementChunkManager::new();
@@ -905,7 +905,7 @@ mod tests {
 
     #[test]
     fn element_chunk_output_swaps_into_game_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         reset_for_test();
         {
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn update_data_list_only_fills_output_per_handle_index() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_elem_table();
         let mut mgr = ElementChunkManager::new();
         let h0 = mgr.add(6, &add_msg(5, 300.0)); // index 0

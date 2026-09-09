@@ -206,12 +206,14 @@ pub fn update_flow_texture(sim: &SimData, game: &mut GameData) {
 ///
 /// 原版 05_liquid_flow.c L397（UpdateLiquidPropertyTexture）与
 /// 11_msvcrt_ignored.c L43123（GetEstimatedLiquidGradientValue）各有一处
-/// `powf()` 调用，参数经浮点寄存器传入、Ghidra 无法恢复；但原版随后
-/// `GetEstimatedLiquidGradientValue(..., 1000.0, true)` 显式传入 **1000.0**
-/// （满格质量常量），且 01 版本实证液面高度 = mass/1000 语义。
-/// 本实现取 `mass/1000`（无幂），若实测高度曲线与原版有差，再校准幂指数。
+/// `powf()` 调用。
+/// **2026-08-10 反汇编原版 SimDLL.dll 确认**（XMM 常量池）：
+/// `powf(min(mass × 0.001, 1.0), 0.45)` —— 指数 = 0.45
+/// （UpdateLiquidPropertyTexture @0x1800486CA：xmm13=0.001、xmm6=1.0、xmm14=0.45；
+///  GetEstimatedLiquidGradientValue @0x180047CC6：div 1000.0、clamp 1.0、指数 0.45）。
+/// 此前取线性 mass/1000（等价指数 1.0）→ 低质量液面偏矮；现按原版 0.45 次方。
 fn liquid_mass_ratio(mass: f32) -> f32 {
-    (mass / 1000.0).clamp(0.0, 1.0)
+    (mass / 1000.0).clamp(0.0, 1.0).powf(0.45)
 }
 
 /// 梯度颜色插值 — 由温度梯度 t（0..1）在 gradient 数组的相邻色之间做 RGB 线性插值。
@@ -554,6 +556,7 @@ mod tests {
     /// 断言 propertyTextureFlow 输出 = 差 × (1/mass)。
     #[test]
     fn update_flow_texture_writes_vector2f() {
+        let _lock = LIB_TESTS_LOCK.lock();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         let mut gd = GameData::new(4, 3);
         unsafe {
@@ -584,7 +587,7 @@ mod tests {
     /// 液体黑屏的直接修复点。自建元素表，强断言精确值。
     #[test]
     fn update_liquid_property_texture_writes_color() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_test_elements_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         let mut gd = GameData::new(4, 3);
@@ -630,7 +633,7 @@ mod tests {
     /// 空元素表（测试环境默认）下不 panic，输出保持 0。
     #[test]
     fn update_liquid_property_texture_no_panic_empty_table() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable(); // 确保空表
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         let mut gd = GameData::new(4, 3);
@@ -646,12 +649,13 @@ mod tests {
         }
     }
 
-    /// 液面高度回归：surface 格（上方为气体/真空）的 alpha = mass/1000（原版 L397
-    /// powf + GetEstimatedLiquidGradientValue 的 1000.0 常量）。
-    /// 此前 liquid_powf()=1.0 占位 → 任何质量都满格高度（用户实测）。
+    /// 液面高度回归：surface 格（上方为气体/真空）的 alpha = powf(mass/1000, 0.45)
+    /// （原版 L397 powf，2026-08-10 反汇编确认指数 0.45）。
+    /// 此前 liquid_powf()=1.0 占位 → 任何质量都满格高度（用户实测）；
+    /// 再此前线性 mass/1000 → 低质量液面偏矮。
     #[test]
     fn liquid_alpha_scales_with_mass_ratio() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_test_elements_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         let mut gd = GameData::new(4, 3);
@@ -668,17 +672,20 @@ mod tests {
         unsafe {
             let liquid = std::slice::from_raw_parts(gd.property_texture_liquid.ptr, 4 * 3);
             let alpha = (liquid[0] >> 24) & 0xff;
-            assert_eq!(alpha, 25, "100kg/1000kg → alpha=0.1×255≈25");
+            assert_eq!(
+                alpha, 90,
+                "100kg/1000kg → alpha=powf(0.1,0.45)×255≈90"
+            );
             assert_eq!(liquid[0] & 0xffffff, 0x00ff00, "RGB 仍为元素 colour（绿）");
         }
         DestroyElementsTable();
     }
 
-    /// 梯度深度因子回归：GetEstimatedLiquidGradientValue 乘 mass/1000
-    /// （原版 L43123 powf 对应物；01 版本实证 mass_ratio 语义）。
+    /// 梯度深度因子回归：GetEstimatedLiquidGradientValue 乘 powf(mass/1000, 0.45)
+    /// （原版 L43123 powf，指数 0.45 已反汇编确认）。
     #[test]
     fn estimated_gradient_scales_with_mass_ratio() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_test_elements_table();
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         unsafe {
@@ -701,8 +708,8 @@ mod tests {
                 false,
             );
             assert!(
-                (v - 0.1).abs() < 1e-3,
-                "梯度 = 光深(1.0) × mass_ratio(0.1) = 0.1，got {}",
+                (v - 0.354813).abs() < 1e-3,
+                "梯度 = 光深(1.0) × powf(0.1,0.45)=0.3548，got {}",
                 v
             );
         }
@@ -713,7 +720,7 @@ mod tests {
     /// 对照原版公式（flow 累加结构已核对），若量级异常则存在累加 bug。
     #[test]
     fn diagnostic_flow_texture_magnitude_gas_diffusion() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 专用表：0=真空(state0,flow 0)、1=气体(state1,flow 0.1)、2=固体(state3)
         let mut w = BinaryBufferWriter::new();
         w.write_int(3);
@@ -854,7 +861,7 @@ mod tests {
     /// - 光列 1：无遮挡 → exposed[5] == exposed[1] == 255
     #[test]
     fn update_exposed_to_sun_writes_attenuated_light_column() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_exposed_table();
         let mut sd = SimData::new_for_allocate(6, 5, 1, true, false);
         sd.worlds.push(WorldOffsetData {
@@ -901,7 +908,7 @@ mod tests {
     /// 期望：全真空列（含空间区）曝光 = 255（真空不挡光）。
     #[test]
     fn exposed_sun_passes_through_vacuum_space_biome() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         // 元素表：0=真空(state0, factor0, **defaultMass=0**)；1=固体(state3, factor0.5)
         {
             let mut w = BinaryBufferWriter::new();
@@ -982,7 +989,7 @@ mod tests {
     /// 空元素表 / 无 world 下不 panic（基线）。
     #[test]
     fn update_exposed_to_sun_no_panic_empty_table() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable(); // 确保空表
         let sd = SimData::new_for_allocate(6, 5, 1, true, false);
         let mut gd = GameData::new(4, 3);

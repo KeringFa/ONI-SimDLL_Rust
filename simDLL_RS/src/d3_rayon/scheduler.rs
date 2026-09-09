@@ -88,7 +88,6 @@ mod tests {
 
     #[test]
     fn scheduler_mode_invalid_rejected() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
         reset_for_tests();
         assert_eq!(RS_SetSchedulerMode(99), -1);
         assert_eq!(current_mode(), SchedulerMode::Auto);
@@ -96,10 +95,6 @@ mod tests {
 
     #[test]
     fn scheduler_mode_set_and_query() {
-        // 必须持锁：MODE 是全局静态量，同目录下其他用例（以及 d3_rayon::mod 的
-        // pool_size_is_physical_minus_reserve）会并发读写它。不加锁时本用例在多
-        // 线程模式下与它们抢状态，断言间歇性失败（实测 583 用例中约 1 例挂）。
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
         reset_for_tests();
         assert_eq!(RS_SetSchedulerMode(1), 1);
         assert_eq!(current_mode(), SchedulerMode::D2);
@@ -109,7 +104,6 @@ mod tests {
 
     #[test]
     fn scheduler_d1_accepts_or_falls_back() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
         reset_for_tests();
         let r = RS_SetSchedulerMode(2);
         // 有 HT → 2；无 HT → 回退 1。两者均合法。
@@ -118,14 +112,14 @@ mod tests {
 
     #[test]
     fn reserved_cores_defaults_to_one() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         reset_for_tests();
         assert_eq!(reserved_cores(), 1);
     }
 
     #[test]
     fn reserved_cores_set_and_clamp() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         reset_for_tests();
         assert_eq!(RS_SetReservedCores(2), 2);
         assert_eq!(reserved_cores(), 2);

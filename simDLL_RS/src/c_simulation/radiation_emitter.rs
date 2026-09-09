@@ -770,7 +770,7 @@ mod tests {
     /// emitRads/linger = 110/1.1 = 100；radius 2×2 边界外不受影响。
     #[test]
     fn emitter_constant_ticks_ellipse() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -817,7 +817,7 @@ mod tests {
     /// 设为全遮挡 → DDA 透射率必须为 1.0。
     #[test]
     fn radiation_absorption_line_dda_visits_original_cells() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -861,7 +861,7 @@ mod tests {
     /// 是**第 2 次**随机抽取，用 seed 确定性断言公式。
     #[test]
     fn tick_constant_low_falloff_jitter_matches_original() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         sd.random_seed = 12345;
@@ -912,7 +912,7 @@ mod tests {
     /// rate=1 边界（timer>=1s）重置 emitStep。
     #[test]
     fn emitter_pulsing_expands_ring() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -990,7 +990,7 @@ mod tests {
     /// 任务 3c：Pulsing 多步发射 + emitStep 在 max_r 后回环。
     #[test]
     fn emitter_pulsing_multistep_wraps_step() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -1037,7 +1037,7 @@ mod tests {
     /// （rx=ry=3）：内部 (1,0) 不受辐射、环上 (2,0)=110、外侧 (3,0)=0。
     #[test]
     fn emitter_pulsing_ring_outline_not_filled() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -1097,7 +1097,7 @@ mod tests {
     /// 累加够一个 step_time 后补发 1 次（每帧 0~1 次）。
     #[test]
     fn emitter_constant_ticks_paced_by_step_timer() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -1148,7 +1148,7 @@ mod tests {
     /// 任务 3b：PulsingAveraged——step 0 中心 = emitRads/面积（radius 2×2 → 面积1 → 110）。
     #[test]
     fn emitter_pulsing_averaged_center_step() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         fill_both(&mut sd, |b| {
@@ -1185,7 +1185,7 @@ mod tests {
     /// 任务 4a：DLC 门控——radiationEnabled=false → update 零执行。
     #[test]
     fn emitter_gated_by_enabled_flag() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         sd.radiation_enabled = false;
@@ -1224,7 +1224,7 @@ mod tests {
     /// 任务 4b：帧消息处理——adds 36B 注册进全局管理器。
     #[test]
     fn emitter_frame_messages_register_global() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_table();
         let mut sd = make_sim();
         clear_radiation_emitters();
@@ -1260,7 +1260,7 @@ mod tests {
 
     #[test]
     fn emitter_register_modify_remove_and_handle_versions() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sd = make_sim();
         let mut reg = RadiationEmitterRegistry::new();
         // Add：callbackIdx=3, gameCell=4（→sim cell = (4/6+1)*8 + 4%6+1 = 1*8+5 = 13），

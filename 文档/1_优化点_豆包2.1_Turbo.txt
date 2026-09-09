@@ -1,0 +1,307 @@
+================================================================================
+simDLL_RS 性能优化点清单（豆包 2.1 Turbo 审阅）
+审阅日期：2026-09-06
+对照基准：反编译源码 SimDLL_Source.c（ghidra 12.1.2 导出）
+================================================================================
+
+【原版 UpdateData 关键流程（对照基准）】
+每子步:
+  iterateDirection 翻转
+  CopyFrom(cells ← updatedCells)          ← 全网格 memcpy
+  遍历 activeRegions:
+    温度任务提交到 ParallelTaskQueue (1 worker, 按行带切分)
+    wait_all
+    CopyFrom(cells ← updatedCells)        ← 全网格
+    气体压力循环 (读 cells, 写 updatedCells)
+    CopyFrom(cells ← updatedCells)        ← 全网格
+    液体流动循环
+    CopyFrom(cells ← updatedCells)        ← 全网格
+    ...
+
+原版温度任务 InternalDoTask 是两遍结构：
+  第一遍：背墙换热 + 右邻换热 + 下邻换热
+  第二遍：独立遍历做 DoStateTransition
+
+================================================================================
+一、高优先级优化点
+================================================================================
+
+【#1】copy_updated_cells_to_cells_region 逐格逐字段赋值 → 行级 memcpy
+  位置：c_simulation/sim_data_ops.rs:152-189
+  问题：D3 并行路径下区域局部 CopyFrom 用嵌套循环对每格做 11 次 .set()，
+        串行路径的 CellSOA::copy_from 用 copy_nonoverlapping（memcpy），快得多。
+  频率：每区域每子步调用 3 次（温度后、气体后、液体后）。
+  改法：改为按行 copy_nonoverlapping，每行 11 次 memcpy。
+  对照审查：✅ 安全。原版 CellSOA::CopyFrom 用 memcpy（L3354-3410），
+        改行级 memcpy 数据完全一致。区域+halo vs 全网格是已有设计差异，
+        非本次优化引入。
+
+【#2】D2 串行路径温度任务队列是纯开销（1 worker = 无并行）
+  位置：c2_physics/mod.rs:41-70
+  问题：parallel=false 时温度计算被切成行带提交到 ParallelTaskQueue（1 worker），
+        然后 wait_all()。等于把本可直接调用的函数丢到另一个线程执行，
+        多了线程唤醒 + 条件变量同步 + 上下文切换，无任何并行收益。
+  改法：worker_count() <= 1 时直接调用 run_temperature_task(sim_data, bounds)。
+  对照审查：✅ 安全。原版 InitializeTasks 创建 1 worker（L132419），
+        任务体 InternalDoTask 只读写 updatedCells/simEvents，无其他副作用。
+        1 worker 下直接调用与经队列执行结果逐字节一致。
+
+【#3】每子步重复分配 4 个 Vec
+  位置：c2_physics/mod.rs:165-193
+  问题：update_data 每子步新建 region_bounds、bounds_list、pp_list、cosmic_list。
+        典型每帧 1-5 子步，每子步都 alloc + free。
+  改法：用 SmallVec<[RegionBounds; 16]>（区域数通常 ≤ 11）或预分配可复用缓冲。
+  对照审查：✅ 安全。原版直接遍历 activeRegions 指针（L41904-41906），不分配。
+        Rust 的 4 个 Vec 是纯中间容器，改分配方式不影响计算。
+
+【#4】D3 run_parallel_pipeline 每个 group 克隆 4 个 Vec
+  位置：d3_rayon/pipeline.rs:69-99 和 110-139
+  问题：阶段 A 和 C 的 rayon scope 中，对每个 group 都 clone() 了
+        region_bounds、region_cosmic、rng_ptrs、events_ptrs。
+  改法：用 Arc<Vec<_>> 共享只读数据，或拆成切片引用传入。
+  对照审查：✅ 安全。这些数据在 scope 内只读，克隆仅为满足闭包捕获。
+
+【#5】热循环中反复解引用 sim.cells.ptr / sim.updated_cells.ptr
+  位置：c2_physics/gas_flow.rs:53-150、temperature.rs:864-905 等
+  问题：内层循环里反复写 unsafe { &*sim.cells.ptr } 创建临时引用块，
+        编译器可能无法把指针提升到循环外。run_gas_pressure_task 里
+        cells 指针解了 4 次。
+  改法：循环外一次性 let cells = unsafe { &*sim.cells.ptr };
+        let updated = unsafe { &*sim.updated_cells.ptr };
+  对照审查：✅ 安全。原版温度/气体循环直接用局部指针变量（L42044 lVar33 = cells.begin），
+        全程不重新分配。Rust 物理循环内 sim.cells.ptr 不会变化。
+
+================================================================================
+二、中优先级优化点
+================================================================================
+
+【#6】derive_natural_solid_strength 每区域每子步跑两遍
+  位置：c2_physics/mod.rs:32（阶段 A）和 :136（阶段 C）
+  问题：两遍都遍历整个区域所有格。阶段 C 目的是补上阶段 B（发射器）
+        新生成的固体，但阶段 B 只修改少量格，全区域重扫浪费。
+  改法：阶段 B 记录被修改的格，阶段 C 只扫这些格；或加脏标记。
+  对照审查：⚠️ 需谨慎。这是 Rust 新增的兜底逻辑——原版在固体生成/加载时
+        直接写 strength_info（0x84），不每帧推导。如果只扫脏格，
+        必须确保所有新生成固体的格被精确标记，否则漏标格 strength=0 →
+        DoPressureBreak 超压检查失效 → 建筑/地形行为异常。
+        建议：要么保留两遍，要么在阶段 B 每个修改点显式标记脏格。
+
+【#7】MsvcVector::get() / set() 每次都边界检查
+  位置：a_framework/stl_shim.rs:65-69, 136-142
+  问题：热循环中每格每字段访问都走 if index < self.len() 分支。
+        温度循环每格访问 ~10 个字段，气体循环更多。
+  改法：新增 get_unchecked / set_unchecked，在已验证边界的热点使用。
+  对照审查：⚠️ 需谨慎。原版全部直接指针访问（*(float*)(begin + i*4)），
+        无边界检查。去掉检查在循环边界已保证安全的前提下等价。
+        必须逐个循环验证：温度循环 ✅、气体循环 ✅、液体循环需单独验证。
+        建议只新增 unchecked 变体，不替换现有安全方法。
+
+【#8】run_temperature_band 内层冗余边界检查
+  位置：c2_physics/temperature.rs:866
+  问题：if row >= h - 1 || col >= w - 1 { continue; } 写在内层循环里，
+        但 row_start..row_end 和 bounds 已经钳制过了。
+  改法：循环前钳制 row_end = row_end.min(h-1)、col_max = bounds.max_x.min(w-1)。
+  对照审查：✅ 安全（但发现已有差异）。bounds 已钳制到 [1, w-1)，
+        循环内检查恒假。已有差异：原版右邻检查是 col < max_x - 1
+        （区域内最后一列不做右邻换热，L41744），Rust 是 col + 1 < w - 1
+        （全局边界）。若区域右边界 < w-1，Rust 会对区域最后一列做右邻换热，
+        原版不做。区域外通常是真空，pair_allowed 大概率跳过，实际影响极小。
+        此差异非本次优化引入。
+
+【#9】update_pressure 未标记 #[inline]
+  位置：c2_physics/liquid_flow.rs:1179
+  问题：气体压力循环每格每方向调用一次，跨模块函数调用，release 下可能不内联。
+  改法：加 #[inline]。
+  对照审查：✅ 安全。纯编译提示，不改变运行时行为。原版 UpdatePressure 是
+        独立函数（L1437），C++ LTO 下可能内联也可能不。
+
+================================================================================
+三、低优先级 / 架构级优化点
+================================================================================
+
+【#10】D3 阶段 B（组件发射器）全程串行
+  位置：c2_physics/mod.rs:97-121（run_region_emitters）
+  问题：多星球下阶段 B 是串行瓶颈，包含 7 个组件。
+  对照审查：❌ 高风险，不建议。这些组件共享全局注册表、互相可能有数据依赖
+        （如 emitter 产生的质量被 consumer 消费），原版严格串行。
+        并行化极易引入竞态和行为偏差。除非逐组件分析数据依赖并加隔离。
+
+【#11】D1 executor 每帧 to_vec() 拷贝区域数据
+  位置：d3_rayon/d1_pipeline.rs:269-273
+  问题：每帧重新分配 bounds/pp/cosmic/rng/events 的 Vec。
+  改法：预分配缓冲，每帧复用。
+  对照审查：✅ 安全。纯分配优化，frame context 数据每帧由主线程写入、
+        worker 只读。
+
+【#12】sim_main_loop 每次取 G_SIM_DATA 都加锁
+  位置：a_framework/sim_thread.rs:103 等
+  问题：只是读一个指针，parking_lot 锁虽快但可换 AtomicPtr 或 OnceLock。
+  对照审查：✅ 安全。原版 gSimData 是全局裸指针直接访问（L41904），无锁。
+        Rust 当前用 Mutex 包指针是过度保护。
+
+================================================================================
+四、对照中发现的已有行为差异（非优化引入，供参考）
+================================================================================
+
+【差异 A】温度任务单遍 vs 两遍
+  原版 InternalDoTask（L41693）：先做完所有换热，再独立遍历做 DoStateTransition。
+  Rust run_temperature_band：同一循环内先换热再 do_state_transition。
+  若某格熔化改变元素，原版中该变化不影响同遍后续格的换热；Rust 中可能影响。
+  实际中相变概率低且邻格多为同元素，影响可能很小，但严格不等价。
+
+【差异 B】温度区域边界列的右邻换热
+  原版：col < max_x - 1（区域内最后一列不做右邻换热）。
+  Rust：col + 1 < w - 1（全局边界）。
+  若区域右边界 < w-1，Rust 会对区域最后一列做右邻换热（邻格在区域外）。
+  区域外通常是真空，pair_allowed 大概率跳过，实际影响极小。
+
+【差异 C】全网格 CopyFrom vs 区域+halo CopyFrom
+  原版每阶段后全网格同步；Rust 并行路径只同步区域+halo。
+  区域外格子从不被物理修改，理论上等价。
+  但 halo 重叠区域（若两区域间距 ≤ 2 格）在并行下可能有数据竞争。
+
+================================================================================
+六、第二轮：深入温度/气体/液体热点循环发现的优化点（#13-#23）
+================================================================================
+
+【#13】pair_allowed 和 update_temperature_pair 重复元素表查找
+  位置：c2_physics/temperature.rs:821-832 (pair_allowed), 647-704 (update_temperature_pair)
+  问题：run_temperature_band 先调 pair_allowed（查 2 次 get_element_temperature_data），
+        通过后调 update_temperature_pair（又查 2 次同样的 ETD）。
+        每次 get_element_temperature_data 涉及 AtomicPtr 加载 + 索引检查。
+  改法：合并 pair_allowed 到 update_temperature_pair 内部，或让 pair_allowed 返回 ETD 引用。
+  对照审查：✅ 安全。原版 InternalDoTask（L41744-41756）中 pair 检查和 UpdateTemperature
+        在同一函数内，元素数据只查一次后直接传参。
+
+【#14】update_temperature_pair / update_pressure 每次调用重复空指针/长度检查
+  位置：temperature.rs:648-653, liquid_flow.rs:1180-1186
+  问题：if sim.cells.ptr.is_null() 和 if cell >= cells.mass.len() 在任务入口已做，
+        每对邻格调用都重复检查。
+  改法：提供 _unchecked 变体，假设指针非空、索引有效。
+  对照审查：✅ 安全。原版无检查（直接指针访问 *(float*)(begin+i*4)）。
+
+【#15】calculate_temperature_exchange_precise 用 f64 计算
+  位置：c2_physics/temperature.rs:580-607
+  问题：所有 f32 转 f64 计算再转回 f32。原版用 float（f32）。
+        f64 运算比 f32 慢，且阻碍 SIMD 向量化（温度是最易向量化的模块）。
+  改法：确认是否有意精度增强。若要严格对齐原版数值，改用 f32。
+  对照审查：⚠️ 行为差异。原版 L133850+ 用 float 计算。Rust 用 f64 是精度增强，
+        改回 f32 会产生微小数值差异（更接近原版），需确认项目是否要求严格对齐。
+
+【#16】combine_conductivity 中 insulation 值可预计算 LUT
+  位置：c2_physics/temperature.rs:612-624
+  问题：insulation 是 u8（仅 256 种可能），iv = ins² × 1.53787e-05 每次重复计算。
+        每对邻格调用一次 combine_conductivity，每格 2 对邻格。
+  改法：静态 [f32; 256] LUT，元素表初始化时一次性计算。
+  对照审查：✅ 安全。纯数学预计算，浮点结果逐位一致。
+
+【#17】update_temperature_for_backwall 背墙相变检查重复查表
+  位置：c2_physics/temperature.rs:802
+  问题：L733-736 已查 get_element_temperature_data(back_elem) 得到 etd_back，
+        L802 又查一次 get_element_temperature_data(back_elem)。
+        back_elem 在中间没有变化。
+  改法：把 etd_back.low_temp/high_temp 存到局部变量，L802 直接用。
+  对照审查：✅ 安全。
+
+【#18】气体流动 gas_pair_ok 和 update_pressure 重复元素表查找
+  位置：c2_physics/gas_flow.rs:157-190, c2_physics/liquid_flow.rs:1189-1199
+  问题：gas_pair_ok 查了 dst_elem 的 pressure data；通过后 update_pressure 又查
+        cell_elem 和 neighbor_elem 的 pressure data。src_elem 的 pd 在循环开头
+        （gas_flow.rs:64）查了但没传下去。
+  改法：把已查的 pd 引用通过参数传给 gas_pair_ok 和 update_pressure。
+  对照审查：✅ 安全。原版 UpdateData（L42077-42109）中 gas pair 检查和 UpdatePressure
+        在同一循环内，元素指针 lVar27 = gElementPressureData 复用。
+
+【#19】add_mass_and_update_temperature / modify_disease_count / clear_disease 未内联
+  位置：c2_physics/liquid_flow.rs 中被 update_pressure 调用
+  问题：每次质量转移都调用这些函数，跨模块函数 release 下可能不内联。
+  改法：加 #[inline]。
+  对照审查：✅ 安全。纯编译提示。
+
+【#20】气体流动 flow 纹理的 Option 分支在循环内
+  位置：c2_physics/gas_flow.rs:93-96, 113-116
+  问题：每个方向都 if let Some(fl) = flow.as_deref_mut()，分支预测开销。
+        flow 指针在整个任务中不变。
+  改法：函数开头匹配 flow，分两个循环版本（有/无 flow），或用 match 在循环外分派。
+  对照审查：✅ 安全。
+
+【#21】run_gas_pressure_task 中 src_mass 读取后未使用
+  位置：c2_physics/gas_flow.rs:71, 73
+  问题：读了 cells.mass.get(src) 但 let _ = src_mass，浪费一次内存访问。
+  改法：删除未使用的读取。
+  对照审查：✅ 安全。原版 L42064 fVar39=mass 后续在 UpdatePressure 内部重新读，
+        调用方未使用 src_mass。
+
+【#22】气体对角方向 corner_blocked 每次查两个元素表
+  位置：c2_physics/gas_flow.rs:134-143
+  问题：每格对角方向都查 h_neighbor 和 v_neighbor 的 pressure data（2 次查表）。
+  改法：可在循环内缓存邻居 state，或预计算 state 数组。
+  对照审查：✅ 安全。
+
+【#23】do_state_transition 中 game_cell_of 闭包每次做除法取模
+  位置：c2_physics/temperature.rs:431-435
+  问题：闭包内 c / width 和 c % width，每格相变时调用。
+  改法：循环外预计算 row/col 传入。
+  对照审查：✅ 安全。但 do_state_transition 只在相变时调用（概率低），影响小。
+
+================================================================================
+八、第三轮：辐射/疾病/纹理/事件模块发现的优化点（#24-#30）
+================================================================================
+
+【#24】辐射模块 occlusion Vec 每区域每子步分配
+  位置：c2_physics/radiation.rs:89
+  问题：let mut occlusion = vec![1.0f32; rw * rh]; 每区域每子步分配。
+  改法：预分配可复用缓冲，或用 SmallVec（区域通常 ≤ 256×256）。
+  对照审查：✅ 安全。原版用全局字段 resize，Rust 用区域局部缓冲是为并行安全。
+        改分配方式不改变计算。
+
+【#25】辐射第二遍 25 格核内重复解引用 updated_cells.ptr
+  位置：c2_physics/radiation.rs:166
+  问题：for &(dx,dy,weight) in &KERNEL 循环内每次 let u = unsafe { &mut *sim.updated_cells.ptr }。
+        25 次循环解引用 25 次。
+  改法：提到核循环外。
+  对照审查：✅ 安全。
+
+【#26】辐射第二遍每格多次解引用 updated_cells.ptr
+  位置：c2_physics/radiation.rs:137, 166, 174, 185, 189
+  问题：同一格的处理中解引用 5 次（衰减、扩散、病菌、宇宙、钳制）。
+  改法：提到格循环外，用一个 u 引用贯穿。
+  对照审查：✅ 安全。
+
+【#27】阳光纹理 sun Vec 每世界每帧分配
+  位置：c2_physics/property_texture.rs:86
+  问题：let mut sun = vec![1.0f32; w_w]; 每世界每帧分配。
+  改法：预分配可复用缓冲，或用栈数组（世界宽度通常 ≤ 384）。
+  对照审查：✅ 安全。
+
+【#28】疾病 get_diffusion_scale 大量边界检查
+  位置：c2_physics/disease.rs:81-110
+  问题：每次病菌扩散做 6 次边界检查（disease_idx/element_idx/disease_count/
+        infestation_tick_count + diseases 索引 + elem_growth_info 三个数组）。
+  改法：提供 unchecked 变体，在循环边界已保证时使用。
+  对照审查：✅ 安全（需验证调用方边界）。原版直接指针访问无检查。
+
+【#29】疾病 calculate_range_half_life 循环查找可改为 if-else 链
+  位置：c2_physics/disease.rs:53-59
+  问题：for i in 0..4 循环查找第一个 temp <= vals[i]，只有 4 个元素，
+        循环开销（计数器、比较、break）大于直接 if-else 链。
+  改法：用 if-else 链展开。
+  对照审查：✅ 安全。纯控制流变换，结果一致。
+
+【#30】辐射 G_DISEASE.lock() 每区域每子步调用
+  位置：c2_physics/radiation.rs:71
+  问题：let ptr = crate::globals::G_DISEASE.lock().0; 每区域每子步加锁读指针。
+  改法：在 run_region_physics_c 外获取一次 disease 指针，作为参数传入。
+  对照审查：✅ 安全。只是读指针，不改变数据。
+
+================================================================================
+九、安全性汇总（最终）
+================================================================================
+  确认安全可直接做：#1, #2, #3, #4, #5, #8, #9, #11, #12,
+                    #13, #14, #16, #17, #18, #19, #20, #21, #22, #23,
+                    #24, #25, #26, #27, #28, #29, #30 （共 26 个）
+  需谨慎实施：#6（需精确脏格追踪）, #7（需逐循环验证边界）,
+              #15（f64→f32 改变数值精度，需确认是否对齐原版） （共 3 个）
+  不建议做：#10（阶段 B 并行化风险太高） （共 1 个）
+  总计：30 个优化点
+================================================================================

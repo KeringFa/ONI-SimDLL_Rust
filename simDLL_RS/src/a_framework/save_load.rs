@@ -155,6 +155,15 @@ pub fn handle_allocate_cells(reader: &mut BinaryBufferReader) -> *mut c_void {
     // 显式清空避免"上个存档辐射残留"（旧发射器继续向新世界发射）。
     crate::c_simulation::radiation_emitter::clear_radiation_emitters();
     crate::c_simulation::disease_component::clear_disease_emitters();
+    // 同类全局静态注册表（原版均随 SimData 重建）：ElementEmitter 漏清会携带
+    // 上一局 callbackManager 的旧句柄 → EMBARK 首帧 callback_info 越界崩溃；
+    // ElementChunk / BuildingTemperature / BuildingToBuilding / DiseaseConsumer
+    // 同为"全局静态 vs 原版随 SimData"模式，一并清空防残留。
+    crate::c_simulation::element_emitter::clear_element_emitters();
+    crate::c_simulation::element_chunk::clear_element_chunks();
+    crate::c_simulation::building_temperature::clear_building_temperature();
+    crate::c_simulation::building_to_building::clear_building_to_building();
+    crate::c_simulation::disease_component::clear_disease_consumers();
 
     tracing::info!(width, height, flag1, flag2, "AllocateCells done");
     sim_data_ptr as *mut c_void
@@ -463,6 +472,11 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
     if version < 0xb {
         sim_data.init_settle_thermal_boundaries = true;
     }
+
+    crate::c_simulation::sim_data_ops::derive_natural_solid_strength(
+        sim_data,
+        crate::d1_activity::full_grid_bounds(sim_data),
+    );
 
     tracing::info!(version, save_width, save_height, x_offset, y_offset, "Load done");
     sim_data_ptr as *mut c_void
@@ -1468,6 +1482,12 @@ pub fn handle_initialize_from_cells(reader: &mut BinaryBufferReader) -> *mut c_v
     global_sim_data.0 = new_ptr;
     crate::c_simulation::radiation_emitter::clear_radiation_emitters();
     crate::c_simulation::disease_component::clear_disease_emitters();
+    // 同 handle_allocate_cells：新世界分配 = 存档切换，清空全部全局静态注册表。
+    crate::c_simulation::element_emitter::clear_element_emitters();
+    crate::c_simulation::element_chunk::clear_element_chunks();
+    crate::c_simulation::building_temperature::clear_building_temperature();
+    crate::c_simulation::building_to_building::clear_building_to_building();
+    crate::c_simulation::disease_component::clear_disease_consumers();
 
     unsafe {
         let sim_data = &mut *new_ptr;
@@ -1484,12 +1504,14 @@ pub fn handle_initialize_from_cells(reader: &mut BinaryBufferReader) -> *mut c_v
                 cells.element_idx.set(dst, reader.read_u16_at(src).unwrap_or(0));
                 cells.properties.set(dst, reader.read_u8_at(src + 2).unwrap_or(0));
                 cells.insulation.set(dst, reader.read_u8_at(src + 3).unwrap_or(0));
-                cells.strength_info.set(dst, reader.read_u8_at(src + 4).unwrap_or(0));
+                let strength = reader.read_u8_at(src + 4).unwrap_or(0);
+                cells.strength_info.set(dst, strength);
                 cells.temperature.set(dst, reader.read_f32_at(src + 8).unwrap_or(0.0));
                 cells.mass.set(dst, reader.read_f32_at(src + 12).unwrap_or(0.0));
                 cells.radiation.set(dst, 0.0);
             }
         }
+
         // 循环 2：DiseaseCell → updated_cells（对照 L24323-24372）
         for row in 0..height as usize {
             for col in 0..msg_width {
@@ -1513,6 +1535,10 @@ pub fn handle_initialize_from_cells(reader: &mut BinaryBufferReader) -> *mut c_v
         }
 
         // Settle + InitializeBoundary（对照 L24416-24419）
+        crate::c_simulation::sim_data_ops::derive_natural_solid_strength(
+            sim_data,
+            crate::d1_activity::full_grid_bounds(sim_data),
+        );
         sim_data.settle_thermal_boundaries();
         sim_data.initialize_boundary();
     }
@@ -1886,20 +1912,20 @@ mod tests {
 
     #[test]
     fn clean_up_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
     }
 
     #[test]
     fn clean_up_with_null_globals_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         clean_up();
     }
 
     #[test]
     fn handle_allocate_cells_returns_non_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let mut w = BinaryBufferWriter::new();
@@ -1928,7 +1954,7 @@ mod tests {
 
     #[test]
     fn handle_allocate_cells_replaces_old_sim_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 第一次分配
@@ -1961,7 +1987,7 @@ mod tests {
 
     #[test]
     fn allocate_cells_clears_radiation_emitter_registry() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         crate::c_simulation::radiation_emitter::clear_radiation_emitters();
 
@@ -2011,8 +2037,148 @@ mod tests {
     }
 
     #[test]
+    fn allocate_cells_clears_all_global_registries() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        clean_up();
+        // 清空所有全局注册表（避免跨测试污染）
+        crate::c_simulation::element_emitter::clear_element_emitters();
+        crate::c_simulation::element_chunk::clear_element_chunks();
+        crate::c_simulation::building_temperature::clear_building_temperature();
+        crate::c_simulation::building_to_building::clear_building_to_building();
+        crate::c_simulation::disease_component::clear_disease_consumers();
+        crate::c_simulation::radiation_emitter::clear_radiation_emitters();
+        crate::c_simulation::disease_component::clear_disease_emitters();
+
+        // 建最小元素表：elem5 液态（SHC=2.0、TC=4.0、low=200、high=5000）。
+        {
+            use crate::b_elements::element::ElementTemperatureData;
+            let mut table = crate::b_elements::elements_table::G_ELEMENTS_TABLE.lock().unwrap();
+            table.elements.clear();
+            table.element_names.clear();
+            table.state_data.clear();
+            table.liquid_data.clear();
+            table.pressure_data.clear();
+            table.post_process_data.clear();
+            table.temperature_data.clear();
+            let mut etd = ElementTemperatureData::default();
+            etd.state = 2;
+            etd.specific_heat_capacity = 2.0;
+            etd.thermal_conductivity = 4.0;
+            etd.high_temp = 5000.0;
+            etd.low_temp = 200.0;
+            table.elements.resize(6, crate::b_elements::element::Element::default());
+            table.temperature_data.resize(6, ElementTemperatureData::default());
+            table.temperature_data[5] = etd;
+        }
+
+        // 模拟上个存档：每个全局注册表各残留 1 条记录。
+        let mut sd = crate::a_framework::sim_data::SimData::new_for_allocate(8, 8, 1, true, false);
+        sd.vacuum_element_idx = 0;
+        let h_emitter = crate::c_simulation::element_emitter::add_element_emitter(
+            &mut sd,
+            &crate::c_simulation::element_emitter::AddElementEmitterMsg::default(),
+        );
+        assert!(h_emitter >= 0, "前置：element_emitter 注册失败");
+        let h_chunk = crate::c_simulation::element_chunk::add_element_chunk(
+            8,
+            &crate::c_simulation::element_chunk::AddElementChunkMsg {
+                game_cell: 0,
+                callback_idx: 7,
+                mass: 100.0,
+                temperature: 300.0,
+                surface_area: 2.0,
+                thickness: 0.5,
+                ground_transfer_scale: 0.5,
+                element_idx: 5,
+                pad: [0; 2],
+            },
+        );
+        assert!(h_chunk >= 0, "前置：element_chunk 注册失败");
+        let h_building = crate::c_simulation::building_temperature::add_building(
+            &crate::a_framework::sim_events::AddBuildingHeatExchangeMsg {
+                callback_idx: 7,
+                elem_idx: 5,
+                pad0: 0,
+                pad1: 0,
+                mass: 100.0,
+                temperature: 300.0,
+                thermal_conductivity: 1.0,
+                overheat_temperature: 2000.0,
+                operating_kilowatts: 0.0,
+                min_x: 1,
+                min_y: 2,
+                max_x: 2,
+                max_y: 3,
+            },
+        );
+        assert!(h_building >= 0, "前置：building_temperature 注册失败");
+        let h_b2b =
+            crate::c_simulation::building_to_building::register_building_to_building(7, h_building);
+        assert!(h_b2b >= 0, "前置：building_to_building 注册失败");
+        // disease_consumer：C# 无发送方，但防御链路注册表同样应被清空。
+        let mut frame = crate::a_framework::sim_frame_manager::SimFrameInfo::default();
+        for &b in &0i32.to_le_bytes() {
+            frame.disease_consumer_messages.adds.push_unchecked(b);
+        }
+        for &b in &(-1i32).to_le_bytes() {
+            frame.disease_consumer_messages.adds.push_unchecked(b);
+        }
+        for _ in 0..4 {
+            frame.disease_consumer_messages.adds.push_unchecked(0);
+        }
+        crate::c_simulation::disease_component::process_disease_consumer_messages(&frame, &mut sd);
+
+        // 前置：各注册表均有残留
+        assert_eq!(crate::c_simulation::element_emitter::element_emitter_count(), 1);
+        assert_eq!(crate::c_simulation::element_chunk::element_chunk_count(), 1);
+        assert_eq!(
+            crate::c_simulation::building_temperature::building_temperature_count(),
+            1
+        );
+        assert_eq!(
+            crate::c_simulation::building_to_building::building_to_building_count(),
+            1
+        );
+        assert_eq!(crate::c_simulation::disease_component::disease_consumer_count(), 1);
+
+        // 新世界分配（存档切换）→ 全部清空，否则旧句柄/旧数据残留在新局生效
+        let mut w2 = BinaryBufferWriter::new();
+        w2.write_int(4);
+        w2.write_int(4);
+        w2.write_bool(true);
+        w2.write_bool(false);
+        let mut reader = BinaryBufferReader::new(&w2.into_bytes());
+        let result = handle_allocate_cells(&mut reader);
+        assert!(!result.is_null());
+        assert_eq!(
+            crate::c_simulation::element_emitter::element_emitter_count(),
+            0,
+            "element_emitter 必须清空（EMBARK 首帧旧句柄越界崩溃根因）"
+        );
+        assert_eq!(crate::c_simulation::element_chunk::element_chunk_count(), 0);
+        assert_eq!(
+            crate::c_simulation::building_temperature::building_temperature_count(),
+            0
+        );
+        assert_eq!(
+            crate::c_simulation::building_to_building::building_to_building_count(),
+            0
+        );
+        assert_eq!(crate::c_simulation::disease_component::disease_consumer_count(), 0);
+
+        crate::c_simulation::element_emitter::clear_element_emitters();
+        crate::c_simulation::element_chunk::clear_element_chunks();
+        crate::c_simulation::building_temperature::clear_building_temperature();
+        crate::c_simulation::building_to_building::clear_building_to_building();
+        crate::c_simulation::disease_component::clear_disease_consumers();
+        crate::c_simulation::radiation_emitter::clear_radiation_emitters();
+        crate::c_simulation::disease_component::clear_disease_emitters();
+        clean_up();
+    }
+
+    #[test]
     fn handle_load_invalid_magic_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let data = [0u8; 32]; // 全零，magic 不匹配
@@ -2024,7 +2190,7 @@ mod tests {
 
     #[test]
     fn handle_load_null_sim_data_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 有效 magic 但 gSimData 为 null
@@ -2043,7 +2209,7 @@ mod tests {
 
     #[test]
     fn handle_load_valid_save_returns_sim_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 先 AllocateCells（2x2，含边界 4x4=16 cells）
@@ -2092,7 +2258,7 @@ mod tests {
 
     #[test]
     fn handle_load_high_version_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let mut w = BinaryBufferWriter::new();
@@ -2106,7 +2272,7 @@ mod tests {
 
     #[test]
     fn handle_start_null_sim_data_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         let data = [0u8; 16];
         let mut reader = BinaryBufferReader::new(&data);
@@ -2116,7 +2282,7 @@ mod tests {
 
     #[test]
     fn prepare_game_data_update_returns_non_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let gd = GameData::new(2, 2);
@@ -2128,7 +2294,7 @@ mod tests {
 
     #[test]
     fn prepare_game_data_update_fills_soa_pointers() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 创建有数据的 GameData
@@ -2154,7 +2320,7 @@ mod tests {
 
     #[test]
     fn handle_start_full_flow_returns_gdu_pointer() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 1. AllocateCells (2x2, 含边界 4x4)
@@ -2209,7 +2375,7 @@ mod tests {
 
     #[test]
     fn begin_save_null_sim_data_returns_null_and_zero_size() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         let mut size: std::os::raw::c_int = -1;
         let result = begin_save(&mut size, 0, 0);
@@ -2220,7 +2386,7 @@ mod tests {
 
     #[test]
     fn begin_save_null_out_size_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         let result = begin_save(std::ptr::null_mut(), 0, 0);
         assert!(result.is_null());
@@ -2229,7 +2395,7 @@ mod tests {
 
     #[test]
     fn begin_save_returns_valid_buffer_with_correct_size() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 先 AllocateCells（2x2，含边界 4x4=16 cells）
@@ -2263,7 +2429,7 @@ mod tests {
 
     #[test]
     fn begin_save_converts_ffff_backwall_to_vacuum_hash() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 填最小元素表：真空 id=0x2d39bf75 在索引 211。
@@ -2319,7 +2485,7 @@ mod tests {
     fn load_disease_8b_per_cell_keeps_backwall_aligned() {
         // 回归测试：太空删除根因——原版 Load 的 disease 段是 8B/格（hash+count）。
         // 若只读 4B/格，背墙段会整体偏移 4B/格，全图背墙读成 0xFFFF。
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 最小元素表：真空 id=0x2d39bf75 → 索引 211。
@@ -2389,7 +2555,7 @@ mod tests {
 
     #[test]
     fn end_save_releases_buffer() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 先 AllocateCells + BeginSave
@@ -2418,7 +2584,7 @@ mod tests {
 
     #[test]
     fn end_save_with_null_buffer_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         end_save(); // 无 SaveBuffer，不应 panic
         clean_up();
@@ -2468,7 +2634,7 @@ mod tests {
 
     #[test]
     fn handle_initialize_from_cells_populates_sim_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let data = build_initialize_from_cells_message();
@@ -2513,7 +2679,7 @@ mod tests {
 
     #[test]
     fn handle_initialize_from_cells_initializes_boundary() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let data = build_initialize_from_cells_message();
@@ -2544,7 +2710,7 @@ mod tests {
 
     #[test]
     fn handle_load_applies_y_offset_when_placing_world() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 元素表：vacuum=211，测试元素=200
@@ -2642,7 +2808,7 @@ mod tests {
 
     #[test]
     fn handle_initialize_from_cells_rejects_truncated_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let mut data = build_initialize_from_cells_message();
@@ -2656,7 +2822,7 @@ mod tests {
 
     #[test]
     fn handle_initialize_from_cells_replaces_old_sim_data() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 先经 AllocateCells 放一个旧 SimData
@@ -2688,7 +2854,7 @@ mod tests {
     /// 逐行读 (width−2) 字节写入 row×width+1）。
     #[test]
     fn handle_set_world_zones_allocates_and_writes_rows() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let data = build_initialize_from_cells_message();
@@ -2737,7 +2903,7 @@ mod tests {
 
     #[test]
     fn handle_define_world_offsets_populates_worlds() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         init_min_elements_for_dlc_handlers();
 
@@ -2780,7 +2946,7 @@ mod tests {
 
     #[test]
     fn handle_clear_unoccupied_cells_resets_all_cells_to_vacuum() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         init_min_elements_for_dlc_handlers();
 
@@ -2830,7 +2996,7 @@ mod tests {
 
     #[test]
     fn handle_resize_and_initialize_vacuum_cells_fills_region() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         init_min_elements_for_dlc_handlers();
 
@@ -2890,7 +3056,7 @@ mod tests {
 
     #[test]
     fn handle_free_grid_cells_clears_region_and_removes_world() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
         init_min_elements_for_dlc_handlers();
 
@@ -2986,7 +3152,7 @@ mod tests {
 
     #[test]
     fn handle_create_disease_table_sets_global() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let data = make_disease_table_message(1, 0, 0x11223344);
@@ -3008,7 +3174,7 @@ mod tests {
 
     #[test]
     fn handle_create_disease_table_replaces_old() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let data1 = make_disease_table_message(1, 0, 0x11111111);
@@ -3035,7 +3201,7 @@ mod tests {
 
     #[test]
     fn handle_create_disease_table_truncated_returns_null_and_keeps_old() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 先挂一张有效表
@@ -3067,7 +3233,7 @@ mod tests {
 
     #[test]
     fn clean_up_after_create_disease_table_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         let data = make_disease_table_message(3, 2, 0x55555555);
@@ -3082,7 +3248,7 @@ mod tests {
 
     #[test]
     fn handle_set_saved_options_clear_and_set_bits() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         clean_up();
 
         // 先经 AllocateCells 建 SimData

@@ -1,0 +1,98 @@
+切片尺寸下拉 UI 链路存档
+================================================
+
+背景：2026-09-05 决定全面下线温度切片（D4）后，Rust 侧以早期版本覆盖。
+C# 侧"切片尺寸下拉"改动**有意保留**（供未来换方案复用），此处存档完整链路，
+覆盖后可据此恢复。
+
+------------------------------------------------
+一、涉及文件（每个文件的角色）
+------------------------------------------------
+SimDLL_Rust/Options.cs
+    主改动。ShowOptionsDialog 里加「温度切片并行」下拉行；
+    新增 CloneResolutionDropdown() 方法（克隆游戏原生下拉）。
+    细节见下方「链路说明」。
+
+SimDLL_Rust/Native.cs
+    声明两个 Rust 导出（供 P/Invoke）：
+        RS_SetSliceEnabled(bool)   /   RS_SetSliceSize(int)
+    注：Rust 侧若已删实现，需保留 no-op stub 导出，否则 mod 加载崩。
+
+SimDLL_Rust/ModConfig.cs
+    新增配置项 SliceEnabled(默认 false) + SliceSize(默认 32, clamp 8~64)，
+    持久化到 config.json，Apply() 时调 RS_SetSliceEnabled/SliceSize。
+
+SimDLL_Rust/strings/Strings.cs
+    SLICE_SIZE_LABEL = "Temperature Slicing (Experimental)"
+    SLICE_HINT = 下拉用法说明（OFF=关；选尺寸=开）
+    （旧的 SLICE_ENABLED_LABEL 已删除）
+
+SimDLL_Rust/translations/zh.po
+    上述两条的简中翻译。
+
+SimDLL_Rust/本地化翻译对照.txt
+    人工对照表，含 D4 三条目。
+
+------------------------------------------------
+二、恢复方法（覆盖早期版本后）
+------------------------------------------------
+确保 SimDLL_Rust/ 下文件为早期版本（无下拉改动）后，在仓库根执行：
+
+    git apply "文档/切片尺寸下拉UI补丁.diff"
+
+补丁内容 = 22b2a55^..82c0b3d 对上述 6 文件的累积 diff（567 行）。
+已用 git apply --check --reverse 验证：与当前 HEAD 精确匹配。
+
+若无冲突直接 apply；若早期版本差异大，参考下面「链路说明」手工改。
+
+------------------------------------------------
+三、下拉链路说明（怎么克隆游戏原生下拉）
+------------------------------------------------
+目标：让玩家用**游戏自带**的固定式下拉选切片尺寸（兼容性最好），
+替代自绘 TMP 输入框。
+
+获取链（全序列化引用，ScreenPrefabs 常驻单例可达，无需某屏打开）：
+    ScreenPrefabs.Instance.OptionsScreen          // OptionsMenuScreen (public)
+      → Traverse 反射私有字段 graphicsOptionsScreenPrefab
+      → GraphicsOptionsScreen prefab (internal 类，反射取值不引用其类型)
+      → transform.Find("Content/DisplaySettings/Resolution/Resolution")
+      → GetComponent<Dropdown>()                   // UnityEngine.UI.Dropdown
+      → GetComponentInChildren<Dropdown>(true) 兜底（避开同屏"颜色模式"下拉）
+
+克隆后处理（CloneResolutionDropdown 方法内）：
+    1. Util.KInstantiateUI(source.gameObject, parent, true) 深拷贝
+    2. 收窄宽度：LayoutElement preferredWidth=80/minWidth=60/flexibleWidth=0
+       + RectTransform 左锚定（原分辨率下拉很宽）
+    3. cloned.ClearOptions() + onValueChanged.RemoveAllListeners()
+    4. 返回 Dropdown；调用方填 OFF/64x64/32x32/16x16/8x8 候选
+
+交互语义（用户定稿，勿改回）：
+    index 0 = "OFF"（默认项，关闭切片，保留上次尺寸便于重开）
+    index 1..4 = "64x64".."8x8"（选任一尺寸 = 启用切片）
+    分隔符用 ASCII 'x' 而非 '×'（U+00D7 字体兼容风险）
+    回显：开关关→OFF；开→对应尺寸；尺寸不在候选钳到最近合法项
+
+选项文案纯文本（Unity Dropdown OptionData 不走 LocText，中英混排风险）。
+
+------------------------------------------------
+四、关键坑（重做时避免）
+------------------------------------------------
+- NewRow() 返回 GameObject，CloneResolutionDropdown 要 Transform：
+  调用必须传 sliceSizeRowObj.transform（曾漏 .transform 编译不过，82c0b3d 修复）
+- railMenu 变量在 ShowOptionsDialog 方法顶层已声明（供预留核输入框用），
+  回退分支复用同一变量，勿重新 var 声明（编译错误）
+- GraphicsOptionsScreen 是 internal 类：全程反射取值 + cast public Component，
+  不要直接引用其类型（编译不过）
+- 克隆体带原 prefab 的选项与监听：必须先 ClearOptions + RemoveAllListeners，
+  否则把分辨率选项/回调带进 mod 面板
+
+------------------------------------------------
+五、C# 编译（覆盖后重编 SimDLL_Rust.dll）
+------------------------------------------------
+机器装 .NET 8 SDK 后（csproj 目标 net48 + LangVersion 9.0）：
+
+    cd SimDLL_Rust
+    dotnet build SimDLL_Rust.csproj -c Release
+
+csproj HintPath 已指向真实游戏库 ..\..\OxygenNotIncluded\OxygenNotIncluded_Data\Managed。
+（若覆盖的是早期 csproj，需核对 HintPath 是否存在。）

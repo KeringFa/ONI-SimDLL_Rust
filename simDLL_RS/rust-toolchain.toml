@@ -1,0 +1,22 @@
+# simDLL_RS 工具链锁定
+#
+# 作用：把 Rust 版本写进项目，任何人（包括重装系统后的你）在这个目录下执行
+#       cargo / rustc 时，rustup 会自动下载并使用这里指定的版本，
+#       不受机器上 "rustup default" 是什么的影响，也不会被 rustup update 悄悄改掉。
+#
+# 版本选择：1.98.0（2026-08-21 发布的当前 stable）。
+#   - 下限：Cargo.lock 是 v4 格式，Cargo 必须 >= 1.78 才能读；依赖里的
+#     windows 0.58 / rayon 1.12 / once_cell 1.21 也都在 1.7x 以上。
+#   - 上限：不追 nightly。本项目是发布给玩家的 cdylib，稳定优先。
+#
+# 升级方式：手动改这里的 channel，跑一次 `cargo build --release --features d3-rayon`
+#           验证能过再提交。不要无脑 `rustup update` 后不验证就发版。
+#
+# 注意：这个文件只管 Rust 编译器。Windows 上编译 cdylib 还必须有
+#       Visual Studio 生成工具（MSVC 的 link.exe），rustup 装不了，见仓库文档。
+
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"

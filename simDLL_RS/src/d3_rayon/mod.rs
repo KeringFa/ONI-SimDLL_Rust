@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn pool_size_is_physical_minus_reserve() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         // 固定默认预留数，避免与可配置测试并行交错影响池线程数
         assert_eq!(crate::d3_rayon::scheduler::RS_SetReservedCores(1), 1);
         let p = pool();
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn pool_builds_once_and_reuses() {
-        let _lock = crate::LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = crate::LIB_TESTS_LOCK.lock();
         let p1 = pool();
         let p2 = pool();
         assert!(std::ptr::eq(p1, p2), "线程池应只构建一次并复用");

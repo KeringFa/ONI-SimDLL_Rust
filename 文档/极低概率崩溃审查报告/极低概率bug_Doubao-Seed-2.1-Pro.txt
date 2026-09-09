@@ -1,0 +1,146 @@
+极低概率崩溃根因分析报告
+=====================================================================
+审查模型：Doubao-Seed-2.1-Pro
+审查日期：2026-08-11
+分析方法：系统化调试（根因调查 → 模式分析 → 数据流追踪）
+结论状态：根因已定位，未修改任何文件
+
+一、崩溃直接原因
+---------------------------------------------------------------------
+C# HandleVector<CallbackInfo>.IsVersionValid 访问 versions[index] 时数组越界，
+其中 index = callbackIdx & 0xFFFFFF。当 Rust 侧推送一个来自上个游戏会话的陈旧
+回调索引（如 300），而新世界的 C# callbackManager 仅有初始 256 项时，即触发
+ArgumentOutOfRangeException。
+
+崩溃堆栈：
+  ArgumentOutOfRangeException: Index was out of range
+    at HandleVector`1[T].IsVersionValid(Handle handle)
+    at Game.IsManuallyReleasedHandle(HandleVector<CallbackInfo>.Handle)
+    at Game.StepTheSim(float dt)
+    at Game.UnsafeSim200ms / SimEveryTick / Update
+
+二、根本原因：ELEMENT_EMITTER_MANAGER 全局静态管理器在世界切换时未清空
+---------------------------------------------------------------------
+
+1. 架构差异
+   原版 C++ simDLL 中，ElementEmitter 注册表是 Sim 对象的成员，随世界分配/销毁
+   自然重建。Rust 重写时将其改为全局静态单例：
+
+   文件：simDLL_RS/src/c_simulation/element_emitter.rs 第247-248行
+
+   static ELEMENT_EMITTER_MANAGER: Lazy<Mutex<ElementEmitterManager>> =
+       Lazy::new(|| Mutex::new(ElementEmitterManager::new()));
+
+   Lazy<Mutex<T>> 的生命周期等于整个 DLL 的生命周期，不会随世界销毁而清空。
+
+2. 清理逻辑遗漏
+   项目中已有 7 个全局管理器定义了 clear_*() 函数，但在世界分配的生产路径
+   handle_allocate_cells() 中只调用了 2 个：
+
+   管理器                          clear 函数                        allocate_cells  clean_up
+   -------------------------------------------------------------------------------------------
+   RadiationEmitterManager         clear_radiation_emitters()        是 (L156)       否
+   DiseaseEmitterRegistry          clear_disease_emitters()          是 (L157)       否
+   ElementEmitterManager           clear_element_emitters()          【缺失】         否
+   ElementChunkManager             clear_element_chunks()            否              否
+   BuildingTemperatureManager      clear_building_temperature()      否(仅测试)      否
+   BuildingToBuildingManager       clear_building_to_building()      否(仅测试)      否
+   DiseaseConsumerRegistry         clear_disease_consumers()         否(仅测试)      否
+
+   clean_up()（save_load.rs 第27-111行）释放了 gSim/gDisease/gSimData 等全局
+   指针，但没有调用任何 clear_*() 函数。
+
+   handle_initialize_from_cells()（save_load.rs 第1469-1470行）同样只清了
+   radiation/disease emitter，遗漏了 element emitter。
+
+3. 崩溃触发链
+
+   玩家玩游戏 A（注册 ElementEmitter，C# 分配回调句柄，如 cb_idx=300）
+       ↓
+   返回主菜单 → clean_up()（未清 ELEMENT_EMITTER_MANAGER，旧记录残留）
+       ↓
+   新建游戏 B → handle_allocate_cells()（只清了 radiation/disease，未清 element_emitter）
+       ↓
+   EMBARK → Start → sim 线程启动
+       ↓
+   首个 sim tick → run_region_emitters() → update_element_emitters()
+       ↓
+   遍历到陈旧发射器记录：
+     - cell 坐标碰巧落在新世界 region bounds 内
+     - blocked_state = 1（旧世界中被堵住）或 0xFF（旧世界中被停用）
+     - 新世界该格为真空（has_room = true）
+       ↓
+   blocked_state != 0 → 触发 unblocked 回调分支
+       ↓
+   events.callback_info.push(CallbackInfo { callback_idx: 300 })  // 旧索引！
+       ↓
+   C# Game.StepTheSim 遍历 callbackInfo
+       ↓
+   HandleVector.IsVersionValid: versions[300 & 0xFFFFFF] → versions[300]
+       ↓
+   callbackManager 初始仅 256 项（建筑尚未 OnSpawn 注册）
+       ↓
+   ArgumentOutOfRangeException → 崩溃
+
+   关键代码（element_emitter.rs 第439-461行）：
+
+   if has_room {
+       if rec.blocked_state != 0 {          // 陈旧记录 blocked_state=1 或 0xFF
+           let cb = rec.unblocked_cb_idx;   // 旧世界的回调索引（如 300）
+           rec.blocked_state = 0;
+           if cb != 0xFFFFFFFF {
+               events.callback_info.push(CallbackInfo {
+                   callback_idx: cb as i32,  // 推入陈旧索引 → C# 越界
+               });
+           }
+       }
+   }
+
+4. 为何"极低概率"
+   需要同时满足多个条件：
+
+   (1) 必须先玩过一局游戏（DLL 加载后直接新建游戏不会触发，因为 Lazy 初始化为空 Vec）
+   (2) 必须返回主菜单再新建游戏（不重启应用程序，让静态变量残留）
+   (3) 旧发射器的 cell 坐标必须落在新世界的 region bounds 内
+       （区域过滤在 element_emitter.rs 第403-409行）
+   (4) blocked_state 必须发生跳变（旧世界被堵住=1，新世界真空有空间 → 触发 unblocked 回调）
+   (5) 旧回调索引必须 ≥ 256（超过新世界 callbackManager 初始容量；若旧世界建筑少，
+       cb_idx < 256 则不会越界，只会版本不匹配）
+
+   这解释了 bug 文档中"n=2 首次崩、后续新建大量游戏未再崩"的现象——复现条件苛刻。
+
+三、已排除的路径（复核确认）
+---------------------------------------------------------------------
+1. frame_processor 中 3 处 callback_info push（dig L146、set_cell_properties L369、
+   cell_modifications L505）均来自当前帧 C# 消息，且过滤了 callback_idx != -1，
+   不会产生陈旧数据。
+2. ModifyCellMessage 与 Rust CellModification 布局一致，消息解析无错位。
+3. AddElementEmitterMessage 与 Rust AddElementEmitterMsg 布局一致（16B）。
+4. element_emitter 事件在 d3 阶段 B 串行执行，无并行竞争。
+5. disease_component 推送的是 component_state_changed_messages（非 callback_info），
+   不直接导致本次越界。
+
+四、其他发现（潜在隐患）
+---------------------------------------------------------------------
+虽然本次崩溃的直接根因是 ElementEmitterManager 未清理，但以下管理器同样未在
+世界切换时清理，虽不直接导致本次 callback_info 越界，但可能引发其他陈旧数据问题：
+
+1. ElementChunkManager：存储碎片温度/相变状态，未清理可能导致新世界出现异常
+   温度/相变回调（element_chunk_melted_info）。
+2. BuildingTemperatureManager / BuildingToBuildingManager：存储建筑热交换记录，
+   未清理可能导致新世界建筑温度异常（building_overheat_info /
+   building_no_longer_overheated_info / building_melted_info）。
+3. DiseaseConsumerRegistry：存储病菌消费者，未清理可能导致新世界病菌计算错误。
+
+这些管理器在原版 C++ 中随 Sim 对象重建，Rust 改为全局静态后应统一在
+handle_allocate_cells() 和 handle_initialize_from_cells() 中清空，
+与 radiation/disease emitter 保持一致。
+
+五、修复方向（仅供参考，本次未修改任何文件）
+---------------------------------------------------------------------
+1. 在 save_load.rs 第156-157行已有清理逻辑旁，补充 clear_element_emitters() 调用。
+2. 同样在 handle_initialize_from_cells() 第1469-1470行补充。
+3. 建议一并补充 clear_element_chunks()、clear_building_temperature()、
+   clear_building_to_building()、clear_disease_consumers()，确保所有全局静态
+   管理器在世界切换时统一重建。
+4. 也可考虑在 clean_up() 中统一调用所有 clear_*()，作为退出游戏时的兜底清理。

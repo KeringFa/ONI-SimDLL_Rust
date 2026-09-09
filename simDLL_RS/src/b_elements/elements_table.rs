@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn get_element_by_idx_returns_element_or_none() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut table = G_ELEMENTS_TABLE.lock().unwrap();
         table.elements.clear();
         let mut e = Element::default();
@@ -709,34 +709,34 @@ mod tests {
 
     #[test]
     fn create_elements_table_with_null_reader_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let result = CreateElementsTable(std::ptr::null_mut());
         assert!(result.is_null());
     }
 
     #[test]
     fn get_element_index_with_empty_table_returns_invalid() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let result = GetElementIndex(999);
         assert_eq!(result, INVALID_ELEMENT_INDEX);
     }
 
     #[test]
     fn destroy_elements_table_does_not_panic() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         DestroyElementsTable();
     }
 
     #[test]
     fn create_element_interactions_with_null_reader_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let result = CreateElementInteractions(std::ptr::null_mut());
         assert!(result.is_null());
     }
 
     #[test]
     fn create_element_interactions_locked_with_null_reader_returns_null() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let result = CreateElementInteractionsLocked(std::ptr::null_mut());
         assert!(result.is_null());
     }
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn post_process_data_field_mapping_matches_source() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         use crate::a_framework::buffer::{BinaryBufferReader, BinaryBufferWriter};
 
         // 构造 1 个 Element，给关键字段赋可识别值
@@ -832,7 +832,7 @@ mod tests {
 
     #[test]
     fn get_element_liquid_data_returns_filled_entry() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_single_element_table();
         let ld = get_element_liquid_data(0);
         assert!(ld.is_some());
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn get_element_pressure_data_returns_filled_entry() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_single_element_table();
         let pd = get_element_pressure_data(0);
         assert!(pd.is_some());
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn get_element_property_texture_data_returns_filled_entry() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         create_single_element_table();
         let ptd = get_element_property_texture_data(0);
         assert!(ptd.is_some());
@@ -864,7 +864,7 @@ mod tests {
     /// refresh 后指针非空且指向克隆数据；destroy 后置 null（回退 Mutex）。
     #[test]
     fn elements_snapshot_publish_and_destroy() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         destroy_elements_table();
         assert!(ELEMENTS_SNAPSHOT.load(Ordering::Acquire).is_null(), "初始无快照");
 

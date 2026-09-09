@@ -173,6 +173,16 @@ pub fn clear_building_to_building() {
     B2B_MANAGER.lock().clear();
 }
 
+/// 测试/诊断：当前活跃建筑-建筑换热记录数。
+pub fn building_to_building_count() -> usize {
+    B2B_MANAGER
+        .lock()
+        .items
+        .iter()
+        .filter(|&&ri| ri >= 0)
+        .count()
+}
+
 /// 处理 RegisterBuildingToBuildingHeatExchange 消息（原版 L138121）。
 pub fn register_building_to_building(callback_idx: i32, heat_exchange_handle: i32) -> i32 {
     B2B_MANAGER
@@ -390,7 +400,7 @@ mod tests {
 
     #[test]
     fn register_and_contacts_and_unregister() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_building_table();
         let mut mgr = BuildingToBuildingManager::new();
         // Register：校验建筑句柄存在（callbackIdx 回调由 frame_processor 负责，见任务 4）
@@ -414,7 +424,7 @@ mod tests {
 
     #[test]
     fn update_exchanges_between_building_and_contact() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_building_table();
         // 建筑 A：totalHC=1000、TC=4、300°C；接触 B：totalHC=2000、TC=2、400°C
         let a = add_building(&bldg_msg(300.0, 1000.0, 4.0));
@@ -436,7 +446,7 @@ mod tests {
 
     #[test]
     fn update_emits_overheat_on_contact() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_building_table();
         let a = add_building(&bldg_msg(300.0, 1000.0, 4.0));
         let mut bmsg = bldg_msg(400.0, 2000.0, 2.0);
@@ -455,7 +465,7 @@ mod tests {
 
     #[test]
     fn update_emits_no_longer_overheated_on_contact() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_building_table();
         let a = add_building(&bldg_msg(300.0, 1000.0, 4.0));
         let mut bmsg = bldg_msg(400.0, 2000.0, 2.0);
@@ -474,7 +484,7 @@ mod tests {
 
     #[test]
     fn update_data_runs_building_to_building() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         init_building_table();
         crate::c_simulation::building_temperature::clear_building_temperature();
         crate::c_simulation::building_to_building::clear_building_to_building();

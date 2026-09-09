@@ -103,30 +103,6 @@ emit!(
 );
 
 impl RegionEvents {
-    /// 把 `other` 的全部条目追加到本缓冲**尾部**（缓冲对缓冲，不碰全局）。
-    ///
-    /// 用途：D4 把温度提升为跨区域全局并行后，各区域的温度事件必须先于本区域的
-    /// 气体/液体事件进入同一份区域缓冲，阶段 A 结束时再由既有 `merge_into`
-    /// 按区域序落盘 —— 这样全局事件顺序才与原版「逐区域 温度→气体→液体」一致。
-    /// 追加后 `other` 不清空（调用方决定归属，避免误删尚需合并的数据）。
-    pub fn append_from(&mut self, other: &RegionEvents) {
-        macro_rules! seg {
-            ($f:ident) => {
-                for i in 0..other.$f.len() {
-                    self.$f.push(other.$f.get(i));
-                }
-            };
-        }
-        seg!(substance_change_info);
-        seg!(spawn_liquid_info);
-        seg!(spawn_ore_info);
-        seg!(unstable_cell_info);
-        seg!(cell_melted_info);
-        seg!(spawn_fx_info);
-        seg!(world_damage_info);
-        seg!(backwall_should_transition_info);
-    }
-
     /// 按区域序合并进全局 SimEvents（字段声明顺序 = 原版区域串行 push 顺序），
     /// 合并后清空本区域缓冲（阶段 A/C 各合并一次，防重复追加）。
     pub fn merge_into(&mut self, sim: &mut SimData) {
@@ -185,7 +161,7 @@ mod tests {
 
     #[test]
     fn sink_routes_to_region_events() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut region = RegionEvents::default();
         let mut sim = dummy_sim();
         with_region_sink(&mut region as *mut RegionEvents, || {
@@ -199,7 +175,7 @@ mod tests {
 
     #[test]
     fn no_sink_writes_global() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut sim = dummy_sim();
         emit_substance_change(&mut sim, SubstanceChangeInfo::default());
         let events = unsafe { &*sim.sim_events.ptr };
@@ -208,7 +184,7 @@ mod tests {
 
     #[test]
     fn with_region_sink_restores_previous() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut r_outer = RegionEvents::default();
         let mut r_inner = RegionEvents::default();
         let mut sim = dummy_sim();
@@ -224,7 +200,7 @@ mod tests {
 
     #[test]
     fn merge_into_appends_in_field_order_and_clears() {
-        let _lock = LIB_TESTS_LOCK.lock().unwrap();
+        let _lock = LIB_TESTS_LOCK.lock();
         let mut region = RegionEvents::default();
         region
             .substance_change_info

@@ -12,8 +12,6 @@ pub mod d1_activity;
 pub mod d2_thread;
 #[cfg(feature = "d3-rayon")]
 pub mod d3_rayon;
-#[cfg(feature = "d4-slice")]
-pub mod d4_slice;                 // 新增
 
 pub mod globals {
     //! 全局静态变量，对应原版 simDLL 的全局状态。
@@ -155,4 +153,7 @@ pub extern "system" fn DllMain(
 /// 跨模块共享的测试序列化锁：串行化所有操作全局状态的 lib 单元测试，
 /// 避免并行执行导致 setup 互相覆盖。
 #[cfg(test)]
-pub(crate) static LIB_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 2026-08-10：std::sync::Mutex 在持锁测试 panic 时 poison → 后续所有
+    // `lock().unwrap()` 测试级联失败（曾出现单次 338/95 失败）。改 parking_lot
+    // （不 poison），使偶发断言失败不再级联，便于定位真实失败点。
+    pub(crate) static LIB_TESTS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());

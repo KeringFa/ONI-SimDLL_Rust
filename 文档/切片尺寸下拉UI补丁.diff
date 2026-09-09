@@ -1,0 +1,567 @@
+diff --git a/SimDLL_Rust/ModConfig.cs b/SimDLL_Rust/ModConfig.cs
+index 714c206..8775f2c 100644
+--- a/SimDLL_Rust/ModConfig.cs
++++ b/SimDLL_Rust/ModConfig.cs
+@@ -24,6 +24,23 @@ namespace SimDLL_Rust
+         /// 启用超线程优化（方向 1：1 星 1 线程）。默认 false；无超线程 CPU 不可用。
+         public static bool HyperThreadOptimizationEnabled { get; private set; } = false;
+ 
++        /// 预留物理线程数（1~4，默认 1）：留给游戏主线程/系统，D1/D2 并行路径通用。
++        public static int ReservedCores { get; private set; } = DEFAULT_RESERVED_CORES;
++
++        public const int DEFAULT_RESERVED_CORES = 1;
++        public const int MAX_RESERVED_CORES = 4;
++
++        /// 启用 D4 切片并行（实验性）。默认 false（与 Rust 侧默认 true 不同——
++        /// Rust 侧默认值是接口 mod 未适配时的兜底；C# 侧接管后以玩家配置为准）。
++        public static bool SliceEnabled { get; private set; } = false;
++
++        /// D4 切片边长（8~64，默认 32）。
++        public static int SliceSize { get; private set; } = DEFAULT_SLICE_SIZE;
++
++        public const int DEFAULT_SLICE_SIZE = 32;
++        public const int MIN_SLICE_SIZE = 8;
++        public const int MAX_SLICE_SIZE = 64;
++
+         public static void Load(string path)
+         {
+             modPath = path;
+@@ -38,6 +55,9 @@ namespace SimDLL_Rust
+                     {
+                         LogEnabled = data.LogEnabled;
+                         HyperThreadOptimizationEnabled = data.HyperThreadOptimizationEnabled;
++                        ReservedCores = ClampReservedCores(data.ReservedCores);
++                        SliceEnabled = data.SliceEnabled;
++                        SliceSize = ClampSliceSize(data.SliceSize);
+                     }
+                 }
+             }
+@@ -45,6 +65,9 @@ namespace SimDLL_Rust
+             {
+                 LogEnabled = true;
+                 HyperThreadOptimizationEnabled = false;
++                ReservedCores = DEFAULT_RESERVED_CORES;
++                SliceEnabled = false;
++                SliceSize = DEFAULT_SLICE_SIZE;
+             }
+         }
+ 
+@@ -66,10 +89,48 @@ namespace SimDLL_Rust
+             }
+         }
+ 
+-        /// 应用当前配置到 Rust 日志（调用 RS_SetLogEnabled）。
++        public static void SetReservedCores(int value)
++        {
++            int clamped = ClampReservedCores(value);
++            if (ReservedCores != clamped)
++            {
++                ReservedCores = clamped;
++                Dirty = true;
++            }
++        }
++
++        public static int ClampReservedCores(int value)
++            => Math.Min(Math.Max(value, DEFAULT_RESERVED_CORES), MAX_RESERVED_CORES);
++
++        public static void SetSliceEnabled(bool value)
++        {
++            if (SliceEnabled != value)
++            {
++                SliceEnabled = value;
++                Dirty = true;
++            }
++        }
++
++        public static void SetSliceSize(int value)
++        {
++            int clamped = ClampSliceSize(value);
++            if (SliceSize != clamped)
++            {
++                SliceSize = clamped;
++                Dirty = true;
++            }
++        }
++
++        public static int ClampSliceSize(int value)
++            => Math.Min(Math.Max(value, MIN_SLICE_SIZE), MAX_SLICE_SIZE);
++
++        /// 应用当前配置到 Rust（日志 / 预留核 / D4 切片开关与尺寸）。
+         public static void Apply()
+         {
+             Native.RS_SetLogEnabled(LogEnabled);
++            Native.RS_SetReservedCores(ReservedCores);
++            Native.RS_SetSliceEnabled(SliceEnabled);
++            Native.RS_SetSliceSize(SliceSize);
+         }
+ 
+         public static void Save()
+@@ -83,6 +144,9 @@ namespace SimDLL_Rust
+                 {
+                     LogEnabled = LogEnabled,
+                     HyperThreadOptimizationEnabled = HyperThreadOptimizationEnabled,
++                    ReservedCores = ReservedCores,
++                    SliceEnabled = SliceEnabled,
++                    SliceSize = SliceSize,
+                 };
+                 File.WriteAllText(configPath, JsonConvert.SerializeObject(data, Formatting.Indented));
+                 Dirty = false;
+@@ -97,6 +161,9 @@ namespace SimDLL_Rust
+         {
+             public bool LogEnabled { get; set; } = false;
+             public bool HyperThreadOptimizationEnabled { get; set; } = false;
++            public int ReservedCores { get; set; } = DEFAULT_RESERVED_CORES;
++            public bool SliceEnabled { get; set; } = false;
++            public int SliceSize { get; set; } = DEFAULT_SLICE_SIZE;
+         }
+     }
+ }
+diff --git a/SimDLL_Rust/Native.cs b/SimDLL_Rust/Native.cs
+index b66aad2..d658ff6 100644
+--- a/SimDLL_Rust/Native.cs
++++ b/SimDLL_Rust/Native.cs
+@@ -22,6 +22,19 @@ namespace SimDLL_Rust
+         [DllImport("SimDLL_RS.sim")]
+         internal static extern int RS_SetSchedulerMode(int mode);
+ 
++        /// 设置预留物理线程数（1~4）：留给游戏主线程/系统，D1/D2 并行路径通用。
++        /// 返回实际生效值；非法输入返回 -1。
++        [DllImport("SimDLL_RS.sim")]
++        internal static extern int RS_SetReservedCores(int cores);
++
++        /// 设置 D4 切片并行开关（实验性）。返回 1。
++        [DllImport("SimDLL_RS.sim")]
++        internal static extern int RS_SetSliceEnabled(bool enabled);
++
++        /// 设置 D4 切片边长（8~64，默认 32）。返回实际生效值；非法输入返回 -1。
++        [DllImport("SimDLL_RS.sim")]
++        internal static extern int RS_SetSliceSize(int size);
++
+         // ===== Sim API（9）=====
+         [DllImport("SimDLL_RS.sim")]
+         internal static extern void SIM_Initialize(Sim.GAME_MessageHandler callback);
+diff --git a/SimDLL_Rust/Options.cs b/SimDLL_Rust/Options.cs
+index d8cbda9..2f20dd4 100644
+--- a/SimDLL_Rust/Options.cs
++++ b/SimDLL_Rust/Options.cs
+@@ -98,6 +98,12 @@ namespace SimDLL_Rust
+             bool currentHt = ModConfig.HyperThreadOptimizationEnabled;
+             bool newHt = currentHt;
+             bool htAvailable = CpuInfo.HasHyperThreading();
++            int currentReservedCores = ModConfig.ReservedCores;
++            int newReservedCores = currentReservedCores;
++            bool currentSlice = ModConfig.SliceEnabled;
++            bool newSlice = currentSlice;
++            int currentSliceSize = ModConfig.SliceSize;
++            int newSliceSize = currentSliceSize;
+ 
+             dialog.SetHeader(STRINGS.UI.FRONTEND.MOD_OPTIONS.DIALOG_TITLE);
+ 
+@@ -261,6 +267,204 @@ namespace SimDLL_Rust
+                 }
+             }
+ 
++            // ===== InputRow：预留物理线程数（1~4，默认 1）=====
++            var reservedRowObj = NewRow(panelObj, "ReservedCoresRow", 24);
++            if (plainTextPrefab != null)
++            {
++                var reservedLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, reservedRowObj, true);
++                var reservedCsf = reservedLabelObj.GetComponent<ContentSizeFitter>();
++                if (reservedCsf != null) reservedCsf.enabled = false;
++                var reservedLabelText = reservedLabelObj.GetComponentInChildren<LocText>();
++                if (reservedLabelText != null)
++                {
++                    reservedLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.RESERVED_CORES_LABEL;
++                    reservedLabelText.alignment = TextAlignmentOptions.Left;
++                    reservedLabelText.raycastTarget = false;
++                }
++                var reservedLabelLE = reservedLabelObj.GetComponent<LayoutElement>()
++                    ?? reservedLabelObj.AddComponent<LayoutElement>();
++                reservedLabelLE.preferredWidth = 300;
++                reservedLabelLE.flexibleWidth = 1;
++            }
++
++            // 输入框：克隆 RailModUploadMenu 的 modVersion（TMP_InputField），
++            // IntegerNumber + 空值回退默认 + 钳制 1~4（套用 Optimize_Steam_Turbine 写法）。
++            TMP_InputField reservedInput = null;
++            var railMenu = screenPrefabs.RailModUploadMenu;
++            if (railMenu != null)
++            {
++                var versionSource = Traverse.Create(railMenu).Field<TMP_InputField>("modVersion").Value;
++                if (versionSource != null)
++                {
++                    var inputClone = Util.KInstantiateUI(versionSource.gameObject, reservedRowObj, true);
++
++                    var inputLe = inputClone.GetComponent<LayoutElement>();
++                    if (inputLe == null) inputLe = inputClone.AddComponent<LayoutElement>();
++                    inputLe.preferredWidth = 80;
++                    inputLe.minWidth = 60;
++
++                    reservedInput = inputClone.GetComponent<TMP_InputField>();
++                    if (reservedInput != null)
++                    {
++                        reservedInput.contentType = TMP_InputField.ContentType.IntegerNumber;
++                        reservedInput.characterLimit = 1;
++                        reservedInput.text = newReservedCores.ToString();
++
++                        var placeholder = reservedInput.placeholder as TextMeshProUGUI;
++                        if (placeholder != null)
++                            placeholder.text = ModConfig.DEFAULT_RESERVED_CORES.ToString();
++
++                        reservedInput.onEndEdit.AddListener(val =>
++                        {
++                            if (string.IsNullOrEmpty(val))
++                            {
++                                newReservedCores = ModConfig.DEFAULT_RESERVED_CORES;
++                                reservedInput.text = newReservedCores.ToString();
++                            }
++                            else if (int.TryParse(val, out int result))
++                            {
++                                newReservedCores = ModConfig.ClampReservedCores(result);
++                                reservedInput.text = newReservedCores.ToString();
++                            }
++                        });
++                    }
++                }
++                else
++                {
++                    Debug.LogWarning("[SimDLL_Rust] modVersion 不可用，预留线程数输入框不可用");
++                }
++            }
++            else
++            {
++                Debug.LogWarning("[SimDLL_Rust] RailModUploadMenu 不可用，预留线程数输入框不可用");
++            }
++
++            // ===== Row：温度切片（OFF / 尺寸）—— 单一下拉同时表达"开关"与"尺寸" =====
++            // 用户定稿的交互：下拉共两类选项，最顶部 OFF（默认项，即关闭切片），
++            // 其下 64×64 / 32×32 / 16×16 / 8×8 —— 玩家选任一尺寸即启用切片。
++            // 因此不再单独放"启用切片"复选框（两者合并，避免开关与尺寸状态脱节）。
++            // 克隆的是游戏 GraphicsOptionsScreen（主菜单"图形"设置）里 Resolution 用的
++            // 原生 Dropdown —— 游戏自带的固定式下拉，兼容性最好。
++            var sliceSizeRowObj = NewRow(panelObj, "SliceSizeRow", 28);
++            if (plainTextPrefab != null)
++            {
++                var sliceSizeLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, sliceSizeRowObj, true);
++                var sliceSizeCsf = sliceSizeLabelObj.GetComponent<ContentSizeFitter>();
++                if (sliceSizeCsf != null) sliceSizeCsf.enabled = false;
++                var sliceSizeLabelText = sliceSizeLabelObj.GetComponentInChildren<LocText>();
++                if (sliceSizeLabelText != null)
++                {
++                    sliceSizeLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_SIZE_LABEL;
++                    sliceSizeLabelText.alignment = TextAlignmentOptions.Left;
++                    sliceSizeLabelText.raycastTarget = false;
++                }
++                var sliceSizeLabelLE = sliceSizeLabelObj.GetComponent<LayoutElement>()
++                    ?? sliceSizeLabelObj.AddComponent<LayoutElement>();
++                sliceSizeLabelLE.preferredWidth = 300;
++                sliceSizeLabelLE.flexibleWidth = 1;
++            }
++            // 克隆下拉：成功则用下拉选尺寸；失败则回退 TMP 输入框（见下行注释）。
++            Dropdown sliceSizeDropdown = CloneResolutionDropdown(sliceSizeRowObj.transform, out GameObject sliceDropdownGO);
++            TMP_InputField sliceSizeInput = null;
++            if (sliceSizeDropdown != null)
++            {
++                // —— 用克隆的游戏下拉：index 0 = OFF，1..4 = 尺寸（由大到小）——
++                // 选项文案纯文本（Unity Dropdown 不走 LocText）。
++                // 选 OFF → 关闭切片（保留上次尺寸，方便重新开启）；选任一尺寸 → 启用。
++                int[] sliceChoices = { 64, 32, 16, 8 };
++                sliceSizeDropdown.ClearOptions();
++                var opts = new System.Collections.Generic.List<Dropdown.OptionData>();
++                opts.Add(new Dropdown.OptionData("OFF"));
++                for (int ci = 0; ci < sliceChoices.Length; ci++)
++                {
++                    // 用 ASCII 'x' 而非乘号 '×'（U+00D7）：游戏字体不保证含乘号字形，
++                    // 显示成方块/问号会误导玩家；游戏自带分辨率选项也用 "1920x1080" 写法。
++                    string label = sliceChoices[ci] + "x" + sliceChoices[ci];
++                    opts.Add(new Dropdown.OptionData(label));
++                }
++                sliceSizeDropdown.options = opts;
++
++                // 回显：关闭 → 选 OFF(0)；启用 → 选对应尺寸，尺寸不在候选时钳到最近合法项
++                int curIdx = 0;
++                if (newSlice)
++                {
++                    int si = Array.IndexOf(sliceChoices, newSliceSize);
++                    if (si < 0)
++                    {
++                        int nearest = ModConfig.DEFAULT_SLICE_SIZE;
++                        int best = 0;
++                        for (int ci = 0; ci < sliceChoices.Length; ci++)
++                        {
++                            if (Math.Abs(sliceChoices[ci] - newSliceSize) < Math.Abs(nearest - newSliceSize))
++                            {
++                                nearest = sliceChoices[ci];
++                                best = ci;
++                            }
++                        }
++                        newSliceSize = nearest;
++                        si = best;
++                    }
++                    curIdx = si + 1; // +1 跳过 OFF
++                }
++                sliceSizeDropdown.value = curIdx;
++                sliceSizeDropdown.onValueChanged.AddListener(idx =>
++                {
++                    if (idx <= 0)
++                    {
++                        // OFF：只关开关，尺寸保持上次值不变
++                        newSlice = false;
++                    }
++                    else
++                    {
++                        newSlice = true;
++                        newSliceSize = sliceChoices[idx - 1];
++                    }
++                });
++            }
++            else
++            {
++                // —— 回退：RailModUploadMenu.modVersion 输入框 ——
++                Debug.LogWarning("[SimDLL_Rust] 分辨率下拉克隆失败，回退输入框");
++                if (railMenu != null)
++                {
++                    var versionSource = Traverse.Create(railMenu).Field<TMP_InputField>("modVersion").Value;
++                    if (versionSource != null)
++                    {
++                        var inputClone = Util.KInstantiateUI(versionSource.gameObject, sliceSizeRowObj, true);
++                        var inputLe = inputClone.GetComponent<LayoutElement>();
++                        if (inputLe == null) inputLe = inputClone.AddComponent<LayoutElement>();
++                        inputLe.preferredWidth = 80;
++                        inputLe.minWidth = 60;
++
++                        sliceSizeInput = inputClone.GetComponent<TMP_InputField>();
++                        if (sliceSizeInput != null)
++                        {
++                            sliceSizeInput.contentType = TMP_InputField.ContentType.IntegerNumber;
++                            sliceSizeInput.characterLimit = 2;
++                            sliceSizeInput.text = newSliceSize.ToString();
++
++                            var placeholder = sliceSizeInput.placeholder as TextMeshProUGUI;
++                            if (placeholder != null)
++                                placeholder.text = ModConfig.DEFAULT_SLICE_SIZE.ToString();
++
++                            sliceSizeInput.onEndEdit.AddListener(val =>
++                            {
++                                if (string.IsNullOrEmpty(val))
++                                {
++                                    newSliceSize = ModConfig.DEFAULT_SLICE_SIZE;
++                                    sliceSizeInput.text = newSliceSize.ToString();
++                                }
++                                else if (int.TryParse(val, out int result))
++                                {
++                                    newSliceSize = ModConfig.ClampSliceSize(result);
++                                    sliceSizeInput.text = newSliceSize.ToString();
++                                }
++                            });
++                        }
++                    }
++                }
++            }
++
+             // ===== 下划线 + 提示 =====
+             var dividerObj = new GameObject("Divider", typeof(RectTransform));
+             dividerObj.transform.SetParent(panelObj.transform, false);
+@@ -302,7 +506,23 @@ namespace SimDLL_Rust
+                 htHintLE.flexibleWidth = 1;
+             }
+ 
+-            // 提示3（红色）：修改设置后需重启游戏生效
++            // 提示3（白色）：D4 温度切片说明
++            if (plainTextPrefab != null)
++            {
++                var sliceHintObj = Util.KInstantiateUI(plainTextPrefab.gameObject, panelObj, true);
++                var sliceHintCsf = sliceHintObj.GetComponent<ContentSizeFitter>();
++                if (sliceHintCsf != null) sliceHintCsf.enabled = false;
++                var sliceHintText = sliceHintObj.GetComponentInChildren<LocText>();
++                if (sliceHintText != null)
++                {
++                    sliceHintText.alignment = TextAlignmentOptions.Left;
++                    sliceHintText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_HINT;
++                }
++                var sliceHintLE = sliceHintObj.GetComponent<LayoutElement>() ?? sliceHintObj.AddComponent<LayoutElement>();
++                sliceHintLE.flexibleWidth = 1;
++            }
++
++            // 提示4（红色）：修改设置后需重启游戏生效
+             if (plainTextPrefab != null)
+             {
+                 var restartObj = Util.KInstantiateUI(plainTextPrefab.gameObject, panelObj, true);
+@@ -323,9 +543,14 @@ namespace SimDLL_Rust
+             // ===== OK / CANCEL =====
+             dialog.AddOption(global::STRINGS.UI.CONFIRMDIALOG.OK, d =>
+             {
+-                bool changed = newEnabled != currentEnabled || newHt != currentHt;
++                bool changed = newEnabled != currentEnabled || newHt != currentHt
++                    || newReservedCores != currentReservedCores
++                    || newSlice != currentSlice || newSliceSize != currentSliceSize;
+                 if (newEnabled != currentEnabled) ModConfig.SetLogEnabled(newEnabled);
+                 if (newHt != currentHt) ModConfig.SetHyperThreadOptimizationEnabled(newHt);
++                if (newReservedCores != currentReservedCores) ModConfig.SetReservedCores(newReservedCores);
++                if (newSlice != currentSlice) ModConfig.SetSliceEnabled(newSlice);
++                if (newSliceSize != currentSliceSize) ModConfig.SetSliceSize(newSliceSize);
+                 if (changed) ModConfig.Save();
+                 d.Deactivate();
+                 if (changed)
+@@ -387,6 +612,97 @@ namespace SimDLL_Rust
+             return rowObj;
+         }
+ 
++        /// <summary>
++        /// 克隆游戏主菜单"图形"设置（GraphicsOptionsScreen）里分辨率下拉（UnityEngine.UI.Dropdown）
++        /// 到 `parent`，返回克隆的 Dropdown（克隆失败返回 null，调用方应回退其他控件）。
++        ///
++        /// 获取链路（全部为序列化引用，ScreenPrefabs 常驻单例可达，无需某屏已打开）：
++        ///   ScreenPrefabs.Instance.OptionsScreen（OptionsMenuScreen prefab）
++        ///     → 私有字段 graphicsOptionsScreenPrefab（GraphicsOptionsScreen prefab，Traverse 反射）
++        ///     → 层级内找 Dropdown（路径 Find 优先，递归 GetComponentInChildren 兜底）
++        ///
++        /// 缩小宽度：原分辨率下拉较宽（GraphicsOptionsScreen 整行），此处把克隆体的
++        /// LayoutElement 收到与输入框一致的宽度（preferredWidth 80 / minWidth 60）。
++        /// </summary>
++        private static Dropdown CloneResolutionDropdown(Transform parent, out GameObject clonedGO)
++        {
++            clonedGO = null;
++            try
++            {
++                var screenPrefabs = ScreenPrefabs.Instance;
++                if (screenPrefabs == null || screenPrefabs.OptionsScreen == null)
++                {
++                    Debug.LogWarning("[SimDLL_Rust] ScreenPrefabs.OptionsScreen 不可用，无法克隆下拉");
++                    return null;
++                }
++
++                // 1) OptionsMenuScreen prefab → GraphicsOptionsScreen prefab（私有序列化字段）。
++                //    用非泛型 GetValue() 取 object 再 cast——字段类型是 GraphicsOptionsScreen，
++                //    泛型强转不匹配时 Traverse 会静默返回 null，难排查。
++                var graphicsObj = Traverse.Create(screenPrefabs.OptionsScreen)
++                    .Field("graphicsOptionsScreenPrefab").GetValue();
++                var graphicsPrefab = graphicsObj as Component;
++                if (graphicsPrefab == null)
++                {
++                    Debug.LogWarning("[SimDLL_Rust] graphicsOptionsScreenPrefab 不可用，无法克隆下拉");
++                    return null;
++                }
++
++                // 2) 找 Resolution 下拉：优先按用户给出的层级路径（AssetStudio 解包路径），
++                //    找不到再递归 GetComponentInChildren<Dropdown>（兜底拿第一个下拉）。
++                //    注意 GraphicsOptionsScreen 里还有一个"颜色模式"下拉，路径定位更精确。
++                Dropdown sourceDropdown = null;
++                var resPath = graphicsPrefab.transform.Find("Content/DisplaySettings/Resolution/Resolution");
++                if (resPath != null)
++                {
++                    sourceDropdown = resPath.GetComponent<Dropdown>();
++                }
++                if (sourceDropdown == null)
++                {
++                    sourceDropdown = graphicsPrefab.GetComponentInChildren<Dropdown>(true);
++                }
++                if (sourceDropdown == null)
++                {
++                    Debug.LogWarning("[SimDLL_Rust] GraphicsOptionsScreen 内找不到 Dropdown，无法克隆");
++                    return null;
++                }
++
++                // 3) 克隆到 parent（KInstantiateUI 深拷贝全部子物体：caption/template/option 等）
++                clonedGO = Util.KInstantiateUI(sourceDropdown.gameObject, parent.gameObject, true);
++                var cloned = clonedGO.GetComponent<Dropdown>();
++                if (cloned == null)
++                {
++                    Debug.LogWarning("[SimDLL_Rust] 克隆体缺少 Dropdown 组件");
++                    return null;
++                }
++
++                // 4) 收窄到与输入框一致的宽度。分辨率下拉宽是因为其 caption 文本长；
++                //    收窄 LayoutElement + 让 RectTransform 不再横向撑满。
++                var le = clonedGO.GetComponent<LayoutElement>();
++                if (le == null) le = clonedGO.AddComponent<LayoutElement>();
++                le.preferredWidth = 80;
++                le.minWidth = 60;
++                le.flexibleWidth = 0;
++                var rt = clonedGO.GetComponent<RectTransform>();
++                if (rt != null)
++                {
++                    rt.anchorMin = new Vector2(0f, 0.5f);
++                    rt.anchorMax = new Vector2(0f, 0.5f);
++                    rt.pivot = new Vector2(0f, 0.5f);
++                    rt.sizeDelta = new Vector2(80, rt.sizeDelta.y);
++                }
++                // 清掉原 dropdown 的旧选项与监听，避免把分辨率选项带进来
++                cloned.ClearOptions();
++                cloned.onValueChanged.RemoveAllListeners();
++                return cloned;
++            }
++            catch (Exception e)
++            {
++                Debug.LogWarning("[SimDLL_Rust] 克隆分辨率下拉异常: " + e.Message);
++                return null;
++            }
++        }
++
+         /// <summary>
+         /// 翻译注册：Localization.Initialize 后注册 STRINGS + 加载 translations/&lt;locale&gt;.po。
+         /// </summary>
+diff --git a/SimDLL_Rust/strings/Strings.cs b/SimDLL_Rust/strings/Strings.cs
+index 3def548..d4b80e8 100644
+--- a/SimDLL_Rust/strings/Strings.cs
++++ b/SimDLL_Rust/strings/Strings.cs
+@@ -11,6 +11,9 @@ namespace SimDLL_Rust
+                     public static LocString DIALOG_TITLE = "SimDLL_Rust Config";
+                     public static LocString LOG_ENABLED_LABEL = "Enable Logging";
+                     public static LocString HYPERTHREAD_LABEL = "Enable Hyper-Threading Optimization";
++                    public static LocString RESERVED_CORES_LABEL = "Reserve physical thread count";
++                    public static LocString SLICE_SIZE_LABEL = "Temperature Slicing (Experimental)";
++                    public static LocString SLICE_HINT = "OFF = disabled (default). Choosing any size enables it: the temperature pass is split into tiles for multi-core parallelization. Smaller slices give more parallelism but higher scheduling overhead. Choose OFF if you observe temperature anomalies.";
+                     public static LocString LOG_PATH_HINT = "Logs are saved in the game installation directory by default.";
+                     public static LocString HYPERTHREAD_HINT = "Make sure Hyper-Threading is enabled on your CPU before turning this on, otherwise it will be automatically disabled.";
+                     public static LocString RESTART_HINT = "After modifying the settings, it is necessary to restart the game.";
+diff --git a/SimDLL_Rust/translations/zh.po b/SimDLL_Rust/translations/zh.po
+index fb798a5..91889bd 100644
+--- a/SimDLL_Rust/translations/zh.po
++++ b/SimDLL_Rust/translations/zh.po
+@@ -33,6 +33,21 @@ msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.HYPERTHREAD_LABEL"
+ msgid "Enable Hyper-Threading Optimization"
+ msgstr "启用超线程优化"
+ 
++#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.RESERVED_CORES_LABEL
++msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.RESERVED_CORES_LABEL"
++msgid "Reserve physical thread count"
++msgstr "预留物理线程数量"
++
++#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_SIZE_LABEL
++msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_SIZE_LABEL"
++msgid "Temperature Slicing (Experimental)"
++msgstr "温度切片并行（实验性）"
++
++#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_HINT
++msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.SLICE_HINT"
++msgid "OFF = disabled (default). Choosing any size enables it: the temperature pass is split into tiles for multi-core parallelization. Smaller slices give more parallelism but higher scheduling overhead. Choose OFF if you observe temperature anomalies."
++msgstr "OFF 为关闭（默认）。选择任意尺寸即启用：把温度阶段切成瓦片做多核并行。切片越小并行度越高，但调度开销也越大。若观察到温度异常，选回 OFF 即可"
++
+ #. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.LOG_PATH_HINT
+ msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.LOG_PATH_HINT"
+ msgid "Logs are saved in the game installation directory by default."
+diff --git "a/SimDLL_Rust/\346\234\254\345\234\260\345\214\226\347\277\273\350\257\221\345\257\271\347\205\247.txt" "b/SimDLL_Rust/\346\234\254\345\234\260\345\214\226\347\277\273\350\257\221\345\257\271\347\205\247.txt"
+index 84f81f5..b1ca827 100644
+--- "a/SimDLL_Rust/\346\234\254\345\234\260\345\214\226\347\277\273\350\257\221\345\257\271\347\205\247.txt"
++++ "b/SimDLL_Rust/\346\234\254\345\234\260\345\214\226\347\277\273\350\257\221\345\257\271\347\205\247.txt"
+@@ -3,9 +3,16 @@ mod.yaml文本：
+ 
+ 模组设置窗口文本（视觉顺序，从上至下）：
+ 标题："SimDLL_Rust Config"="SimDLL_Rust 配置",
+-勾选项1："Enable Logging"="启用日志功能"，
++勾选项1："Enable Logging"="启用日志功能",
+ 勾选项2："Enable Hyper-Threading Optimization"="启用超线程优化",
++输入项1："Reserve physical thread count"="预留物理线程数量",
++下拉项1："Temperature Slicing (Experimental)"="温度切片并行（实验性）",
+ 
+ 提示1（白色字体）："Logs are saved in the game installation directory by default."="日志默认保存在游戏安装目录",
+ 提示2（白色字体）："Make sure Hyper-Threading is enabled on your CPU before turning this on, otherwise it will be automatically disabled."="启用超线程优化前，确保你的CPU开启了超线程，否则会自动禁用",
+-提示3（红色字体）："After modifying the settings, it is necessary to restart the game."="修改设置后需重启游戏生效",
+\ No newline at end of file
++提示3（白色字体）："OFF = disabled (default). Choosing any size enables it: the temperature pass is split into tiles for multi-core parallelization. Smaller slices give more parallelism but higher scheduling overhead. Choose OFF if you observe temperature anomalies."="OFF 为关闭（默认）。选择任意尺寸即启用：把温度阶段切成瓦片做多核并行。切片越小并行度越高，但调度开销也越大。若观察到温度异常，选回 OFF 即可",
++提示4（红色字体）："After modifying the settings, it is necessary to restart the game."="修改设置后需重启游戏生效",
++
++说明：下拉项1 的选项为 OFF（默认，最顶部）/ 64×64 / 32×32 / 16×16 / 8×8，
++均为纯文本，不走 LocText 本地化（Unity Dropdown 的 OptionData 是纯文本）。
++选 OFF = 关闭切片；选任一尺寸 = 启用切片（该尺寸同时作为切片边长）。

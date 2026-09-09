@@ -1,0 +1,313 @@
+极低概率崩溃 Bug 根因分析报告（GLM-5.2）
+=====================================================================
+审查对象：simDLL_RS 项目
+Bug 描述：EMBARK 后首个 sim tick 的 HandleVector<CallbackInfo> 越界
+审查日期：2026-08-11
+审查方法：systematic-debugging 四阶段（根因调查 → 模式分析 → 假设验证 → 输出结论）
+审查约束：只读分析，未修改任何文件
+
+=====================================================================
+一、根因结论
+=====================================================================
+
+【核心根因】
+clear_element_emitters() 在生产代码中从未被调用，导致
+ELEMENT_EMITTER_MANAGER 全局静态注册表跨存档残留旧记录。
+
+EMBARK 后首个 sim tick 处理这些残留记录时，把上个存档的
+callback_idx（cb）推送到 callback_info，而 C# 新存档的
+callbackManager 尚未注册该 cb → versions[cb] 越界 →
+ArgumentOutOfRangeException 崩溃。
+
+【一句话总结】
+radiation_emitter 和 disease_emitter 在新世界分配时都调用了
+clear_xxx_emitters() 清空全局静态注册表，唯独 element_emitter
+漏了这一步，导致旧存档的发射器记录带着过期的 cb 值"穿越"到
+新存档，首个 sim tick 即触发越界崩溃。
+
+=====================================================================
+二、核心证据
+=====================================================================
+
+---------------------------------------------------------------------
+证据 1：三类 emitter 注册表都是全局静态，但只有两类被清空
+---------------------------------------------------------------------
+
+文件：src/a_framework/save_load.rs
+
+【AllocateCells 函数（新世界分配入口）】
+  L156:  crate::c_simulation::radiation_emitter::clear_radiation_emitters();   ✓
+  L157:  crate::c_simulation::disease_component::clear_disease_emitters();     ✓
+         crate::c_simulation::element_emitter::clear_element_emitters();      ✗ 缺失！
+
+【第二处分配路径】
+  L1469: crate::c_simulation::radiation_emitter::clear_radiation_emitters();  ✓
+  L1470: crate::c_simulation::disease_component::clear_disease_emitters();    ✓
+         crate::c_simulation::element_emitter::clear_element_emitters();     ✗ 同样缺失！
+
+两处新世界分配路径都清空了 radiation 和 disease，唯独漏掉 element。
+
+---------------------------------------------------------------------
+证据 2：开发者已意识到该模式，但只应用了两处
+---------------------------------------------------------------------
+
+文件：src/a_framework/save_load.rs L153-L155
+
+开发者注释明确写道：
+  "新世界分配 = 存档切换：上一存档的 RadiationEmitter 记录全部作废。
+   原版注册表在 Sim 内、跨存档靠 Remove 消息清理；本项目为全局静态，
+   显式清空避免'上个存档辐射残留'（旧发射器继续向新世界发射）。"
+
+关键背景：
+  - 原版 C++ 把注册表放在 SimData 内，新游戏 = 新 SimData = 自动清空。
+  - Rust 改成全局静态后需显式清空。
+  - 开发者给 radiation_emitter / disease_emitter 加了清空，
+    唯独漏了 element_emitter。
+
+---------------------------------------------------------------------
+证据 3：clear_element_emitters() 只在测试中调用
+---------------------------------------------------------------------
+
+全局搜索 clear_element_emitters / ELEMENT_EMITTER_MANAGER.clear() 的结果：
+
+  src/c_simulation/element_emitter.rs:251
+      pub fn clear_element_emitters() {
+          ELEMENT_EMITTER_MANAGER.lock().clear();        ← 函数定义
+      }
+
+  src/c_simulation/element_emitter.rs:267
+      #[cfg(test)]
+      pub fn reset_for_test() {
+          ELEMENT_EMITTER_MANAGER.lock().clear();        ← 仅测试用
+      }
+
+  src/c_simulation/sim_data_ops.rs:869
+      #[test]
+      fn copy_sim_data_to_game_keeps_emitted_mass_vector_length() {
+          ...
+          crate::c_simulation::element_emitter::reset_for_test();  ← 仅测试用
+      }
+
+结论：生产路径零调用。clear_element_emitters() 是"声明了却从未使用"
+的函数，典型的遗漏模式。
+
+---------------------------------------------------------------------
+证据 4：update() 会遍历所有残留记录并可能推送 cb
+---------------------------------------------------------------------
+
+文件：src/c_simulation/element_emitter.rs
+
+【全局静态注册表】
+  L247-248:
+      static ELEMENT_EMITTER_MANAGER: Lazy<Mutex<ElementEmitterManager>> =
+          Lazy::new(|| Mutex::new(ElementEmitterManager::new()));
+
+【update 遍历所有记录】
+  L394:  for idx in 0..self.items.len() {
+             let ri = self.items[idx];
+             if ri < 0 { continue; }
+             let rec = &mut self.records[ri as usize];
+             ...
+
+【blocked/unblocked 状态翻转时推送 cb 到 callback_info】
+  L438-461（has_room 分支，blocked→unblocked）:
+      if rec.blocked_state != 0 {
+          let cb = rec.unblocked_cb_idx;
+          rec.blocked_state = 0;
+          if cb != 0xFFFFFFFF {
+              ...
+              events.callback_info.push(CallbackInfo {
+                  callback_idx: cb as i32,
+              });
+          }
+      }
+
+  L463-478（!has_room 分支，unblocked→blocked）:
+      else if rec.blocked_state != 1 {
+          let cb = rec.blocked_cb_idx;
+          rec.blocked_state = 1;
+          if cb != 0xFFFFFFFF {
+              ...
+              events.callback_info.push(CallbackInfo {
+                  callback_idx: cb as i32,
+              });
+          }
+      }
+
+关键点：
+  - 过滤条件是 cb != 0xFFFFFFFF（即 != -1）。
+  - 旧存档的 cb 值（如 42）是合法的非 -1 值，过滤逻辑无法拦截。
+  - 问题不在过滤，而在 cb 值本身是上个存档的"幽灵"。
+
+---------------------------------------------------------------------
+证据 5：原版 C++ 源码对照确认 5 处 push 路径均已实现
+---------------------------------------------------------------------
+
+原版 SimDLL_Source.c 中推送到 callback_info（simEvents + 0x120）的位置：
+
+  L115710  ProcessSetCellProperties    → Rust frame_processor.rs L369   ✓
+  L116005  ProcessDigPoints            → Rust frame_processor.rs L146   ✓
+  L135025  ProcessCellModifications    → Rust frame_processor.rs L505   ✓
+  L141587  ElementEmitter::Update      → Rust element_emitter.rs L458/L475 ✓
+  L143671  SimBase::ConsolidateEvents  → Rust 串行执行，无需合并       ✓（不适用）
+
+Rust 实现的 5 个 push 点（bug 文档所述）与原版语义一致，过滤逻辑
+（!= -1 / != 0xFFFFFFFF）也完全对应。因此 push 路径本身无 bug，
+问题出在 cb 值的生命周期管理（注册表未清空）。
+
+=====================================================================
+三、崩溃机制（与现象逐一对应）
+=====================================================================
+
+1. 【存档 1】玩家游玩
+   - C# 为建筑注册 cb（例如 cb=42），发 AddElementEmitterMessage。
+   - simDLL 全局注册表存 blocked_cb_idx=42 / unblocked_cb_idx=42。
+
+2. 【存档 1 结束 → 新建游戏 EMBARK】
+   - C# callbackManager 重新初始化（256 槽，新存档尚未注册 cb=42）。
+   - simDLL 的 ELEMENT_EMITTER_MANAGER 未清空，仍持有 cb=42 的旧记录。
+
+3. 【首个 sim tick】
+   - update_element_emitters 遍历残留记录。
+   - 若旧记录的 cell 坐标落在新世界范围内、且压力/元素状态恰好触发
+     blocked→unblocked（或反向）翻转 → 推送 cb=42 到 callback_info。
+
+4. 【C# 侧崩溃】
+   - Game.StepTheSim 读取 callback_info。
+   - handle.index = callbackInfo.callbackIdx = 42。
+   - IsManuallyReleasedHandle → callbackManager.IsVersionValid(handle)。
+   - HandleVector.IsVersionValid: index = 42 & 0xFFFFFF = 42。
+   - versions[42] 越界（新存档 callbackManager 尚未注册到 42）。
+   - ArgumentOutOfRangeException: Index was out of range。
+
+=====================================================================
+四、与观察现象的吻合度
+=====================================================================
+
+观察现象                              | 本根因的解释
+--------------------------------------+------------------------------------------
+极低概率（n=2/大量尝试）              | 需同时满足：旧记录存在、cell 落在新世界
+                                      | 范围内、timing 触发、压力状态触发翻转、
+                                      | cb 超出新注册数。五重条件同时命中才崩。
+--------------------------------------+------------------------------------------
+EMBARK 后首个 sim tick                | 第一个 tick 即首次跑 update_element_emitters，
+                                      | 残留记录立刻被处理；一旦触发翻转即崩。
+--------------------------------------+------------------------------------------
+首次崩、后续新建大量游戏未再崩        | 首次崩溃后游戏进程退出 → 全局静态重置 →
+                                      | 后续新游戏无残留记录。或后续新游戏世界
+                                      | 种子不同，残留记录 cell 状态未触发翻转。
+--------------------------------------+------------------------------------------
+5 处 push 点均过滤 -1 仍崩溃          | cb=42 不是 -1，过滤逻辑无法拦截；问题不在
+                                      | 过滤，而在 cb 值本身是上个存档的"幽灵"。
+--------------------------------------+------------------------------------------
+callbackIdx 超过 C# 注册数越界        | 旧 cb 值（如 42）≥ 新存档当前 callbackManager
+                                      | 注册数 → 越界。完全吻合。
+
+=====================================================================
+五、与 bug 文档的对照
+=====================================================================
+
+bug 文档第四节"诊断日志"提到：
+  "崩溃前最后一帧的 callback_info count 与 emitter push 的 cb 值；
+   若 cb 为 -1/超限即为直接来源。"
+
+本根因属于"超限"情形——cb 是合法的非 -1 值，但来自上个存档，
+超出新存档 C# 注册数。
+
+bug 文档第五节"附带观察"建议的"cb > 0xFFFF 时丢弃并告警"是
+【症状层过滤】，无法根治（旧 cb 可能是 42 这样的合法小值）。
+
+真正的根因修复应是：
+  在 src/a_framework/save_load.rs L156-L157 旁边补一行：
+    crate::c_simulation::element_emitter::clear_element_emitters();
+  并在 L1469-L1470 同步补上。
+
+=====================================================================
+六、补充观察
+=====================================================================
+
+1. disease_consumer 也未清空
+   clear_disease_consumers() 定义于 src/c_simulation/disease_component.rs L466
+   但未在 save_load 调用。不过其注释写明"C# 无发送方 → 生产环境
+   注册表恒空"，故无实际影响。
+
+2. radiation_emitter / disease_emitter 已正确清空
+   不受此 bug 影响。
+
+3. 测试覆盖缺失
+   已有一个回归测试 allocate_cells_clears_radiation_emitter_registry
+   （src/a_framework/save_load.rs L1963）验证 radiation 清空，但
+   没有对应的 element_emitter 清空测试——测试覆盖的缺失也是该遗漏
+   未被发现的原因之一。
+
+4. element_emitter.rs 内部的修复注释
+   src/c_simulation/element_emitter.rs L452-L457 有一段注释记录了
+   之前的"根因修复"：
+     "此前误推 componentStateChangedMessages → C# 首次触发即 Release
+      回调句柄 → 版本飙升 + 旧句柄残留 → mismatched handle version
+      崩溃。此为崩溃根因修复。"
+   说明开发者已修过一次 element_emitter 的 cb 推送通道错误，但
+   那次修复针对的是"推错 vector"，本次遗留的是"注册表未清空"——
+   两个独立的根因，后者仍未修复。
+
+=====================================================================
+七、修复建议（仅供参考，本次未实施）
+=====================================================================
+
+【最小修复】
+在 src/a_framework/save_load.rs 的两处新世界分配路径补上清空调用：
+
+  L156-L157 之间或之后加：
+    crate::c_simulation::element_emitter::clear_element_emitters();
+
+  L1469-L1470 之间或之后加：
+    crate::c_simulation::element_emitter::clear_element_emitters();
+
+【增强建议】
+1. 补一个回归测试 allocate_cells_clears_element_emitter_registry，
+   对照现有的 radiation 版测试，验证新世界分配后
+   element_emitter_count() == 0。
+
+2. 考虑把三类 clear_xxx_emitters 调用集中到一个 helper 函数
+  （如 clear_all_global_emitter_registries），避免未来再加新
+   emitter 类型时再次遗漏。
+
+3. bug 文档第五节的"cb > 0xFFFF 过滤"可作为防御性兜底，但不应
+   视为根因修复——它只是症状层过滤，且 0xFFFF 阈值需先确认合法
+   上限语义，勿凭猜测改动。
+
+=====================================================================
+八、审查方法说明
+=====================================================================
+
+本次审查遵循 systematic-debugging 技能四阶段：
+
+  第一阶段（根因调查）：
+    - 阅读 simDLL_RS项目说明.txt 和 极低概率崩溃.txt
+    - 全局搜索 callback_info / push_state_changed / push_back
+    - 发现 radiation_emitter.rs 和 disease_component.rs 也调用
+      push_state_changed（bug 文档未提及），但它们推送的是
+      component_state_changed_messages，非 callback_info，排除。
+    - 确认 5 处 callback_info push 点均过滤 -1，逻辑正确。
+    - 转向 cb 值的生命周期管理调查。
+
+  第二阶段（模式分析）：
+    - 对比 radiation_emitter / disease_emitter / element_emitter
+      三者的注册表清空模式。
+    - 发现 radiation 和 disease 在 save_load.rs 中被清空，
+      element 未被清空。
+    - 对照原版 C++ 源码确认原版注册表在 SimData 内（自动清空），
+      Rust 改全局静态后需显式清空。
+
+  第三阶段（假设验证）：
+    - 假设：clear_element_emitters() 在生产代码中从未被调用。
+    - 验证：全局搜索结果确认仅 3 处调用，全部在 #[cfg(test)]
+      或 #[test] 代码中。
+    - 假设得到 100% 证实。
+
+  第四阶段（输出结论）：
+    - 按用户要求，本次仅输出分析报告，未修改任何文件。
+
+=====================================================================
+报告结束
+=====================================================================
