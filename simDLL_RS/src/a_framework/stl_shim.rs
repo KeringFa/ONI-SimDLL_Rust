@@ -475,6 +475,11 @@ pub struct MsvcCondVar {
 
 #[cfg(target_os = "linux")]
 mod condvar_futex {
+    // musl 的 libc crate 未导出 _PRIVATE 变体——内核 ABI 值固定，自行定义：
+    // FUTEX_PRIVATE_FLAG=128，FUTEX_WAIT=0，FUTEX_WAKE=1。
+    const FUTEX_WAIT_PRIVATE: i32 = 0x80;
+    const FUTEX_WAKE_PRIVATE: i32 = 0x81;
+
     #[inline]
     fn futex_word(cv: &super::MsvcCondVar) -> *mut u32 {
         cv.bytes.as_ptr() as *mut u32
@@ -487,7 +492,7 @@ mod condvar_futex {
                 let r = libc::syscall(
                     libc::SYS_futex,
                     futex_word(cv),
-                    libc::FUTEX_WAIT_PRIVATE,
+                    FUTEX_WAIT_PRIVATE,
                     expected,
                     std::ptr::null::<libc::timespec>(),
                 );
@@ -509,7 +514,7 @@ mod condvar_futex {
     /// futex(FUTEX_WAKE_PRIVATE, n)。
     pub fn futex_wake(cv: &super::MsvcCondVar, n: i32) {
         unsafe {
-            libc::syscall(libc::SYS_futex, futex_word(cv), libc::FUTEX_WAKE_PRIVATE, n);
+            libc::syscall(libc::SYS_futex, futex_word(cv), FUTEX_WAKE_PRIVATE, n);
         }
     }
 
