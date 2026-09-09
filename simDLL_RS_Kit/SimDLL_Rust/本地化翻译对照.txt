@@ -1,0 +1,18 @@
+mod.yaml文本：
+"Rust-based SimDLL"="基于 Rust 的 SimDLL",
+
+模组设置窗口文本（视觉顺序，从上至下）：
+标题："SimDLL_Rust Config"="SimDLL_Rust 配置",
+勾选项1："Enable Logging"="启用日志功能",
+勾选项2："Enable Hyper-Threading Optimization"="启用超线程优化",
+输入项1："Reserve physical thread count"="预留物理线程数量",
+下拉项1："Temperature Slicing (Experimental)"="温度切片并行（实验性）",
+
+提示1（白色字体）："Logs are saved in the game installation directory by default."="日志默认保存在游戏安装目录",
+提示2（白色字体）："Make sure Hyper-Threading is enabled on your CPU before turning this on, otherwise it will be automatically disabled."="启用超线程优化前，确保你的CPU开启了超线程，否则会自动禁用",
+提示3（白色字体）："OFF = disabled (default). Choosing any size enables it: the temperature pass is split into tiles for multi-core parallelization. Smaller slices give more parallelism but higher scheduling overhead. Choose OFF if you observe temperature anomalies."="OFF 为关闭（默认）。选择任意尺寸即启用：把温度阶段切成瓦片做多核并行。切片越小并行度越高，但调度开销也越大。若观察到温度异常，选回 OFF 即可",
+提示4（红色字体）："After modifying the settings, it is necessary to restart the game."="修改设置后需重启游戏生效",
+
+说明：下拉项1 的选项为 OFF（默认，最顶部）/ 64×64 / 32×32 / 16×16 / 8×8，
+均为纯文本，不走 LocText 本地化（Unity Dropdown 的 OptionData 是纯文本）。
+选 OFF = 关闭切片；选任一尺寸 = 启用切片（该尺寸同时作为切片边长）。
