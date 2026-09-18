@@ -1,0 +1,7 @@
+C:\Users\KeringFa\Desktop\my_Project\simDLL_RS_Kit_v1\SimDLL_Rust\bin\SimDLL_Rust.dll
+C:\Users\KeringFa\Desktop\my_Project\simDLL_RS_Kit_v1\SimDLL_Rust\bin\SimDLL_Rust.pdb
+C:\Users\KeringFa\Desktop\my_Project\simDLL_RS_Kit_v1\SimDLL_Rust\obj\Release\SimDLL_Rust.csproj.AssemblyReference.cache
+C:\Users\KeringFa\Desktop\my_Project\simDLL_RS_Kit_v1\SimDLL_Rust\obj\Release\SimDLL_Rust.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\KeringFa\Desktop\my_Project\simDLL_RS_Kit_v1\SimDLL_Rust\obj\Release\SimDLL_Rust.csproj.CoreCompileInputs.cache
+C:\Users\KeringFa\Desktop\my_Project\simDLL_RS_Kit_v1\SimDLL_Rust\obj\Release\SimDLL_Rust.dll
+C:\Users\KeringFa\Desktop\my_Project\simDLL_RS_Kit_v1\SimDLL_Rust\obj\Release\SimDLL_Rust.pdb

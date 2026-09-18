@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "XPfqv8dEOK8=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\KeringFa\\Desktop\\my_Project\\simDLL_RS_Kit_v1\\SimDLL_Rust\\SimDLL_Rust.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\KeringFa\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.3\\microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",
+    "C:\\Users\\KeringFa\\.nuget\\packages\\microsoft.netframework.referenceassemblies.net48\\1.0.3\\microsoft.netframework.referenceassemblies.net48.1.0.3.nupkg.sha512"
+  ],
+  "logs": []
+}

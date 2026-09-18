@@ -1,0 +1,12 @@
+mod.yaml文本：
+"Rust-based SimDLL"="基于 Rust 的 SimDLL",
+
+模组设置窗口文本（视觉顺序，从上至下）：
+标题："SimDLL_Rust Config"="SimDLL_Rust 配置",
+勾选项1："Enable Logging"="启用日志功能"，
+勾选项2："Enable Hyper-Threading Optimization"="启用超线程优化",
+输入项1："Reserve physical thread count"="预留物理线程数量",
+
+提示1（白色字体）："Logs are saved in the game installation directory by default."="日志默认保存在游戏安装目录",
+提示2（白色字体）："Make sure Hyper-Threading is enabled on your CPU before turning this on, otherwise it will be automatically disabled."="启用超线程优化前，确保你的CPU开启了超线程，否则会自动禁用",
+提示3（红色字体）："After modifying the settings, it is necessary to restart the game."="修改设置后需重启游戏生效",
