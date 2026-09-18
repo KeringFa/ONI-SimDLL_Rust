@@ -1,4 +1,2 @@
 # ONI-SimDLL_Rust
-Maybe GPUs could be leveraged? wgpu+……
-
-The other core components are still being sorted out.
+The code comments are in Chinese. Well… make do with it.
