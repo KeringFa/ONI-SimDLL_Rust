@@ -1,9 +1,0 @@
-湿地小行星（MarshyMoonlet，64 x 96 6144格）
-超导小行星（NiobiumMoonlet，64 x 96 6144格）
-海牛小行星（MooMoonlet，96 x 80 7680格）
-苔原小行星（TundraMoonlet，64 x 128 8192格）
-
-水域小行星（WaterMoonlet，80 x 174 13920格）
-浮土小行星ASTEROID STYLE眼冒金星DLC开局（RegolithMoonlet，160 x 96 15360格）/ASTEROID STYLE Classic开局（MiniRegolithMoonlet，96 x 96 9216格）
-
-对比最小开局：荒凉小行星（MiniBadlandsStart，128 x 153  19584格）
