@@ -161,48 +161,101 @@ unsafe fn resolve_original_export(name: &[u8]) -> Option<*mut c_void> {
     }
 }
 
-/// 定位原版 SimDLL.dll：优先已加载模块；否则用 exe 目录拼
-/// `OxygenNotIncluded_Data\Plugins\x86_64\SimDLL.dll` 完整路径 LoadLibrary。
-/// 显式加载后，游戏 DllImport("SimDLL") 首次解析会命中该已加载模块
-/// （按文件名匹配），入口已被接管。
+/// 往候选列表里塞两种插件布局：`Plugins\x86_64\SimDLL.dll` 与 `Plugins\SimDLL.dll`。
+#[cfg(windows)]
+fn push_plugin_candidates(out: &mut Vec<std::path::PathBuf>, root: &std::path::Path) {
+    let plugins = root.join("OxygenNotIncluded_Data").join("Plugins");
+    out.push(plugins.join("x86_64").join("SimDLL.dll"));
+    out.push(plugins.join("SimDLL.dll"));
+}
+
+/// 定位原版 SimDLL.dll。查找顺序（2026-10-29 兼容性重做）：
+///
+/// 1. 进程内已加载 —— 最理想。宿主（CoreCLR / oni-moono 等）若已先解析过
+///    `DllImport("SimDLL")`，模块就在进程里，直接命中。
+/// 2. 环境变量显式指定 —— 宿主 exe 不在游戏目录、或布局非常规时的兜底：
+///    - `SIMDLL_RS_ORIGINAL_DLL` = 原版 SimDLL.dll 的完整路径
+///    - `SIMDLL_RS_GAME_DIR`     = 游戏根目录（其下有 OxygenNotIncluded_Data）
+/// 3. 从若干根目录**逐级向上**找 `OxygenNotIncluded_Data`。
+///
+/// 第 3 步是本次改动的关键。原实现只看 `GetModuleFileNameW(NULL)` 的同级目录，
+/// 一旦宿主进程不是原版播放器（例如 oni-moono 用自家 exe 通过 Steam 启动参数
+/// 拉起游戏），该路径就指向宿主而不是游戏安装目录，定位必然失败。改为对
+/// exe 目录与当前工作目录各向上回溯若干层，可覆盖"宿主 exe 放在游戏子目录"
+/// 与"Steam 设置 CWD 为游戏目录"两类常见布局。
+///
+/// 显式加载后，游戏 `DllImport("SimDLL")` 首次解析会按文件名命中该已加载
+/// 模块，入口已被接管。
 #[cfg(windows)]
 unsafe fn locate_original_module() -> Option<HMODULE> {
+    // 1) 已在进程内
     if let Ok(h) = GetModuleHandleA(PCSTR(b"SimDLL.dll\0".as_ptr())) {
+        tracing::info!("original SimDLL.dll already resident in process");
         return Some(h);
     }
 
-    // exe 路径（GetModuleFileNameW(NULL)）→ 目录 → Plugins\x86_64\SimDLL.dll
-    let mut buf = [0u16; 1024];
-    let len = GetModuleFileNameW(GetModuleHandleW(None).ok()?, &mut buf);
-    if len == 0 {
-        return None;
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // 2) 显式覆盖
+    if let Some(p) = std::env::var_os("SIMDLL_RS_ORIGINAL_DLL") {
+        candidates.push(std::path::PathBuf::from(p));
     }
-    let exe = String::from_utf16_lossy(&buf[..len as usize]);
-    let exe_dir = std::path::Path::new(&exe).parent()?.to_path_buf();
-    let candidate = exe_dir
-        .join("OxygenNotIncluded_Data")
-        .join("Plugins")
-        .join("x86_64")
-        .join("SimDLL.dll");
-    if !candidate.exists() {
-        tracing::error!(path = ?candidate, "original SimDLL.dll not found on disk");
-        return None;
+    if let Some(d) = std::env::var_os("SIMDLL_RS_GAME_DIR") {
+        push_plugin_candidates(&mut candidates, std::path::Path::new(&d));
     }
-    let wide: Vec<u16> = candidate
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    match LoadLibraryW(PCWSTR(wide.as_ptr())) {
-        Ok(h) => {
-            tracing::info!(path = ?candidate, "loaded original SimDLL.dll");
-            Some(h)
-        }
-        Err(e) => {
-            tracing::error!(path = ?candidate, error = ?e, "LoadLibraryW failed");
-            None
+
+    // 3) 多根向上回溯
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(h) = GetModuleHandleW(None) {
+        let mut buf = [0u16; 1024];
+        let len = GetModuleFileNameW(h, &mut buf);
+        if len > 0 {
+            let exe = String::from_utf16_lossy(&buf[..len as usize]);
+            if let Some(dir) = std::path::Path::new(&exe).parent() {
+                roots.push(dir.to_path_buf());
+            }
         }
     }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    for root in &roots {
+        // 6 层足够覆盖 <game>/bin/host/... 之类的嵌套，且不会扫到盘符根。
+        for anc in root.ancestors().take(6) {
+            push_plugin_candidates(&mut candidates, anc);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|p| seen.insert(p.clone()));
+
+    for candidate in &candidates {
+        if !candidate.exists() {
+            continue;
+        }
+        let wide: Vec<u16> = candidate
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        match LoadLibraryW(PCWSTR(wide.as_ptr())) {
+            Ok(h) => {
+                tracing::info!(path = ?candidate, "loaded original SimDLL.dll");
+                return Some(h);
+            }
+            Err(e) => {
+                tracing::error!(path = ?candidate, error = ?e, "LoadLibraryW failed");
+            }
+        }
+    }
+
+    // 全部失败：把试过的路径原样打出来，方便用户按日志设置环境变量。
+    tracing::error!(
+        tried = ?candidates,
+        "original SimDLL.dll not found; set SIMDLL_RS_ORIGINAL_DLL to its full path \
+         or SIMDLL_RS_GAME_DIR to the game root"
+    );
+    None
 }
 
 /// 在目标函数入口写 12 字节绝对跳转：
@@ -288,26 +341,85 @@ unsafe fn resolve_original_export(name: &[u8]) -> Option<*mut c_void> {
     Some(sym as *mut c_void)
 }
 
-/// exe 路径（/proc/self/exe）→ 游戏目录 → 原版 SimDLL.so 候选路径。
-/// Unity Linux 原生插件命名为 libSimDLL.so；兼容 SimDLL.so。
+/// 往候选列表里塞 libSimDLL.so / SimDLL.so（Unity Linux 原生插件命名）。
 #[cfg(target_os = "linux")]
-fn original_so_candidates() -> Vec<std::path::PathBuf> {
-    let exe = match std::fs::read_link("/proc/self/exe") {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = ?e, "readlink /proc/self/exe failed");
-            return Vec::new();
-        }
-    };
-    let exe_dir = match exe.parent() {
-        Some(d) => d.to_path_buf(),
-        None => return Vec::new(),
-    };
-    let plugins = exe_dir
+fn push_so_candidates(out: &mut Vec<std::path::PathBuf>, root: &std::path::Path) {
+    let plugins = root
         .join("OxygenNotIncluded_Data")
         .join("Plugins")
         .join("x86_64");
-    vec![plugins.join("libSimDLL.so"), plugins.join("SimDLL.so")]
+    out.push(plugins.join("libSimDLL.so"));
+    out.push(plugins.join("SimDLL.so"));
+}
+
+/// 从 /proc/self/maps 里找**已经映射进进程**的原版 simDLL 真实路径。
+///
+/// 这是 Linux 侧最可靠的一手：无论宿主用什么路径 dlopen 的，映射表里都是
+/// 真实文件路径，不依赖 exe 位置。必须按文件名精确匹配，否则会把我们自己的
+/// `SimDLL_RS.so`（同样含 "SimDLL" 子串）误认成原版。
+#[cfg(target_os = "linux")]
+fn mapped_simdll_path() -> Option<std::path::PathBuf> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        // 格式：addr perms offset dev inode pathname
+        let Some(path) = line.split_whitespace().nth(5) else {
+            continue;
+        };
+        let Some(name) = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+        else {
+            continue;
+        };
+        if name == "libSimDLL.so" || name == "SimDLL.so" {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    None
+}
+
+/// 原版 SimDLL.so 候选路径（2026-10-29 兼容性重做）。
+///
+/// 顺序：环境变量显式指定 → /proc/self/maps 已映射路径 → 多根向上回溯。
+/// 原实现只看 `/proc/self/exe` 同级目录，宿主不是原版播放器时（如 oni-moono
+/// 用自己的 host 二进制）会整体失效。
+#[cfg(target_os = "linux")]
+fn original_so_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Some(p) = std::env::var_os("SIMDLL_RS_ORIGINAL_SO") {
+        candidates.push(std::path::PathBuf::from(p));
+    }
+    if let Some(d) = std::env::var_os("SIMDLL_RS_GAME_DIR") {
+        push_so_candidates(&mut candidates, std::path::Path::new(&d));
+    }
+
+    if let Some(p) = mapped_simdll_path() {
+        tracing::info!(path = ?p, "original SimDLL.so found via /proc/self/maps");
+        candidates.push(p);
+    }
+
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    match std::fs::read_link("/proc/self/exe") {
+        Ok(exe) => {
+            if let Some(dir) = exe.parent() {
+                roots.push(dir.to_path_buf());
+            }
+        }
+        Err(e) => tracing::error!(error = ?e, "readlink /proc/self/exe failed"),
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    for root in &roots {
+        for anc in root.ancestors().take(6) {
+            push_so_candidates(&mut candidates, anc);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|p| seen.insert(p.clone()));
+    candidates
 }
 
 /// 定位（必要时显式加载）原版 SimDLL.so。返回 dlopen 句柄。
@@ -331,6 +443,7 @@ unsafe fn locate_original_module() -> Option<*mut libc::c_void> {
         }
     }
     // 未加载 → 显式加载。
+    let all = candidates.clone();
     candidates.retain(|c| c.exists());
     for c in &candidates {
         let cpath = match std::ffi::CString::new(c.as_os_str().to_string_lossy().as_bytes()) {
@@ -344,7 +457,11 @@ unsafe fn locate_original_module() -> Option<*mut libc::c_void> {
         }
         tracing::error!(path = ?c, error = ?std::io::Error::last_os_error(), "dlopen failed");
     }
-    tracing::error!("original SimDLL.so not found on disk");
+    tracing::error!(
+        tried = ?all,
+        "original SimDLL.so not found; set SIMDLL_RS_ORIGINAL_SO to its full path \
+         or SIMDLL_RS_GAME_DIR to the game root"
+    );
     None
 }
 

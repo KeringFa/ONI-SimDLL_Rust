@@ -66,7 +66,22 @@ namespace SimDLL_Rust
             int installed = Native.RS_LoaderInstall();
             if (installed <= 0)
             {
-                throw new InvalidOperationException("SimDLL_Rust: RS_LoaderInstall 失败，安装数=" + installed);
+                // 2026-10-29 兼容性：定位不到原版 simDLL、或导出缺失时不再抛异常
+                // 中断整条 mod 加载链，而是明确告警并回落原版模拟——第三方宿主
+                // （如 oni-moono 用自己的 exe 启动游戏）下仍能正常进游戏。
+                // 开发排障可用 SIMDLL_RS_STRICT=1 恢复硬失败。
+                string msg =
+                    "[SimDLL_Rust] RS_LoaderInstall 未能接管任何导出（安装数=" + installed + "），"
+                    + "已回落原版模拟。若当前宿主不是原版播放器（例如 oni-moono），"
+                    + "请设置环境变量 SIMDLL_RS_ORIGINAL_DLL 为原版 SimDLL.dll 的完整路径，"
+                    + "或 SIMDLL_RS_GAME_DIR 为游戏根目录后重试。日志中的 tried 列表列出了全部尝试路径。";
+                Debug.LogError(msg);
+                SimAvailable = false;
+                if (Environment.GetEnvironmentVariable("SIMDLL_RS_STRICT") == "1")
+                {
+                    throw new InvalidOperationException(msg);
+                }
+                return;
             }
 
             // 加载 mod 配置并应用到 Rust 日志级别（config.json，Options 屏可改）
