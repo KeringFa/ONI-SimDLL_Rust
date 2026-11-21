@@ -1154,7 +1154,9 @@ fn process_building_heat_exchange_messages(frame: &mut SimFrameInfo, sim_data: &
                         callback_idx: msg.callback_idx,
                         sim_handle: handle,
                     });
-                tracing::info!(
+                // 噪音（每个热交换消息一条，实测约 238 条/帧）：降为 debug。
+                // 这行本身就在吃性能——格式化+写盘被算进 emitters 阶段。
+                tracing::debug!(
                     callback = msg.callback_idx,
                     handle,
                     "building_temperature: handle callback pushed"

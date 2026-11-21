@@ -27,9 +27,10 @@ pub(crate) fn run_region_physics_a(
     if bounds.is_empty() {
         return;
     }
-    // 自然固体强度推导（原版在固体生成/加载时赋予质量型抗压字节；每帧按活动区域兜底，
-    // 覆盖岩浆凝固/沙盒生成等运行时新出现的固体，随后压力分支据此计算抗压阈值）。
-    crate::c_simulation::sim_data_ops::derive_natural_solid_strength(sim_data, bounds);
+    // 自然固体强度曾是每帧兜底（补 0 强度格，供压力分支算抗压阈值）。
+    // 2026-11-21 起改为“载入/分配即填默认 0x84”（见 save_load 与 sim_data），
+    // 全网格不再有 0 强度格 → 每帧扫 22 万格纯属空转，故移除。
+    // 若将来有路径会造出 0 强度格，必须重新接回 derive_natural_solid_strength。
     // 温度段（含并行/串行两分支与队列调度开销——都归属温度阶段成本）
     crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_TEMPERATURE, {
         if parallel {
@@ -42,10 +43,22 @@ pub(crate) fn run_region_physics_a(
             // 是临时量，语句结束即释放，后续 submit/wait_all 无锁使用裸指针（UAF 隐患）。
             let queue_guard = crate::globals::G_PARALLEL_TASK_QUEUE.lock();
             let queue_ptr = queue_guard.0;
-            if !queue_ptr.is_null() {
+            let n_workers = if queue_ptr.is_null() {
+                1
+            } else {
+                unsafe { (*queue_ptr).worker_count().max(1) }
+            };
+            let total_rows = bounds.max_y.saturating_sub(bounds.min_y);
+            if queue_ptr.is_null() || n_workers <= 1 || total_rows <= 2 {
+                // 单带：直接内联，省掉一次条件变量往返（数值与走队列完全相同）。
+                crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+            } else {
                 let queue = unsafe { &*queue_ptr };
-                let n_workers = queue.worker_count().max(1);
-                let total_rows = bounds.max_y - bounds.min_y;
+                // 每带独立事件缓冲：相变（substance_change）与生成矿物（spawn_ore）
+                // 经线程局部 sink 写入本带缓冲，wait_all 后按带序归并。
+                // 带序 = 行序，因此全局事件顺序与逐行串行扫描完全一致（确定性）。
+                let mut band_events: Vec<crate::c2_physics::region_events::RegionEvents> =
+                    (0..n_workers).map(|_| Default::default()).collect();
                 let base = total_rows / n_workers;
                 let extra = total_rows % n_workers;
                 let mut row = bounds.min_y;
@@ -57,9 +70,19 @@ pub(crate) fn run_region_physics_a(
                     }
                     let row_end = row + band_rows;
                     let ptr = crate::globals::SendSyncPtr(sim_data as *mut SimData);
+                    let sink: crate::globals::SendSyncPtr<
+                        crate::c2_physics::region_events::RegionEvents,
+                    > = crate::globals::SendSyncPtr(&mut band_events[i] as *mut _);
                     let b = bounds;
                     queue.submit(Box::new(move || {
-                        crate::c2_physics::temperature::run_temperature_band_task(ptr, b, row, row_end);
+                        // 用 get() 强制捕获整个 SendSyncPtr：直接访问 `.0` 字段
+                        // 在 Rust 2021 disjoint capture 下只捕获裸指针，绕过 Send。
+                        let sink_ptr = sink.get();
+                        crate::c2_physics::region_events::with_region_sink(sink_ptr, || {
+                            crate::c2_physics::temperature::run_temperature_band_task(
+                                ptr, b, row, row_end,
+                            );
+                        });
                     }));
                     row = row_end;
                     submitted += 1;
@@ -67,8 +90,10 @@ pub(crate) fn run_region_physics_a(
                 if submitted > 0 {
                     queue.wait_all();
                 }
-            } else {
-                crate::c2_physics::temperature::run_temperature_task(sim_data, bounds);
+                // 按带序归并 → 与串行逐行扫描的事件顺序一致。
+                for ev in band_events.iter_mut() {
+                    ev.merge_into(sim_data);
+                }
             }
         }
     });
@@ -151,19 +176,19 @@ pub(crate) fn run_region_physics_c(
     if bounds.is_empty() {
         return;
     }
-    // 阶段 C 开头的自然固体强度推导：A 阶段温度/相变与 B 阶段发射器新生成的固体，
-    // 在进入 PostProcess（含 DoPressureBreak 超压检查）前补上强度，做到同 tick 生效。
-    // 用 bounds（区域边界）而非 pp_bounds：相邻区域的 post-process 边界会重叠 1 格，
-    // 并行下并发写同一格不安全；区域边界互不重叠。
-    crate::c_simulation::sim_data_ops::derive_natural_solid_strength(sim_data, bounds);
+    // 阶段 C 开头曾在此处再补一次自然固体强度（A/B 阶段新生成的固体要在
+    // PostProcess 的超压检查前生效）。同上：默认值改 0x84 后该推导为空转，已移除。
     // 2026-08-10 修复（顶部格层气体残留 bug）：原版 L145445-145460 太空删除的
     // 遍历边界用 **PostProcess 边界**（32 格块对齐 + max+1），即世界上方/右方
     // 1 格（太空格）也在删除范围内；此前误用普通区域边界 → 顶部格层气体扩散到
     // 世界上方太空格后不被删除，删除主格后残留随机闪现、缓慢消失。
-    let _t0 = std::time::Instant::now();
-    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_POSTPROCESS, {
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_PP_VACUUM, {
         crate::c2_physics::liquid_flow::run_space_vacuum_task(sim_data, pp_bounds);
+    });
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_PP_LOOP, {
         crate::c2_physics::liquid_flow::post_process_loop(sim_data, pp_bounds);
+    });
+    crate::sim_stage_timed!(crate::a_framework::stage_profiler::STAGE_PP_DISEASE, {
         crate::c2_physics::disease::run_disease_growth_task(sim_data, bounds);
     });
 }

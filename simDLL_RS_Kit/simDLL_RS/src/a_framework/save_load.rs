@@ -118,17 +118,27 @@ pub fn clean_up() {
 /// 数据格式：width(int) + height(int) + flag1(bool) + flag2(bool)
 /// 创建 SimData（width+2, height+2，含边界）并替换全局 gSimData。
 /// 返回 gSimData 指针。
+/// 当前 Unix 秒 —— 原版 `_time64(NULL)` 的等价物（SimData 随机种子的来源）。
+fn now_unix_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
 pub fn handle_allocate_cells(reader: &mut BinaryBufferReader) -> *mut c_void {
     let width = reader.read_int().unwrap_or(0);
     let height = reader.read_int().unwrap_or(0);
     let flag1 = reader.read_bool().unwrap_or(false);
     let flag2 = reader.read_bool().unwrap_or(false);
 
-    // 获取当前时间作为随机种子（对照源码 _time64）
-    let random_seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    // 获取当前时间作为随机种子（对照源码 _time64 返回的 Unix 秒）。
+    // abtest 特性下优先取时钟锁的值：A/B 逐格对拍必须两轮同源，否则测到的
+    // 全是随机噪声（详见 a_framework::clock_lock 的说明）。发布版不含该路径。
+    #[cfg(feature = "abtest")]
+    let random_seed = crate::a_framework::clock_lock::locked_seed().unwrap_or_else(now_unix_secs);
+    #[cfg(not(feature = "abtest"))]
+    let random_seed = now_unix_secs();
 
     // 创建 SimData（width+2, height+2，含边界）
     // 对照源码 L282-283: SimData::SimData(this, width+2, height+2, time, flag1, flag2)
@@ -513,7 +523,7 @@ pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
 
     // ===== 2. 从 cells 提取 9 个 SOA 指针 =====
     let cells_ptr = game_data.cells.ptr;
-    tracing::info!(
+    tracing::debug!(
         cells_ptr_null = cells_ptr.is_null(),
         gd_width = game_data.width,
         gd_height = game_data.height,
@@ -523,7 +533,7 @@ pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
         let cells = unsafe { &*cells_ptr };
 
         // 诊断：记录 cells 各 vector 的长度
-        tracing::info!(
+        tracing::debug!(
             elem_len = cells.element_idx.len(),
             temp_len = cells.temperature.len(),
             mass_len = cells.mass.len(),
@@ -675,7 +685,7 @@ pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
     // L820-827: callbackInfo (CallbackInfo, 4B, >>2)
     gdu.num_callback_info = game_data.callback_info.len() as i32;
     // 诊断：记录本帧 callbackInfo 总量（C# StepTheSim 遍历，越界崩溃排查用）
-    tracing::info!(
+    tracing::debug!(
         count = gdu.num_callback_info,
         "PrepareGameData callback_info count"
     );
@@ -924,7 +934,7 @@ pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
     let disease_idx_val = gdu.disease_idx;
     let disease_count_val = gdu.disease_count;
     let accumulated_flow_val = gdu.accumulated_flow;
-    tracing::info!(
+    tracing::debug!(
         gdu_ptr = ?ptr,
         elem_idx = ?elem_idx_val,
         temperature = ?temperature_val,
@@ -1504,8 +1514,15 @@ pub fn handle_initialize_from_cells(reader: &mut BinaryBufferReader) -> *mut c_v
                 cells.element_idx.set(dst, reader.read_u16_at(src).unwrap_or(0));
                 cells.properties.set(dst, reader.read_u8_at(src + 2).unwrap_or(0));
                 cells.insulation.set(dst, reader.read_u8_at(src + 3).unwrap_or(0));
+                // strength（抗液压强度）：0 = 存档未设置 → 原版填默认值 0x84，
+                // 非 0 才采用存档值。实测原版该表 223,731 格为 0x84、13 格为 4
+                // （与存档携带值一致），**无任何 0**。此前 Rust 直接写存档字节，
+                // 导致 151,153 格强度为 0 → 固体方块抗液压强度远低于原版。
+                // 0x84 = 位7(质量型标志) | 4(强度 1.0×4)。
                 let strength = reader.read_u8_at(src + 4).unwrap_or(0);
-                cells.strength_info.set(dst, strength);
+                cells
+                    .strength_info
+                    .set(dst, if strength == 0 { 0x84 } else { strength });
                 cells.temperature.set(dst, reader.read_f32_at(src + 8).unwrap_or(0.0));
                 cells.mass.set(dst, reader.read_f32_at(src + 12).unwrap_or(0.0));
                 cells.radiation.set(dst, 0.0);
@@ -2660,7 +2677,12 @@ mod tests {
                     assert_eq!(cells.element_idx.get(dst), 100 + i as u16, "element_idx @{}", i);
                     assert_eq!(cells.properties.get(dst), 0);
                     assert_eq!(cells.insulation.get(dst), 50 + i as u8);
-                    assert_eq!(cells.strength_info.get(dst), 0);
+                    assert_eq!(
+                        cells.strength_info.get(dst),
+                        0x84,
+                        "strength 存档为 0 时应取默认 0x84 @{}",
+                        i
+                    );
                     assert_eq!(cells.temperature.get(dst), 300.0 + i as f32);
                     assert_eq!(cells.mass.get(dst), 1000.0 + i as f32);
                     assert_eq!(cells.radiation.get(dst), 0.0);

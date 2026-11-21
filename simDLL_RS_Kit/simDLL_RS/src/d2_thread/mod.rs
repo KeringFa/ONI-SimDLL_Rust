@@ -19,13 +19,55 @@
 //! - wait_all：lock → while mTaskCount!=0 → wait(完成条件变量)。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// 任务：`FnOnce` 闭包。温度行带任务捕获 `SendSyncPtr<SimData>` + 区域边界 + 行带范围，
 /// 在 worker 内 `unsafe { &mut *ptr }` 访问 sim（1 worker 串行，安全；
 /// 多 worker 扩展需保证各带写不同行，且遵循原版原始指针模型）。
 type Task = Box<dyn FnOnce() + Send>;
+
+/// 温度行带 worker 数：`0` = 自动（物理核 − 预留核，最小 1）；`>0` = 指定值。
+///
+/// 默认 **1** = 与原版 `ParallelTaskQueue(queue, 1)` 一致（单带、整区一个任务）。
+/// 改成 >1 会把温度区域切成多行带并行执行，代价见 `run_temperature_band`
+/// 的 `below_limit` 注释（每带边界丢一对竖向热交换）。
+static TASK_WORKERS: AtomicI32 = AtomicI32::new(1);
+
+/// 解析实际生效的行带 worker 数。
+pub fn task_worker_count() -> usize {
+    let cfg = TASK_WORKERS.load(Ordering::Relaxed);
+    if cfg > 0 {
+        return cfg as usize;
+    }
+    // 自动：物理核 − 预留主线程核，至少 1。
+    #[cfg(feature = "d3-rayon")]
+    {
+        let topo = crate::d3_rayon::affinity::CpuTopology::cached();
+        let reserved = crate::d3_rayon::scheduler::reserved_cores();
+        topo.physical_cores
+            .saturating_sub(reserved)
+            .max(1)
+    }
+    #[cfg(not(feature = "d3-rayon"))]
+    {
+        std::thread::available_parallelism()
+            .map(|n| n.get() / 2)
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
+/// 设置温度行带 worker 数（0..=64；0=自动）。返回实际生效值；非法输入返回 -1。
+/// 必须在 `SIM_Initialize`（建队列）之前调用，否则本局不生效、下次读档生效。
+#[no_mangle]
+pub extern "C" fn RS_SetTaskWorkers(workers: i32) -> i32 {
+    if !(0..=64).contains(&workers) {
+        return -1;
+    }
+    TASK_WORKERS.store(workers, Ordering::Relaxed);
+    task_worker_count() as i32
+}
 
 struct QueueState {
     tasks: VecDeque<Task>,

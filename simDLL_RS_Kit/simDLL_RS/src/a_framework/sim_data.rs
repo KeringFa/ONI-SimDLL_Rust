@@ -292,7 +292,10 @@ impl CellSOA {
         s.mass.resize(n, 0.0f32);
         s.properties.resize(n, 0u8);
         s.insulation.resize(n, 0u8);
-        s.strength_info.resize(n, 0u8);
+        // strength_info 默认 0x84（位7 质量型标志 | 强度1.0×4）：
+        // 实测原版该表无任何 0 值，空世界/新分配也应是这个默认
+        //（0 会让固体方块抗液压强度退化，见 save_load 加载循环处的说明）。
+        s.strength_info.resize(n, 0x84);
         s.disease_idx.resize(n, 0u8);
         s.disease_count.resize(n, 0i32);
         s.disease_infestation_tick_count.resize(n, 0u8);

@@ -2,6 +2,8 @@
 name = "simdll_rs"
 version = "0.1.0"
 edition = "2021"
+# MSRV：Cargo.lock 为 v4 格式，Cargo >= 1.78 才能读；实际构建跟随 rust-toolchain.toml 的 stable。
+rust-version = "1.78"
 build = "build.rs"
 description = "Rust port of Oxygen Not Included's simDLL.dll"
 
@@ -41,6 +43,8 @@ libc = "0.2"
 [features]
 default = []
 d3-rayon = ["dep:rayon"]
+# A/B 对拍专用：编译时钟锁（RS_InstallClockLock）。发布版不启用。
+abtest = []
 
 [profile.release]
 panic = "unwind"

@@ -4,6 +4,8 @@
 
 pub mod abi;
 pub mod buffer;
+#[cfg(feature = "abtest")]
+pub mod clock_lock;
 // crashdump 依赖 Windows SEH（SetUnhandledExceptionFilter + MiniDumpWriteDump），
 // Linux 下以 no-op 存根替代（崩溃转储为 Windows 专属诊断能力）。
 #[cfg(windows)]

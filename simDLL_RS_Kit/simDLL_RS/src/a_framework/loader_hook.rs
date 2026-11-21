@@ -262,7 +262,7 @@ unsafe fn locate_original_module() -> Option<HMODULE> {
 /// `48 B8 <imm64>` mov rax, dest；`FF E0` jmp rax。
 /// 返回 false 表示 VirtualProtect/写入失败。
 #[cfg(windows)]
-unsafe fn install_absolute_jump(target: *mut c_void, dest: *const c_void) -> bool {
+pub(crate) unsafe fn install_absolute_jump(target: *mut c_void, dest: *const c_void) -> bool {
     const JUMP_SIZE: usize = 12;
     let mut old_protect = PAGE_PROTECTION_FLAGS(0);
     if VirtualProtect(
@@ -470,7 +470,7 @@ unsafe fn locate_original_module() -> Option<*mut libc::c_void> {
 /// （原版 .so 代码段为 r-xp）。x86_64 自修改代码硬件保证一致性，
 /// 无需显式刷指令缓存。
 #[cfg(target_os = "linux")]
-unsafe fn install_absolute_jump(target: *mut c_void, dest: *const c_void) -> bool {
+pub(crate) unsafe fn install_absolute_jump(target: *mut c_void, dest: *const c_void) -> bool {
     const JUMP_SIZE: usize = 12;
     let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
     if page == 0 {

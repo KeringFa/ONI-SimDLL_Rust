@@ -38,6 +38,43 @@ pub fn bin_pack_region_groups(
     out
 }
 
+/// 最近一次装箱结果的诊断行（随 perf 5 秒窗口输出，**不参与调度**）。
+///
+/// 为什么需要：并行收益的天花板 = 总面积 / 最大星球面积（星球不可拆），
+/// 而"该开几个线程"还受内存带宽约束（实测 8 物理核上 7 线程反而比 4 线程慢）。
+/// 这两件事光看核数推不出来，必须看实际装箱负载。
+static LAST_PACK_LINE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn record_pack(threads: usize, bounds: &[RegionBounds], groups: &[Vec<usize>]) {
+    let loads = group_loads(bounds, groups);
+    let total: u64 = loads.iter().sum();
+    let largest = bounds.iter().map(|b| b.cell_count()).max().unwrap_or(0);
+    let bound = if largest == 0 {
+        0.0
+    } else {
+        total as f64 / largest as f64
+    };
+    let line = format!(
+        "[simdll-packs] threads={} groups={} regions={} largest={} total={} bound={:.2}x loads={:?}
+",
+        threads,
+        groups.len(),
+        bounds.len(),
+        largest,
+        total,
+        bound,
+        loads
+    );
+    if let Ok(mut g) = LAST_PACK_LINE.lock() {
+        *g = Some(line);
+    }
+}
+
+/// 取出装箱诊断行（取出即清空，避免同一结果被重复打印）。
+pub fn take_pack_line() -> Option<String> {
+    LAST_PACK_LINE.lock().ok().and_then(|mut g| g.take())
+}
+
 /// 各组累计面积（测试/诊断用）。
 pub fn group_loads(bounds: &[RegionBounds], groups: &[Vec<usize>]) -> Vec<u64> {
     groups

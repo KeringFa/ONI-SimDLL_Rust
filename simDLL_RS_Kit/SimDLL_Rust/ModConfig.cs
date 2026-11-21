@@ -30,6 +30,13 @@ namespace SimDLL_Rust
         public const int DEFAULT_RESERVED_CORES = 1;
         public const int MAX_RESERVED_CORES = 4;
 
+        /// 温度行带 worker 数：0=自动（物理核−预留核），1=与原版一致（默认），>1=切带并行。
+        /// 仅影响温度阶段；写频率低，改完读档生效。
+        public static int TaskWorkers { get; private set; } = 1;
+
+        public const int MIN_TASK_WORKERS = 0;
+        public const int MAX_TASK_WORKERS = 16;
+
         public static void Load(string path)
         {
             modPath = path;
@@ -45,6 +52,7 @@ namespace SimDLL_Rust
                         LogEnabled = data.LogEnabled;
                         HyperThreadOptimizationEnabled = data.HyperThreadOptimizationEnabled;
                         ReservedCores = ClampReservedCores(data.ReservedCores);
+                        TaskWorkers = ClampTaskWorkers(data.TaskWorkers);
                     }
                 }
             }
@@ -87,6 +95,19 @@ namespace SimDLL_Rust
         public static int ClampReservedCores(int value)
             => Math.Min(Math.Max(value, DEFAULT_RESERVED_CORES), MAX_RESERVED_CORES);
 
+        public static void SetTaskWorkers(int value)
+        {
+            int clamped = ClampTaskWorkers(value);
+            if (TaskWorkers != clamped)
+            {
+                TaskWorkers = clamped;
+                Dirty = true;
+            }
+        }
+
+        public static int ClampTaskWorkers(int value)
+            => Math.Min(Math.Max(value, MIN_TASK_WORKERS), MAX_TASK_WORKERS);
+
         /// 应用当前配置到 Rust 日志（调用 RS_SetLogEnabled）。
         /// 原生库未加载（平台不支持/加载失败）时短路——防止二次 P/Invoke 崩溃。
         public static void Apply()
@@ -94,6 +115,7 @@ namespace SimDLL_Rust
             if (!Native.IsAvailable) return;
             Native.RS_SetLogEnabled(LogEnabled);
             Native.RS_SetReservedCores(ReservedCores);
+            Native.RS_SetTaskWorkers(TaskWorkers);
         }
 
         public static void Save()
@@ -108,6 +130,7 @@ namespace SimDLL_Rust
                     LogEnabled = LogEnabled,
                     HyperThreadOptimizationEnabled = HyperThreadOptimizationEnabled,
                     ReservedCores = ReservedCores,
+                    TaskWorkers = TaskWorkers,
                 };
                 File.WriteAllText(configPath, JsonConvert.SerializeObject(data, Formatting.Indented));
                 Dirty = false;
@@ -123,6 +146,7 @@ namespace SimDLL_Rust
             public bool LogEnabled { get; set; } = false;
             public bool HyperThreadOptimizationEnabled { get; set; } = false;
             public int ReservedCores { get; set; } = DEFAULT_RESERVED_CORES;
+            public int TaskWorkers { get; set; } = 1;
         }
     }
 }

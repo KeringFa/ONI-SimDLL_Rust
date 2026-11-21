@@ -31,6 +31,7 @@ namespace SimDLL_Rust
         private static IntFromBoolFn _setLogEnabled;
         private static IntFromIntFn _setSchedulerMode;
         private static IntFromIntFn _setReservedCores;
+        private static IntFromIntFn _setTaskWorkers;
 
         /// 原生库是否已加载且符号解析完成。失败（如不支持的架构）时为 false，
         /// 所有入口短路返回失败值——调用方据此回落原版 sim。
@@ -49,6 +50,12 @@ namespace SimDLL_Rust
                     GetAddress(nativeModule, "RS_SetSchedulerMode"));
                 _setReservedCores = Marshal.GetDelegateForFunctionPointer<IntFromIntFn>(
                     GetAddress(nativeModule, "RS_SetReservedCores"));
+                // 可选符号：旧版 .sim 没有该导出，缺失时保持 null（Apply 里判空）。
+                IntPtr tw = GetAddress(nativeModule, "RS_SetTaskWorkers");
+                if (tw != IntPtr.Zero)
+                {
+                    _setTaskWorkers = Marshal.GetDelegateForFunctionPointer<IntFromIntFn>(tw);
+                }
                 IsAvailable = true;
             }
             catch (Exception e)
@@ -102,6 +109,11 @@ namespace SimDLL_Rust
         /// 设置预留物理线程数（1~4）：留给游戏主线程/系统，D1/D2 并行路径通用。
         /// 返回实际生效值；非法输入返回 -1。
         internal static int RS_SetReservedCores(int cores) => _setReservedCores(cores);
+
+        /// 设置温度行带 worker 数（0=自动＝物理核−预留核；1=与原版一致；>1 并行切带）。
+        /// 必须在 SIM_Initialize 之前生效。旧版 .sim 无此导出时返回 -1（不改行为）。
+        internal static int RS_SetTaskWorkers(int workers)
+            => _setTaskWorkers == null ? -1 : _setTaskWorkers(workers);
 
         // ===== Sim API（9）—— ABI 参照声明，C# 无调用者（游戏经 detour 直调）=====
         [DllImport("SimDLL_RS.sim")]

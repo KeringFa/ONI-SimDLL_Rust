@@ -115,7 +115,10 @@ pub mod globals {
             }
             g.0 = std::ptr::null_mut();
         }
-        let q = Box::new(crate::d2_thread::ParallelTaskQueue::new(1));
+        // worker 数由 RS_SetTaskWorkers 配置（默认 1 = 与原版一致）。
+        // >1 时温度按行带并行，见 c2_physics::run_region_physics_a。
+        let n = crate::d2_thread::task_worker_count();
+        let q = Box::new(crate::d2_thread::ParallelTaskQueue::new(n));
         q.start_workers();
         g.0 = Box::into_raw(q);
     }

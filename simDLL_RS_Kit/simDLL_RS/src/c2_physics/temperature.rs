@@ -898,6 +898,12 @@ pub(crate) fn run_temperature_band(
     if w < 3 || h < 3 {
         return;
     }
+    // 下邻对的下界。多个行带并行时，若某带的最后一行仍做「下邻对」，
+    // 它会写 updated_cells[row_end]——那一格属于下一带，两个 worker 对同一
+    // f32 做 `+=`，丢更新且不可复现。所以非末带一律在 row_end 处收手
+    // （代价：每带边界丢一对竖向热交换，n 带则 n-1 行）。
+    // 末带保持原版语义（允许跨出区域下边界到 h-1），保证 worker=1 时逐字节一致。
+    let below_limit = if row_end >= bounds.max_y { h - 1 } else { row_end };
     for row in row_start..row_end {
                 for col in bounds.min_x..bounds.max_x {
             if row >= h - 1 || col >= w - 1 {
@@ -939,7 +945,7 @@ pub(crate) fn run_temperature_band(
                     }
                 }
             }
-            if row + 1 < h - 1 && (t_self - t_below).abs() >= 1.0 {
+            if row + 1 < below_limit && (t_self - t_below).abs() >= 1.0 {
                 let c = unsafe { &*sim.cells.ptr };
                 if let (Some(ea), Some(eb)) = (
                     get_element_temperature_data(c.element_idx.get(cell)),

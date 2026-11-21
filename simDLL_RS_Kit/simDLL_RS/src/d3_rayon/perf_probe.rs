@@ -65,6 +65,12 @@ pub fn frame_done(region_count: usize, mode: i32, threads: usize, elapsed_us: u6
             avg_us as f64 / 1000.0,
             p.max_us as f64 / 1000.0
         );
+        // ⚠️ 已知异常（2026-11-21 实测，未解）：sim_to_game 报 23~34ms/帧，
+        // 而整帧 update_data 只有 8.2~8.9ms，且拷贝同样数据量的 STAGE_COPY 仅 0.6ms。
+        // 已排除：线程争抢（ReservedCores 4 → 线程 7→4，该值不变）、内存重分配
+        // （MsvcVector::resize 容量内只改 end）。**读日志时不要把它当纯工作量**，
+        // 想追查需先在 copy_sim_data_to_game 内做二级埋点（cells/backwall/events）。
+        //
         // 阶段分解行（2026-09-06 方向 A）：与 SimDLL_PerfProbe（C# 侧）互补。
         // 口径标注：copy/emitters/sim_to_game = 主线程串行段（真实墙钟）；
         // 其余 = 阶段 A/C rayon worker 内 CPU 累计（并行下 > 墙钟，除以并行
@@ -99,6 +105,10 @@ pub fn frame_done(region_count: usize, mode: i32, threads: usize, elapsed_us: u6
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
             let _ = f.write_all(stage_line.as_bytes());
+            // 装箱诊断：并行收益上限（总面积/最大星球）与各组负载。
+            if let Some(pack_line) = crate::d3_rayon::bin_pack::take_pack_line() {
+                let _ = f.write_all(pack_line.as_bytes());
+            }
         }
         *p = FrameSample {
             frames: 0,

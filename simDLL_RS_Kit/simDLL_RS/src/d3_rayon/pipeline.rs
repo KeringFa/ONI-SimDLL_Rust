@@ -62,6 +62,8 @@ pub(crate) fn run_parallel_pipeline(
         &region_bounds,
         pool.current_num_threads(),
     );
+    // 诊断：把本次装箱结果缓存起来，由 perf 窗口打印（不影响调度）。
+    crate::d3_rayon::bin_pack::record_pack(pool.current_num_threads(), &region_bounds, &groups);
     let sim_ptr: SendSyncPtr<SimData> = SendSyncPtr(sim as *mut SimData);
 
     // —— 阶段 A：网格物理并行（温度内联、区域局部 CopyFrom，parallel=true）——

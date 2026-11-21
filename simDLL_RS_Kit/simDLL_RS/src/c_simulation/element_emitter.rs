@@ -6,7 +6,7 @@
 //! - `GetReachableCells`（11_msvcrt_ignored.c L34451）；
 //! - CopySimDataToGame emittedMassInfo 拷贝+清零（11_msvcrt_ignored.c L31626-31648）。
 
-use crate::a_framework::game_data::{CallbackInfo, EmittedMassInfo};
+use crate::a_framework::game_data::{CallbackInfo, EmittedMassInfo, SpawnOreInfo};
 use crate::a_framework::sim_data::SimData;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -566,7 +566,18 @@ fn try_emit(
                 }
             }
             3 => {
-                // 固体：推 MassConsumedCallback（含可见性检查，原版 L1816-1844）
+                // 固体：推 spawnOreInfo（含可见性检查，原版 TheSimDLL_Source L49080-49110）
+                //
+                // 原版该分支把首字段=格子索引写进 SimEvents+0x40 —— 即第 3 个字段
+                // spawnOreInfo（见 SimEvents 字段序：substanceChange 0x00 /
+                // spawnLiquid 0x20 / spawnOre 0x40）。C# 侧把它当"固体落地成资源"
+                // 处理（Game.cs spawnOreInfo 循环 → substance.SpawnResource）。
+                //
+                // 曾经误推 mass_consumed_callbacks（SimEvents+0x160）：两结构体
+                // 布局全同（20B 同字段序），数值看起来一模一样，但 C# 把
+                // massConsumedCallbacks 的首字段当**回调句柄索引**去 Release，
+                // 格子索引灌进只有 64 槽的句柄空间 → versions[] 越界崩溃。
+                // 详见 26-11-3-罕见bug成因与修复方案.txt。
                 if rec.emit_mass > 0.0 {
                     let width = sim.width as usize;
                     let game_cell =
@@ -579,17 +590,15 @@ fn try_emit(
                         };
                         if sim.debug_properties.is_debug_editing || visible != 0 {
                             let events = unsafe { &mut *sim.sim_events.ptr };
-                            events.mass_consumed_callbacks.push(
-                                crate::a_framework::game_data::MassConsumedCallback {
-                                    callback_idx: game_cell,
-                                    elem_idx: rec.elem_idx,
-                                    disease_idx: 0xFF,
-                                    pad: 0,
-                                    mass: rec.emit_mass,
-                                    temperature: emit_temp,
-                                    disease_count: 0,
-                                },
-                            );
+                            events.spawn_ore_info.push(SpawnOreInfo {
+                                cell_idx: game_cell,
+                                elem_idx: rec.elem_idx,
+                                disease_idx: 0xFF,
+                                pad: 0,
+                                mass: rec.emit_mass,
+                                temperature: emit_temp,
+                                disease_count: 0,
+                            });
                         }
                     }
                 }
@@ -864,6 +873,142 @@ mod tests {
         // 发射格（sim 7）应已变成气体
         let u = unsafe { &*sim.updated_cells.ptr };
         assert_eq!(u.element_idx.get(7), 3);
+    }
+
+    /// 回归（2026-11-03）：固体发射分支必须推 **spawn_ore_info**（SimEvents+0x40），
+    /// 绝不能推 mass_consumed_callbacks（+0x160）。
+    ///
+    /// 两个结构体布局完全相同（20B 同字段序），数值上看起来毫无异常，所以这个
+    /// 错误不会编译报错、不会测试失败、日志也看不出异样，只在 C# 侧爆炸：
+    /// massConsumedCallbacks 的首字段被当**回调句柄索引**去 Release，格子索引
+    /// 灌进只有 64 槽的句柄空间 → `versions[index]` 越界抛
+    /// ArgumentOutOfRangeException（ComplexCallbackHandleVector.Release）。
+    ///
+    /// 详见 26-11-3-罕见bug成因与修复方案.txt。此断言是防止同文件第三次犯同类错误。
+    #[test]
+    fn solid_emit_pushes_spawn_ore_not_mass_consumed() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        reset_for_test();
+        init_table();
+        let mut sim = make_sim();
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        let m = ModifyElementEmitterMsg {
+            handle: h,
+            cell_idx: 0,
+            emit_interval: 0.2,
+            emit_mass: 0.002,
+            emit_temperature: 350.0,
+            max_pressure: 10.0,
+            disease_count: 0,
+            element_idx: 2, // init_table：2 = 固体（state=3）
+            max_depth: 2,
+            disease_idx: 0xFF,
+        };
+        assert!(modify_element_emitter(&sim, &m));
+        let b = crate::d1_activity::full_grid_bounds(&sim);
+        update_element_emitters(&mut sim, 0.2, 6, b);
+
+        let events = unsafe { &*sim.sim_events.ptr };
+        let ore = &events.spawn_ore_info;
+        assert!(
+            !ore.is_empty(),
+            "固体发射应推 spawn_ore_info，实际为空"
+        );
+        assert_eq!(ore.get(0).elem_idx, 2, "elem_idx 应为固体元素");
+        assert!(ore.get(0).mass > 0.0, "mass 应等于 emit_mass");
+        assert!(
+            ore.get(0).cell_idx >= 0 && ore.get(0).cell_idx < sim.num_game_cells,
+            "cell_idx 应是游戏格索引（不是句柄索引），got {}",
+            ore.get(0).cell_idx
+        );
+        assert_eq!(
+            events.mass_consumed_callbacks.len(),
+            0,
+            "固体分支不得推 mass_consumed_callbacks——C# 句柄空间只有 64 槽，必越界"
+        );
+    }
+
+    /// 端到端（2026-11-21）：固体发射 → sim_events → copy_sim_data_to_game
+    /// → GameData → GameDataUpdate(GDU) → C# 实际读取的字段。
+    ///
+    /// 上一个测试只验到 sim_events 层；本测试补上"能不能真送到托管侧"这一段。
+    /// 链路每一环都可能断：swap 漏字段、GDU 漏赋值、num 与 len 不一致、指针为空。
+    #[test]
+    fn solid_emit_reaches_gdu_spawn_ore_info() {
+        use crate::a_framework::game_data::GameData;
+        use crate::a_framework::game_data_update::GameDataUpdate;
+        use crate::c_simulation::sim_data_ops::copy_sim_data_to_game;
+
+        let _lock = LIB_TESTS_LOCK.lock();
+        reset_for_test();
+        init_table();
+        let mut sim = make_sim();
+        let h = add_element_emitter(
+            &mut sim,
+            &AddElementEmitterMsg {
+                max_pressure: 10.0,
+                ..AddElementEmitterMsg::default()
+            },
+        );
+        let m = ModifyElementEmitterMsg {
+            handle: h,
+            cell_idx: 0,
+            emit_interval: 0.2,
+            emit_mass: 0.002,
+            emit_temperature: 350.0,
+            max_pressure: 10.0,
+            disease_count: 0,
+            element_idx: 2, // 固体
+            max_depth: 2,
+            disease_idx: 0xFF,
+        };
+        assert!(modify_element_emitter(&sim, &m));
+        let b = crate::d1_activity::full_grid_bounds(&sim);
+        update_element_emitters(&mut sim, 0.2, 6, b);
+        assert!(
+            !unsafe { &*sim.sim_events.ptr }.spawn_ore_info.is_empty(),
+            "发射后 sim_events.spawn_ore_info 应有内容"
+        );
+
+        // 一帧结束时的搬运：swap 进 game_data（C# 通过 GDU 指针读的就是这块）
+        // 尺寸留 0：让 cells/property_texture 等按行拷贝走 early-return，
+        // 本测试只关心事件向量的搬运，不关心格子数据（格子搬运另有测试覆盖）。
+        let mut game = GameData::default();
+        unsafe {
+            copy_sim_data_to_game(&mut sim, &mut game, std::ptr::null(), 1);
+        }
+        let ore_len = game.spawn_ore_info.len();
+        assert!(ore_len > 0, "copy 后 game_data.spawn_ore_info 应有内容");
+        assert!(
+            game.mass_consumed_callbacks.is_empty(),
+            "搬运后不得混入质量消费回调"
+        );
+        assert!(
+            unsafe { &*sim.sim_events.ptr }.spawn_ore_info.is_empty(),
+            "swap 后源向量应被换空（否则下一帧会重复投递）"
+        );
+
+        // GDU 填充：C# 直接读 numSpawnOreInfo / spawnOreInfo
+        let gdu_ptr = crate::a_framework::save_load::prepare_game_data_update(&game);
+        assert!(!gdu_ptr.is_null(), "prepare_game_data_update 不得返回 null");
+        let gdu = gdu_ptr as *const GameDataUpdate;
+        let (n, p) = unsafe {
+            (
+                std::ptr::addr_of!((*gdu).num_spawn_ore_info).read_unaligned(),
+                std::ptr::addr_of!((*gdu).spawn_ore_info).read_unaligned(),
+            )
+        };
+        assert_eq!(
+            n as usize, ore_len,
+            "numSpawnOreInfo 必须与向量长度一致，否则 C# 遍历越界/漏读"
+        );
+        assert!(!p.is_null(), "spawnOreInfo 指针不得为 null");
     }
 
     /// 回归（2026-08-18）：多 region（多星）下每子步按 region 逐个调用

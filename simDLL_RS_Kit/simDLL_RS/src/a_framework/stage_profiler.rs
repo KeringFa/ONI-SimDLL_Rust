@@ -28,9 +28,12 @@ pub const STAGE_LIQUID_DISPLACE: usize = 5; // 液体置换
 pub const STAGE_DISEASE_DIFFUSE: usize = 6; // 病菌扩散
 pub const STAGE_RADIATION: usize = 7; // 辐射
 pub const STAGE_EMITTERS: usize = 8; // 阶段 B：组件发射器（串行墙钟）
-pub const STAGE_POSTPROCESS: usize = 9; // 阶段 C：太空真空+PostProcess+病菌生长
-pub const STAGE_SIM_TO_GAME: usize = 10; // CopySimDataToGame（sim→C# 边界拷贝）
-pub const STAGE_COUNT: usize = 11;
+// 阶段 C 拆成三段：后者占 31.7% 的 sim 时间但从未细分，先看谁贵。
+pub const STAGE_PP_VACUUM: usize = 9; // 太空真空删除
+pub const STAGE_PP_LOOP: usize = 10; // PostProcess 主循环
+pub const STAGE_PP_DISEASE: usize = 11; // 病菌生长
+pub const STAGE_SIM_TO_GAME: usize = 12; // CopySimDataToGame（sim→C# 边界拷贝）
+pub const STAGE_COUNT: usize = 13;
 
 const STAGE_NAMES: [&str; STAGE_COUNT] = [
     "copy",
@@ -42,7 +45,9 @@ const STAGE_NAMES: [&str; STAGE_COUNT] = [
     "disease_diffuse",
     "radiation",
     "emitters",
-    "postprocess",
+    "pp_vacuum",
+    "pp_loop",
+    "pp_disease",
     "sim_to_game",
 ];
 
@@ -50,7 +55,7 @@ static STAGE_NANOS: [AtomicU64; STAGE_COUNT] = {
     #[allow(clippy::declare_interior_mutable_const)]
     const ZERO: AtomicU64 = AtomicU64::new(0);
     [
-        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
+        ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO,
     ]
 };
 
