@@ -5,10 +5,16 @@ The latest steam: https://steamcommunity.com/sharedfiles/filedetails/?id=3779276
 A Rust reimplementation of Oxygen Not Included's native simulation DLL, targeting **U60 (build 764025)**.
 Physics is bit-exact with the stock simulation; parallelism is region-level (one discovered world = one work unit, packed with LPT by area), so it needs no halo exchange and never changes simulation results.
 
-Performance comparison, late-game colony, Moono alone vs Moono + this mod (Chinese narration):
+Performance comparison on the same late-game colony (Chinese narration):
 [缺氧优化：Moono 与 SimDLL_Rust](https://www.bilibili.com/video/BV1qfyvzREVi/)
 
-> Moono alone gets that colony to ~60 fps; this mod adds on top of it. Note that most of the gain in that video is Moono's — see the numbers below for what this mod alone contributes.
+| configuration | fps |
+|---|---|
+| this mod alone | ~60 |
+| Moono alone | 172 |
+| Moono + this mod | **192** |
+
+The bulk of that gain is Moono's — it rebuilds the Unity layer, which is where most of the frame time goes. This mod adds ~12 % on top by removing the simulation from the main thread. The two are independent and stack.
 
 ## Test machine
 
