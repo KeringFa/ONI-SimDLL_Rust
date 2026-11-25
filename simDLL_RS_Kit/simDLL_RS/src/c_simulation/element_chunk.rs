@@ -170,6 +170,27 @@ impl ElementChunkManager {
             index as i32
         };
         self.records.push(rec);
+        // 2026-11-25 修复：注册时把初始温度写进 output。
+        // output 按 handle index 索引，但原先只有 Update 才写它，且 Update 只处理
+        // 落在**本区域 bounds 内**的碎片（区域外直接 continue）。于是：
+        //   - 新注册的碎片在所在区域首次模拟前，output[slot] 保持默认 0.0；
+        //   - 不在任何激活区域的碎片（未激活星球上的食物等）永远等不到那次写。
+        // C# SimTemperatureTransfer.OnGetTemperature 直接读 elementChunks[i].temperature
+        // （Assembly-CSharp/SimTemperatureTransfer.cs L214），读到 0 → 物品 0 K →
+        // 腐烂/结籽时原版报 "has a temperature of zero"。
+        // 顺带修掉槽位复用读到上一任残留温度的问题。
+        let idx = (handle & 0xffffff) as usize;
+        if self.output.len() < self.items.len() {
+            self.output
+                .resize(self.items.len(), ElementChunkInfo::default());
+        }
+        self.output.set(
+            idx,
+            ElementChunkInfo {
+                temperature: self.records[ri].temperature,
+                delta_kj: 0.0,
+            },
+        );
         handle
     }
 
@@ -899,6 +920,25 @@ mod tests {
         assert!(
             (out[idx].temperature - 300.0).abs() < 1e-3,
             "释放槽位应保留上一帧温度 300，got {}",
+            out[idx].temperature
+        );
+    }
+
+    /// 2026-11-25：注册即写初始温度。
+    /// 之前 add() 不碰 output，而 Update 只写"落在本区域 bounds 内"的碎片，
+    /// 于是区域外（未激活星球）的碎片永远保持默认 0 → C# 读到 0K。
+    #[test]
+    fn add_writes_initial_temperature_to_output() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_elem_table();
+        let mut mgr = ElementChunkManager::new();
+        let h = mgr.add(6, &add_msg(5, 300.0));
+        let idx = (h & 0xffffff) as usize;
+        let out = mgr.output_snapshot();
+        assert_eq!(out.len(), 1, "注册后就应有对应槽位");
+        assert!(
+            (out[idx].temperature - 300.0).abs() < 1e-3,
+            "未模拟前 C# 也应读到初始温度 300，got {}",
             out[idx].temperature
         );
     }

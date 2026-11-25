@@ -75,8 +75,22 @@ impl Default for BuildingTemperatureRecord {
 /// 由 Add/Modify 消息构建记录并计算派生字段（原版 InitializeFromMessageData L137088-137186）。
 /// 元素表缺失/面积<1/温度越界时返回 None（原版断言/崩溃，本项目转日志 + 拒绝）。
 pub fn build_record_from_msg(msg: &AddBuildingHeatExchangeMsg) -> Option<BuildingTemperatureRecord> {
-    let etd =
-        crate::b_elements::elements_table::get_element_temperature_data(msg.elem_idx)?;
+    // 诊断（2026-11-25）：元素表查不到时**静默丢弃注册**。
+    // 之后 C# 用该 handle 查 buildingTemperatures 查不到 → 默认值 0 →
+    // 物件变 0 K，等到生种子/腐烂时才被原版 PrimaryElement.OnSetTemperature 报出。
+    // 这条 warn 用于确认"是否有注册被丢"。
+    let etd = match crate::b_elements::elements_table::get_element_temperature_data(msg.elem_idx) {
+        Some(e) => e,
+        None => {
+            tracing::warn!(
+                elem_idx = msg.elem_idx,
+                mass = msg.mass,
+                callback_idx = msg.callback_idx,
+                "建筑换热注册被丢弃：元素表无此 elem_idx"
+            );
+            return None;
+        }
+    };
     let area = (msg.max_x - msg.min_x) * (msg.max_y - msg.min_y);
     if area < 1 {
         tracing::error!("Size zero building passed into BuildingHeatExchange");
@@ -85,6 +99,22 @@ pub fn build_record_from_msg(msg: &AddBuildingHeatExchangeMsg) -> Option<Buildin
     if !(0.0..=10000.0).contains(&msg.temperature) {
         tracing::error!("Invalid temperature passed into BuildingHeatExchange");
         return None;
+    }
+    // 诊断（2026-11-25）：玩家报告"虫果种子温度为 0"（SeedProducer 让种子继承植物温度）。
+    // 建筑的 PrimaryElement.Temperature 若被写成 0 K，会顺着这条链传到产物上。
+    // 原版只拒绝 <0 与 >10000，0 是合法的 —— 所以这里**不改行为**，只留证据：
+    // 记录元素、质量、回调索引与格范围，便于判断 0 是来自 C# 侧还是我方拷贝。
+    if msg.temperature <= 0.0 {
+        tracing::warn!(
+            elem_idx = msg.elem_idx,
+            mass = msg.mass,
+            callback_idx = msg.callback_idx,
+            min_x = msg.min_x,
+            min_y = msg.min_y,
+            max_x = msg.max_x,
+            max_y = msg.max_y,
+            "BuildingHeatExchange 收到 0 温度（原版允许，疑似上游传入 0 K）"
+        );
     }
     let total_hc = etd.specific_heat_capacity * msg.mass;
     Some(BuildingTemperatureRecord {
@@ -307,6 +337,11 @@ impl BuildingTemperatureManager {
     /// （原版 Unregister L137245 写 0xbf800000 = -1.0f）。
     pub fn write_building_temperature_info(&self, game_data: &mut GameData) {
         game_data.building_temperature_info.clear_keep_capacity();
+        // 输出侧诊断（2026-11-25）：玩家报告 Rot Pile / 虫果种子 温度 0。
+        // 输入侧的 0 已在上游 warn 过；这里补查"存档记录里躺着的 0"——
+        // 例如注册时就带 0、或某帧算出 0 后被写回记录。
+        // 每个进程只报前 20 条，避免每帧刷屏。
+        let mut zero_reported = 0usize;
         for index in 0..self.items.len() {
             let record_index = self.items[index];
             let (handle_value, temperature) = if record_index >= 0 {
@@ -319,6 +354,22 @@ impl BuildingTemperatureManager {
             } else {
                 (0, -1.0)
             };
+            if record_index >= 0 && temperature <= 0.0 && zero_reported < 20 {
+                zero_reported += 1;
+                let rec = &self.records[record_index as usize];
+                tracing::warn!(
+                    handle = handle_value,
+                    slot = index,
+                    elem_idx = rec.elem_idx,
+                    mass = rec.mass,
+                    per_cell_hc = rec.per_cell_heat_capacity,
+                    min_x = rec.min_x,
+                    min_y = rec.min_y,
+                    max_x = rec.max_x,
+                    max_y = rec.max_y,
+                    "建筑温度输出为 <=0（将传给 C# 的 buildingTemperatures）"
+                );
+            }
             game_data.building_temperature_info.push(BuildingTemperatureInfo {
                 handle: Handle {
                     value: handle_value,
