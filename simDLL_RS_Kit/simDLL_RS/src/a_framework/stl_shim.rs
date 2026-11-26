@@ -61,10 +61,25 @@ impl<T> MsvcVector<T> {
         }
     }
 
-    /// 写入索引处的元素（越界时静默忽略）。
+    /// 写入索引处的元素（越界时忽略并告警）。
+    ///
+    /// 2026-11-26：原先越界**静默丢弃**。这类漏写只会表现为"某个值莫名其妙是 0"，
+    /// 极难定位（element_chunk 的 0K 事故就是同族问题的另一种形态）。
+    /// 保留忽略行为（不 panic，避免把游戏带崩），但前 10 次各记一条 error。
     pub fn set(&mut self, index: usize, value: T) {
         if index < self.len() {
             unsafe { std::ptr::write(self.begin.add(index), value) }
+        } else {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static OUT_OF_RANGE: AtomicUsize = AtomicUsize::new(0);
+            let n = OUT_OF_RANGE.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                tracing::error!(
+                    index,
+                    len = self.len(),
+                    "MsvcVector::set 越界，写入被丢弃（后续同类不再记录）"
+                );
+            }
         }
     }
 

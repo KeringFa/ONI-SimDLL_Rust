@@ -38,6 +38,9 @@ namespace SimDLL_Rust
 
         public override void OnLoad(Harmony harmony)
         {
+            // 必须在原生库初始化前设置（日志目录在 logger 初始化时读取一次）。
+            ApplyDefaultLogDirectory();
+
             if (Native.IsWindowsPlatform())
             {
                 LoadWindows();
@@ -107,6 +110,34 @@ namespace SimDLL_Rust
             // Harmony 版本对 extern 生成 wrapper 崩溃）；这里显式 PatchAll 只含
             // 托管方法补丁（extern 补丁类已不存在）。
             harmony.PatchAll(Assembly.GetExecutingAssembly());
+        }
+
+        /// 日志默认写到用户数据目录，而不是 exe 目录。
+        /// Moono 会把宿主 exe 换成自己的，日志原先散落在
+        /// %LOCALAPPDATA%\oni-moono\versioned\logs，玩家根本找不到；
+        /// 原版启动器则在 Steam 安装目录，只读环境还会写失败。
+        /// 已显式设置 SIMDLL_LOG_DIR 时不覆盖（保留排障时的自定义路径）。
+        private static void ApplyDefaultLogDirectory()
+        {
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SIMDLL_LOG_DIR")))
+            {
+                return;
+            }
+            try
+            {
+                string docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                if (string.IsNullOrEmpty(docs))
+                {
+                    return;
+                }
+                string dir = Path.Combine(docs, "Klei", "OxygenNotIncluded", "SimDLL_Rust");
+                Directory.CreateDirectory(dir);
+                Environment.SetEnvironmentVariable("SIMDLL_LOG_DIR", dir);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[SimDLL_Rust] 日志目录设置失败，回落 exe 目录: " + e.Message);
+            }
         }
 
         /// Windows 加载：kernel32 LoadLibrary（.sim 绕过 KMod 托管程序集扫描）。

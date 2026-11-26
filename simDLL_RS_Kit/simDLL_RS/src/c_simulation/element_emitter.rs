@@ -435,7 +435,9 @@ impl ElementEmitterManager {
                     if rec.blocked_state != 0 {
                         let cb = rec.unblocked_cb_idx;
                         rec.blocked_state = 0;
-                        if cb != 0xFFFFFFFF {
+                        if cb != 0xFFFFFFFF
+                            && crate::c_simulation::frame_processor::callback_ok(cb as i32)
+                        {
                             let events = unsafe { &mut *sim.sim_events.ptr };
                             // 诊断：记录 unblocked 回调值（C# 以 callbackIdx 查句柄池，
                             // -1/超限会 ArgumentOutOfRangeException——新建游戏 EMBARK 后偶发崩溃嫌疑）
@@ -459,7 +461,9 @@ impl ElementEmitterManager {
                 } else if rec.blocked_state != 1 {
                     let cb = rec.blocked_cb_idx;
                     rec.blocked_state = 1;
-                    if cb != 0xFFFFFFFF {
+                    if cb != 0xFFFFFFFF
+                            && crate::c_simulation::frame_processor::callback_ok(cb as i32)
+                        {
                         let events = unsafe { &mut *sim.sim_events.ptr };
                         // 诊断：记录 blocked 回调值
                         tracing::info!(

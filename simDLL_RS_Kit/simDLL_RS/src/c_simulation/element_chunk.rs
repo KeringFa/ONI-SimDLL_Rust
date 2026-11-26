@@ -456,16 +456,24 @@ pub(crate) fn update_element_chunks_inner(
         // 原版 ElementChunk::Update L140137-140139：仅处理落在 region 矩形内的碎片
         // （cell/width → row/col 检查；★4）。max 为**包含**（`<= region.max`，
         // 原版组件与温度任务的排他边界不同——严格复刻组件字面语义）。
+        //
+        // 2026-11-26 修复：区域外碎片**也必须上报温度**（不再 continue 整个跳过）。
+        //   根因：output 与 game_data 是乒乓交换的双缓冲，两者长度各自演化；
+        //   下一帧 resize 只把"新增长段"填成 default（温度 0），而区域外碎片
+        //   此前直接 continue、从不写回 → 两个缓冲交替持有"真值"与"0" →
+        //   区域外隔帧归零 → 与玩家"地图未探开部分的物品状态"完全吻合。
+        //   C# 读到 0K（SimTemperatureTransfer.OnGetTemperature）后，
+        //   腐烂/结籽时继承该温度 → 原版 PrimaryElement.OnSetTemperature 报错。
+        //   原版语义本就是"输出写在换热块之外，活跃碎片都上报真实温度"，
+        //   此前把"区域过滤"错当成了"整个碎片跳过"。
         let row = chunk.cell / width;
         let col = chunk.cell % width;
-        if col < bounds.min_x as i32
+        let in_region = !(col < bounds.min_x as i32
             || row < bounds.min_y as i32
             || col > bounds.max_x as i32
-            || row > bounds.max_y as i32
-        {
-            continue;
-        }
-        if chunk.heat_capacity > 0.0 {
+            || row > bounds.max_y as i32);
+        // 热交换仍只在区域内进行（原版如此），区域外只是不上报换热量。
+        if in_region && chunk.heat_capacity > 0.0 {
             if chunk.adjuster.heat_capacity > 0.0 {
                 // adjuster 分支（原版 L140114-140120）：rate 1.0，不写格子；
                 // 原版走 CalculateTemperatureExchange wrapper（冷侧在前），负温差下 min 取负会过冲。
@@ -526,12 +534,26 @@ pub(crate) fn update_element_chunks_inner(
         // → C# SimTemperatureTransfer 读到 0K → 泵存储水块（被抽空、mass=0）显示 0K →
         // 冻结成冰 + 排水口 T(0) 液滴（用户实测冰方块 + FallingWater 崩溃）。
         let t = chunk.temperature;
-        mgr.output.set(handle_index as usize, ElementChunkInfo {
+        // 2026-11-26：区域外只刷新温度，delta 保留槽位现值。
+        // delta 的语义是"本帧换热量"，由该碎片**所在区域**的 pass 写入；
+        // 若这里一律清 0，多区域存档里只有最后一个区域的换热量能传到 C#。
+        // 保留而非清 0 也不会造成陈旧值：每帧交换后 game 侧已消费上一帧 delta。
+        let out_index = handle_index as usize;
+        let delta_out = if in_region {
+            delta
+        } else if out_index < mgr.output.len() {
+            mgr.output.get(out_index).delta_kj
+        } else {
+            0.0
+        };
+        mgr.output.set(out_index, ElementChunkInfo {
             temperature: t,
-            delta_kj: delta,
+            delta_kj: delta_out,
         });
         // 相变（原版 L140185-140196）：T ≥ highTemp+3 或 < lowTemp−3 → elementChunkMeltedInfo
-        if chunk.high_temp + 3.0 <= t || t < chunk.low_temp - 3.0 {
+        // 2026-11-26：仍以 in_region 门控——区域外碎片不参与模拟，
+        // 不能因为"现在也上报温度"就给未激活星球凭空发熔化事件。
+        if in_region && (chunk.high_temp + 3.0 <= t || t < chunk.low_temp - 3.0) {
             let events = unsafe { &mut *sim.sim_events.ptr };
             events
                 .element_chunk_melted_info
@@ -942,6 +964,155 @@ mod tests {
             out[idx].temperature
         );
     }
+
+    /// 回归（2026-11-26）：碎片落在【激活区域之外】时，温度不得归零。
+    /// 根因：output 与 game_data 乒乓交换，两缓冲长度各自演化；resize 把新增长段
+    /// 填成 default（温度 0），而区域外碎片此前 continue 不写回 →
+    /// 两个缓冲交替持有"真值"与"0" → C# 隔帧读到 0K。
+    /// 本测试跨多帧 + 跨 swap 往返。
+    #[test]
+    fn out_of_region_chunk_temperature_never_zeroes_across_frames() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        // game cell 5 → sim (2,2) = 14；温度 300K
+        let h = mgr.add(6, &add_msg(5, 300.0));
+        let idx = (h & 0xffffff) as usize;
+
+        // 一个【不包含该碎片】的区域 → 模拟"未探开的地图 / 未激活星球"
+        let outside = crate::d1_activity::RegionBounds {
+            min_x: 4,
+            min_y: 4,
+            max_x: 5,
+            max_y: 5,
+        };
+
+        let mut gd: crate::a_framework::game_data::GameData = unsafe { std::mem::zeroed() };
+        for frame in 0..8 {
+            update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, outside);
+            // 与 swap_element_chunk_output 同语义，但作用于本测试的局部 manager
+            // （生产代码走全局单例，测试不能碰全局状态）。
+            std::mem::swap(&mut gd.element_chunk_info, &mut mgr.output);
+            let got = if gd.element_chunk_info.len() > idx {
+                gd.element_chunk_info.get(idx).temperature
+            } else {
+                f32::NAN
+            };
+            assert!(
+                (got - 300.0).abs() < 1e-3,
+                "帧 {frame}: 区域外碎片温度被归零 (got {got}) —— 双缓冲 resize 填 0 泄漏"
+            );
+        }
+    }
+
+    /// 回归（2026-11-26）：多区域依次 pass 时，只包含该碎片的那个区域才能影响它，
+    /// 不包含它的区域 pass 不能把槽位写成 0。
+    #[test]
+    fn out_of_region_chunk_temperature_survives_multi_region_pass() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        let h = mgr.add(6, &add_msg(5, 300.0)); // sim (2,2)
+        let idx = (h & 0xffffff) as usize;
+        // 区域1 不含该碎片；区域2 只含该碎片（2,2）
+        let r1 = crate::d1_activity::RegionBounds {
+            min_x: 4,
+            min_y: 4,
+            max_x: 5,
+            max_y: 5,
+        };
+        let r2 = crate::d1_activity::RegionBounds {
+            min_x: 2,
+            min_y: 2,
+            max_x: 2,
+            max_y: 2,
+        };
+        let mut gd: crate::a_framework::game_data::GameData = unsafe { std::mem::zeroed() };
+        for (frame, b) in [r1, r2, r1, r2].into_iter().enumerate() {
+            update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, b);
+            std::mem::swap(&mut gd.element_chunk_info, &mut mgr.output);
+            let got = gd.element_chunk_info.get(idx).temperature;
+            assert!(
+                (got - 300.0).abs() < 1e-3,
+                "帧 {frame}: 多区域 pass 后温度被改写 (got {got})"
+            );
+        }
+    }
+
+    /// 回归（2026-11-26）：新碎片注册导致 items.len() 增长时，
+    /// resize 会为新增段填 0——已存在的区域外碎片不能被波及。
+    #[test]
+    fn out_of_region_chunk_temperature_zero_after_new_chunk_registered() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        let ha = mgr.add(6, &add_msg(5, 300.0));
+        let idx_a = (ha & 0xffffff) as usize;
+        let outside = crate::d1_activity::RegionBounds {
+            min_x: 4,
+            min_y: 4,
+            max_x: 5,
+            max_y: 5,
+        };
+        let mut gd: crate::a_framework::game_data::GameData = unsafe { std::mem::zeroed() };
+        for _ in 0..3 {
+            update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, outside);
+            std::mem::swap(&mut gd.element_chunk_info, &mut mgr.output);
+        }
+        // 注册第二个碎片 → items.len() 由 1 变 2 → 下一帧 resize 填新增长段
+        let _hb = mgr.add(6, &add_msg(11, 400.0));
+        for frame in 0..3 {
+            update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, outside);
+            std::mem::swap(&mut gd.element_chunk_info, &mut mgr.output);
+            let got = gd.element_chunk_info.get(idx_a).temperature;
+            assert!(
+                (got - 300.0).abs() < 1e-3,
+                "帧 {frame}: 新碎片注册后旧碎片温度被归零 (got {got})"
+            );
+        }
+    }
+
+    /// 回归（2026-11-26）：多区域串行 pass 时，后一个区域的 pass 不得抹掉
+    /// 前一个区域写下的本帧换热量（delta_kj）。
+    /// 背景：区域外碎片现在也会写 output（修 0K 所需），但 delta 语义是
+    /// "本帧换热量"，区域外必须**保留**而不是清 0，否则 12 个区域的存档里
+    /// 只有最后一个区域的热交换量能传到 C#。
+    #[test]
+    fn out_of_region_pass_preserves_delta_kj() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_elem_table();
+        let mut sd = make_sim();
+        let mut mgr = ElementChunkManager::new();
+        let h = mgr.add(6, &add_msg(5, 300.0)); // sim (2,2)
+        let idx = (h & 0xffffff) as usize;
+        // 模拟"区域1 已写入本帧换热量 5.0"
+        mgr.output.set(
+            idx,
+            ElementChunkInfo {
+                temperature: 300.0,
+                delta_kj: 5.0,
+            },
+        );
+        // 区域2 的 pass 不含该碎片 → 只应刷新温度，delta 保持 5.0
+        let other = crate::d1_activity::RegionBounds {
+            min_x: 4,
+            min_y: 4,
+            max_x: 5,
+            max_y: 5,
+        };
+        update_element_chunks_inner(&mut mgr, &mut sd, 0.2, 6, other);
+        let out = mgr.output_snapshot()[idx];
+        assert!(
+            (out.delta_kj - 5.0).abs() < 1e-6,
+            "区域外 pass 抹掉了 delta_kj: got {}",
+            out.delta_kj
+        );
+        assert!((out.temperature - 300.0).abs() < 1e-3);
+    }
+
 
     #[test]
     fn element_chunk_output_swaps_into_game_data() {

@@ -9,6 +9,29 @@
 //! - 残留桩：consolidate_events（单 worker 下行为等价，见 c2_physics/mod.rs）。
 
 use crate::a_framework::sim_data::SimData;
+
+/// 回调句柄合法性校验（2026-11-26 加固）。
+///
+/// C# `Game.StepTheSim` 把 `callbackInfo.callbackIdx` 当作 HandleVector 的 handle，
+/// `HandleVector.IsVersionValid` 只做 `versions[index & 0xFFFFFF]`，**没有边界检查**。
+/// 因此：
+///   -1 → 约定「无回调」，本就不该推送；
+///   -2（手动释放）→ `& 0xFFFFFF` 得 0xFFFFFF → 必然越界 → ArgumentOutOfRangeException。
+/// 负值一律丢弃并记一条 error（前 5 次），其余值保持原样以维持与原版一致的行为。
+pub(crate) fn callback_ok(callback_idx: i32) -> bool {
+    if callback_idx >= 0 {
+        return true;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static BAD: AtomicUsize = AtomicUsize::new(0);
+    if BAD.fetch_add(1, Ordering::Relaxed) < 5 {
+        tracing::error!(
+            callback_idx,
+            "非法 callback_idx 已丢弃（防止 C# HandleVector 越界）"
+        );
+    }
+    false
+}
 use crate::a_framework::sim_frame_manager::SimFrameInfo;
 use crate::b_elements::elements_table;
 
@@ -142,7 +165,7 @@ pub fn process_dig_points(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
         };
 
         // 3. 如果 callback_idx != -1，push 到 callback_info
-        if dig_point.callback_idx != -1 {
+        if callback_ok(dig_point.callback_idx) {
             let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
             sim_events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
                 callback_idx: dig_point.callback_idx,
@@ -365,7 +388,7 @@ fn process_cell_properties(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
             }
         }
         // 原版 L298-311：callback_idx != -1 → 推 callback_info（C# 协程等待该回调）
-        if entry.callback_idx != -1 {
+        if callback_ok(entry.callback_idx) {
             let events = unsafe { &mut *sim_data.sim_events.ptr };
             events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
                 callback_idx: entry.callback_idx,
@@ -501,7 +524,7 @@ fn process_cell_modifications(frame: &mut SimFrameInfo, sim_data: &mut SimData) 
         }
 
         // callback_idx != -1 → push callback_info（源码 L135019-135031）
-        if entry.callback_idx != -1 {
+        if callback_ok(entry.callback_idx) {
             let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
             sim_events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
                 callback_idx: entry.callback_idx,
@@ -3216,5 +3239,20 @@ mod tests {
 
         let updated_cells = unsafe { &*sd.updated_cells.ptr };
         assert_eq!(updated_cells.properties.get(7), 0x00);
+    }
+}
+
+#[cfg(test)]
+mod callback_guard_tests {
+    use super::callback_ok;
+
+    /// 2026-11-26：负值句柄不得进入 callback_info。
+    /// -2 会变成 0xFFFFFF 索引，C# HandleVector 无边界检查 → 越界崩溃。
+    #[test]
+    fn callback_ok_rejects_negative() {
+        assert!(!callback_ok(-1));
+        assert!(!callback_ok(-2));
+        assert!(callback_ok(0));
+        assert!(callback_ok(0x1234));
     }
 }
