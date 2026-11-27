@@ -32,6 +32,7 @@ namespace SimDLL_Rust
         private static IntFromIntFn _setSchedulerMode;
         private static IntFromIntFn _setReservedCores;
         private static IntFromIntFn _setTaskWorkers;
+        private static IntFromIntFn _setUtilizeThreads;
 
         /// 原生库是否已加载且符号解析完成。失败（如不支持的架构）时为 false，
         /// 所有入口短路返回失败值——调用方据此回落原版 sim。
@@ -55,6 +56,11 @@ namespace SimDLL_Rust
                 if (tw != IntPtr.Zero)
                 {
                     _setTaskWorkers = Marshal.GetDelegateForFunctionPointer<IntFromIntFn>(tw);
+                }
+                IntPtr ut = GetAddress(nativeModule, "RS_SetUtilizeThreads");
+                if (ut != IntPtr.Zero)
+                {
+                    _setUtilizeThreads = Marshal.GetDelegateForFunctionPointer<IntFromIntFn>(ut);
                 }
                 IsAvailable = true;
             }
@@ -114,6 +120,10 @@ namespace SimDLL_Rust
         /// 必须在 SIM_Initialize 之前生效。旧版 .sim 无此导出时返回 -1（不改行为）。
         internal static int RS_SetTaskWorkers(int workers)
             => _setTaskWorkers == null ? -1 : _setTaskWorkers(workers);
+
+        /// 设置并行 worker 数（0=自动）。旧版 .sim 无此导出时返回 -1（保持自动）。
+        public static int RS_SetUtilizeThreads(int threads)
+            => _setUtilizeThreads == null ? -1 : _setUtilizeThreads(threads);
 
         // ===== Sim API（9）—— ABI 参照声明，C# 无调用者（游戏经 detour 直调）=====
         [DllImport("SimDLL_RS.sim")]

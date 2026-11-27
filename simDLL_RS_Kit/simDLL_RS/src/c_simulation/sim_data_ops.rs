@@ -7,6 +7,16 @@
 //! GameData 中的 cells/backwalls 同样为 `UniquePtr<T>`。
 
 use crate::a_framework::sim_data::SimData;
+
+/// 诊断计数（2026-11-27）：批次产出 / 被 C# 取走。
+static PREPARED: AtomicU32 = AtomicU32::new(0);
+static FETCHED: AtomicU32 = AtomicU32::new(0);
+static LOST_HITS: AtomicU32 = AtomicU32::new(0);
+
+/// C# 每次 PrepareGameData 取走一批 → 计数 +1。
+pub fn note_game_data_fetched() {
+    FETCHED.fetch_add(1, Ordering::Relaxed);
+}
 use crate::a_framework::game_data::{EmittedMassInfo, GameData};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -389,6 +399,28 @@ pub fn copy_sim_data_to_game(
         tracing::warn!("copy_sim_data_to_game: sim_events ptr is null, skip events swap");
     } else {
         let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+
+        // === 诊断（2026-11-27 v2）：判断"上一次 copy 的批次有没有被 C# 取走" ===
+        // v1 的判断方式是错的：C# 只按指针读、从不清理，所以 swap 前缓冲非空是常态，
+        // 不是"未消费"。正确判据是**计数**：每次 copy 产出一批，每次 PrepareGameData
+        // 取走一批。若 copy 次数比取走次数多 ≥2，说明中间那批被覆盖、从未被读到。
+        {
+            let prepared = PREPARED.fetch_add(1, Ordering::Relaxed) + 1;
+            let fetched = FETCHED.load(Ordering::Relaxed);
+            if prepared > fetched + 1 {
+                let n = LOST_HITS.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    tracing::warn!(
+                        prepared,
+                        fetched,
+                        lost = prepared - fetched - 1,
+                        pending_callback = game_data.callback_info.len(),
+                        pending_substance = game_data.substance_change_info.len(),
+                        "有批次未经 PrepareGameData 取走就被覆盖（事件将丢失）"
+                    );
+                }
+            }
+        }
 
         // 按 SimEvents 字段顺序 swap（与 GameData 对应字段名一致或相近）
         std::mem::swap(&mut game_data.substance_change_info, &mut sim_events.substance_change_info);
@@ -1180,4 +1212,12 @@ mod tests {
         assert_eq!(sim_events.dig_info.len(), 0, "sim_events 源应被清空");
         assert_eq!(gd.dig_info.len(), 0, "残留事件不应再次出现");
     }
+}
+
+
+/// 载入存档时重置诊断计数（避免跨存档累计）。
+pub fn reset_event_flow_counters() {
+    PREPARED.store(0, Ordering::Relaxed);
+    FETCHED.store(0, Ordering::Relaxed);
+    LOST_HITS.store(0, Ordering::Relaxed);
 }

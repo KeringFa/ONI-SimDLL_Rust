@@ -1,12 +1,102 @@
-mod.yaml文本：
-"Rust-based SimDLL"="基于 Rust 的 SimDLL",
+================================================================================
+SimDLL_Rust 本地化翻译对照（以 strings/Strings.cs 与 translations/zh.po 为准）
+最后更新：2026-11-28
+================================================================================
 
-模组设置窗口文本（视觉顺序，从上至下）：
-标题："SimDLL_Rust Config"="SimDLL_Rust 配置",
-勾选项1："Enable Logging"="启用日志功能"，
-勾选项2："Enable Hyper-Threading Optimization"="启用超线程优化",
-输入项1："Reserve physical thread count"="预留物理线程数量",
+【注意】C# 源码与 .po 里，反斜杠都要写成双反斜杠（\\），否则编译/解析失败：
+    Strings.cs : "Logs are saved in <Documents>\\Klei\\...\\SimDLL_Rust"
+    zh.po      : msgid "Logs are saved in <Documents>\\Klei\\...\\SimDLL_Rust"
 
-提示1（白色字体）："Logs are saved in the game installation directory by default."="日志默认保存在游戏安装目录",
-提示2（白色字体）："Make sure Hyper-Threading is enabled on your CPU before turning this on, otherwise it will be automatically disabled."="启用超线程优化前，确保你的CPU开启了超线程，否则会自动禁用",
-提示3（红色字体）："After modifying the settings, it is necessary to restart the game."="修改设置后需重启游戏生效",
+
+--------------------------------------------------------------------------------
+一、mod.yaml 文本
+--------------------------------------------------------------------------------
+
+msgid  "Rust-based SimDLL"
+msgstr "基于 Rust 的 SimDLL"
+
+
+--------------------------------------------------------------------------------
+二、模组设置窗口（视觉顺序，从上至下）
+--------------------------------------------------------------------------------
+
+标题
+    msgid  "SimDLL_Rust Config"
+    msgstr "SimDLL_Rust 配置"
+
+勾选项 1
+    msgid  "Enable Logging"
+    msgstr "启用日志功能"
+
+勾选项 2
+    msgid  "Enable Hyper-Threading Optimization"
+    msgstr "启用超线程优化"
+
+输入项 1
+    msgid  "Reserve physical thread count"
+    msgstr "预留物理线程数量"
+
+输入项 2
+    msgid  "Utilize the number of threads"
+    msgstr "利用线程数量"
+
+提示 1（白色字体）—— 日志位置
+    msgid  "Logs are saved in <Documents>\\Klei\\OxygenNotIncluded\\SimDLL_Rust by default."
+    msgstr "日志默认保存在 <我的文档>\\Klei\\OxygenNotIncluded\\SimDLL_Rust"
+    备注：RC-4.3 起日志不再跟随宿主 exe 目录（Moono 下会落到它自己的目录），
+          改为用户文档目录，C# 侧通过 SIMDLL_LOG_DIR 环境变量传给原生库。
+
+提示 2（白色字体）—— 超线程优化说明
+    msgid  "Make sure Hyper-Threading is enabled on your CPU before turning this on, otherwise it will be automatically disabled."
+    msgstr "启用超线程优化前，确保你的CPU开启了超线程，否则会自动禁用"
+
+提示 3（白色字体）—— 线程数说明（输入项 2 下方）
+    msgid  "0 = Auto (recommended): about half the physical cores. More threads than that competes for memory bandwidth and is usually slower."
+    msgstr "0 = 自动（推荐，约物理核一半）。超过这个数会争抢内存带宽，通常更慢。"
+
+提示 4（红色字体）—— 重启提示
+    msgid  "After modifying the settings, it is necessary to restart the game."
+    msgstr "修改设置后需重启游戏生效"
+
+
+--------------------------------------------------------------------------------
+三、两个输入项的语义（防止日后混淆）
+--------------------------------------------------------------------------------
+
+输入项 1：预留物理线程数量（Reserve physical thread count，1~4，默认 1）
+    · 从物理核里留出多少给游戏主线程 / 系统。
+    · 两条并行路径通用（D1 亲和分组、D2 rayon 池）。
+
+输入项 2：利用线程数量（Utilize the number of threads，0~64，默认 0）
+    · 实际开几个 worker。0 = 自动。
+    · 与「超线程优化」不是同一维度：
+        超线程优化   = 亲和策略（是否把逻辑核纳入分组）
+        利用线程数量 = worker 数量（池里开几个线程）
+      两者同时设置不冲突：数量优先，上限受逻辑核数截断。
+
+自动值的推导规则（Rust 侧 d3_rayon/mod.rs::pool）
+    显式设置 > 0          → 用设置值（≤ 逻辑核数）
+    否则 D1（超线程优化）  → 物理核 − 预留
+    否则                  → min(物理核 − 预留, 物理核 / 2)
+
+    取物理核一半的依据（9800X3D，8 核，冰城存档实测）：
+        1 线程 18.6 ms ／ 4 线程 8.2 ms ／ 7 线程 8.8 ms
+        超过一半后是内存带宽竞争，边际转负；同时要给主线程留余量
+        （模拟只占帧时 4~6%，渲染与寻路才是瓶颈）。
+
+
+--------------------------------------------------------------------------------
+四、翻译文件维护
+--------------------------------------------------------------------------------
+
+    · 源文本：SimDLL_Rust/strings/Strings.cs（LocString 字段）
+    · 译文：  SimDLL_Rust/translations/zh.po（msgctxt 必须与字段全名一致）
+    · 游戏不加载 mod 的 .po；本模组在 Options.cs 里 LoadStringsFile 后逐条 Strings.Add。
+    · 新增一条的步骤：
+        1) Strings.cs 加 LocString 字段（英文源文本）
+        2) zh.po 加 msgctxt/msgid/msgstr 三行，msgctxt 用
+           "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.<字段名>"
+        3) Options.cs 里引用 STRINGS.UI.FRONTEND.MOD_OPTIONS.<字段名>
+        4) 编译后把 bin/SimDLL_Rust.dll 与 translations/zh.po 一起部署
+
+================================================================================

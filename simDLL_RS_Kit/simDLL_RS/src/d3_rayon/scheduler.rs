@@ -22,6 +22,32 @@ static RESERVED_CORES: AtomicI32 = AtomicI32::new(1);
 /// 预留物理核数上限（与 C# ModConfig.MAX_RESERVED_CORES 保持一致）。
 pub const MAX_RESERVED_CORES: i32 = 4;
 
+/// 显式指定并行 worker 数（0 = 自动）。默认 0。
+///
+/// 与「超线程优化」不是同一维度：
+///   - 超线程优化 = **亲和策略**（是否把逻辑核纳入分组，D1/D2 选择）
+///   - 本项 = **worker 数量**（池里开几个线程）
+/// 两者同时设置时不冲突：数量优先，上限受逻辑核数约束。
+static UTILIZE_THREADS: AtomicI32 = AtomicI32::new(0);
+
+/// 线程数上限（与 C# ModConfig.MAX_UTILIZE_THREADS 保持一致）。
+pub const MAX_UTILIZE_THREADS: i32 = 64;
+
+/// 当前显式线程数（0 = 自动）。
+pub fn utilize_threads() -> i32 {
+    UTILIZE_THREADS.load(Ordering::Relaxed).clamp(0, MAX_UTILIZE_THREADS)
+}
+
+/// 设置显式线程数（0 = 自动，1..=64 = 指定）。返回实际生效值；非法输入返回 -1。
+#[no_mangle]
+pub extern "C" fn RS_SetUtilizeThreads(threads: i32) -> i32 {
+    if !(0..=MAX_UTILIZE_THREADS).contains(&threads) {
+        return -1;
+    }
+    UTILIZE_THREADS.store(threads, Ordering::Relaxed);
+    threads
+}
+
 pub fn current_mode() -> SchedulerMode {
     match MODE.load(Ordering::Relaxed) {
         1 => SchedulerMode::D2,

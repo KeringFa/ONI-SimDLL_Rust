@@ -100,6 +100,8 @@ namespace SimDLL_Rust
             bool htAvailable = CpuInfo.HasHyperThreading();
             int currentReservedCores = ModConfig.ReservedCores;
             int newReservedCores = currentReservedCores;
+            int currentUtilizeThreads = ModConfig.UtilizeThreads;
+            int newUtilizeThreads = currentUtilizeThreads;
 
             dialog.SetHeader(STRINGS.UI.FRONTEND.MOD_OPTIONS.DIALOG_TITLE);
 
@@ -335,6 +337,82 @@ namespace SimDLL_Rust
                 Debug.LogWarning("[SimDLL_Rust] RailModUploadMenu 不可用，预留线程数输入框不可用");
             }
 
+            // ===== InputRow：利用线程数量（0 = 自动）=====
+            var utilizeRowObj = NewRow(panelObj, "UtilizeThreadsRow", 24);
+            if (plainTextPrefab != null)
+            {
+                var utilizeLabelObj = Util.KInstantiateUI(plainTextPrefab.gameObject, utilizeRowObj, true);
+                var utilizeCsf = utilizeLabelObj.GetComponent<ContentSizeFitter>();
+                if (utilizeCsf != null) utilizeCsf.enabled = false;
+                var utilizeLabelText = utilizeLabelObj.GetComponentInChildren<LocText>();
+                if (utilizeLabelText != null)
+                {
+                    utilizeLabelText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.UTILIZE_THREADS_LABEL;
+                    utilizeLabelText.alignment = TextAlignmentOptions.Left;
+                    utilizeLabelText.raycastTarget = false;
+                }
+                var utilizeLabelLE = utilizeLabelObj.GetComponent<LayoutElement>()
+                    ?? utilizeLabelObj.AddComponent<LayoutElement>();
+                utilizeLabelLE.preferredWidth = 300;
+                utilizeLabelLE.flexibleWidth = 1;
+            }
+
+            TMP_InputField utilizeInput = null;
+            var railMenu2 = screenPrefabs.RailModUploadMenu;
+            if (railMenu2 != null)
+            {
+                var versionSource2 = Traverse.Create(railMenu2).Field<TMP_InputField>("modVersion").Value;
+                if (versionSource2 != null)
+                {
+                    var inputClone2 = Util.KInstantiateUI(versionSource2.gameObject, utilizeRowObj, true);
+                    var inputLe2 = inputClone2.GetComponent<LayoutElement>();
+                    if (inputLe2 == null) inputLe2 = inputClone2.AddComponent<LayoutElement>();
+                    inputLe2.preferredWidth = 80;
+                    inputLe2.minWidth = 60;
+
+                    utilizeInput = inputClone2.GetComponent<TMP_InputField>();
+                    if (utilizeInput != null)
+                    {
+                        utilizeInput.contentType = TMP_InputField.ContentType.IntegerNumber;
+                        utilizeInput.characterLimit = 2;
+                        utilizeInput.text = newUtilizeThreads.ToString();
+
+                        var placeholder2 = utilizeInput.placeholder as TextMeshProUGUI;
+                        if (placeholder2 != null) placeholder2.text = "0";
+
+                        utilizeInput.onEndEdit.AddListener(val =>
+                        {
+                            if (string.IsNullOrEmpty(val))
+                            {
+                                newUtilizeThreads = 0; // 空 = 自动
+                                utilizeInput.text = "0";
+                            }
+                            else if (int.TryParse(val, out int result))
+                            {
+                                newUtilizeThreads = ModConfig.ClampUtilizeThreads(result);
+                                utilizeInput.text = newUtilizeThreads.ToString();
+                            }
+                        });
+                    }
+                }
+            }
+
+            // 说明（白色）：0 = 自动
+            if (plainTextPrefab != null)
+            {
+                var utilizeHintObj = Util.KInstantiateUI(plainTextPrefab.gameObject, panelObj, true);
+                var utilizeHintCsf = utilizeHintObj.GetComponent<ContentSizeFitter>();
+                if (utilizeHintCsf != null) utilizeHintCsf.enabled = false;
+                var utilizeHintText = utilizeHintObj.GetComponentInChildren<LocText>();
+                if (utilizeHintText != null)
+                {
+                    utilizeHintText.alignment = TextAlignmentOptions.Left;
+                    utilizeHintText.text = STRINGS.UI.FRONTEND.MOD_OPTIONS.UTILIZE_THREADS_HINT;
+                }
+                var utilizeHintLE = utilizeHintObj.GetComponent<LayoutElement>() ?? utilizeHintObj.AddComponent<LayoutElement>();
+                utilizeHintLE.flexibleWidth = 1;
+            }
+
             // ===== 下划线 + 提示 =====
             var dividerObj = new GameObject("Divider", typeof(RectTransform));
             dividerObj.transform.SetParent(panelObj.transform, false);
@@ -398,10 +476,12 @@ namespace SimDLL_Rust
             dialog.AddOption(global::STRINGS.UI.CONFIRMDIALOG.OK, d =>
             {
                 bool changed = newEnabled != currentEnabled || newHt != currentHt
-                    || newReservedCores != currentReservedCores;
+                    || newReservedCores != currentReservedCores
+                    || newUtilizeThreads != currentUtilizeThreads;
                 if (newEnabled != currentEnabled) ModConfig.SetLogEnabled(newEnabled);
                 if (newHt != currentHt) ModConfig.SetHyperThreadOptimizationEnabled(newHt);
                 if (newReservedCores != currentReservedCores) ModConfig.SetReservedCores(newReservedCores);
+                if (newUtilizeThreads != currentUtilizeThreads) ModConfig.SetUtilizeThreads(newUtilizeThreads);
                 if (changed) ModConfig.Save();
                 d.Deactivate();
                 if (changed)

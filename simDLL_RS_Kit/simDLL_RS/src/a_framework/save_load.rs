@@ -261,6 +261,8 @@ fn cell_read(
 pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
     // L32: 检查 magic "SIMSAVE\0"
     let magic = reader.read_bytes(8).unwrap_or_default();
+    // 诊断（2026-11-27）：载入时重置"批次产出/取走"计数，避免跨存档累计。
+    crate::c_simulation::sim_data_ops::reset_event_flow_counters();
     if magic != b"SIMSAVE\0" {
         tracing::error!("Load: invalid magic");
         return std::ptr::null_mut();
@@ -511,6 +513,9 @@ pub fn handle_load(reader: &mut BinaryBufferReader) -> *mut c_void {
 /// 5. 提取 6 个 property texture 指针（accumulated_flow/property_texture_*）
 /// 6. 返回 G_GAME_DATA_UPDATE 的地址
 pub fn prepare_game_data_update(game_data: &GameData) -> *mut c_void {
+    // 诊断（2026-11-27）：C# 每取走一批 GDU 就记账，用于判断批次是否被覆盖。
+    crate::c_simulation::sim_data_ops::note_game_data_fetched();
+
     // G_GAME_DATA_UPDATE 是 OnceCell<Mutex<GameDataUpdate>>。
     // get_or_init 返回 &Mutex<GameDataUpdate>，lock() 返回 MutexGuard。
     // MutexGuard 的内存位置固定（Mutex 是 static），返回的指针在 guard drop 后仍有效。

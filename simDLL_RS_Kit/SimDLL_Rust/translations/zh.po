@@ -38,10 +38,20 @@ msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.RESERVED_CORES_LABEL"
 msgid "Reserve physical thread count"
 msgstr "预留物理线程数量"
 
+#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.UTILIZE_THREADS_LABEL
+msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.UTILIZE_THREADS_LABEL"
+msgid "Utilize the number of threads"
+msgstr "利用线程数量"
+
+#. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.UTILIZE_THREADS_HINT
+msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.UTILIZE_THREADS_HINT"
+msgid "0 = Auto (recommended): about half the physical cores. More threads than that competes for memory bandwidth and is usually slower."
+msgstr "0 = 自动（推荐，约物理核一半）。超过这个数会争抢内存带宽，通常更慢。"
+
 #. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.LOG_PATH_HINT
 msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.LOG_PATH_HINT"
-msgid "Logs are saved in the game installation directory by default."
-msgstr "日志默认保存在游戏安装目录"
+msgid "Logs are saved in <Documents>\\Klei\\OxygenNotIncluded\\SimDLL_Rust by default."
+msgstr "日志默认保存在 <我的文档>\\Klei\\OxygenNotIncluded\\SimDLL_Rust"
 
 #. SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.HYPERTHREAD_HINT
 msgctxt "SimDLL_Rust.STRINGS.UI.FRONTEND.MOD_OPTIONS.HYPERTHREAD_HINT"

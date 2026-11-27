@@ -37,6 +37,14 @@ namespace SimDLL_Rust
         public const int MIN_TASK_WORKERS = 0;
         public const int MAX_TASK_WORKERS = 16;
 
+        /// 显式指定并行 worker 数（0=自动）。默认 0。
+        /// 与「超线程优化」是两个维度：后者决定亲和策略，本项决定线程数；
+        /// 同时设置不冲突——数量优先，上限受逻辑核数约束。
+        public static int UtilizeThreads { get; private set; } = 0;
+
+        public const int MIN_UTILIZE_THREADS = 0;
+        public const int MAX_UTILIZE_THREADS = 64;
+
         public static void Load(string path)
         {
             modPath = path;
@@ -53,6 +61,7 @@ namespace SimDLL_Rust
                         HyperThreadOptimizationEnabled = data.HyperThreadOptimizationEnabled;
                         ReservedCores = ClampReservedCores(data.ReservedCores);
                         TaskWorkers = ClampTaskWorkers(data.TaskWorkers);
+                        UtilizeThreads = ClampUtilizeThreads(data.UtilizeThreads);
                     }
                 }
             }
@@ -61,6 +70,7 @@ namespace SimDLL_Rust
                 LogEnabled = true;
                 HyperThreadOptimizationEnabled = false;
                 ReservedCores = DEFAULT_RESERVED_CORES;
+                UtilizeThreads = 0;
             }
         }
 
@@ -108,6 +118,19 @@ namespace SimDLL_Rust
         public static int ClampTaskWorkers(int value)
             => Math.Min(Math.Max(value, MIN_TASK_WORKERS), MAX_TASK_WORKERS);
 
+        public static void SetUtilizeThreads(int value)
+        {
+            int clamped = ClampUtilizeThreads(value);
+            if (UtilizeThreads != clamped)
+            {
+                UtilizeThreads = clamped;
+                Dirty = true;
+            }
+        }
+
+        public static int ClampUtilizeThreads(int value)
+            => Math.Min(Math.Max(value, MIN_UTILIZE_THREADS), MAX_UTILIZE_THREADS);
+
         /// 应用当前配置到 Rust 日志（调用 RS_SetLogEnabled）。
         /// 原生库未加载（平台不支持/加载失败）时短路——防止二次 P/Invoke 崩溃。
         public static void Apply()
@@ -116,6 +139,7 @@ namespace SimDLL_Rust
             Native.RS_SetLogEnabled(LogEnabled);
             Native.RS_SetReservedCores(ReservedCores);
             Native.RS_SetTaskWorkers(TaskWorkers);
+            Native.RS_SetUtilizeThreads(UtilizeThreads);
         }
 
         public static void Save()
@@ -131,6 +155,7 @@ namespace SimDLL_Rust
                     HyperThreadOptimizationEnabled = HyperThreadOptimizationEnabled,
                     ReservedCores = ReservedCores,
                     TaskWorkers = TaskWorkers,
+                    UtilizeThreads = UtilizeThreads,
                 };
                 File.WriteAllText(configPath, JsonConvert.SerializeObject(data, Formatting.Indented));
                 Dirty = false;
@@ -147,6 +172,7 @@ namespace SimDLL_Rust
             public bool HyperThreadOptimizationEnabled { get; set; } = false;
             public int ReservedCores { get; set; } = DEFAULT_RESERVED_CORES;
             public int TaskWorkers { get; set; } = 1;
+            public int UtilizeThreads { get; set; } = 0;
         }
     }
 }

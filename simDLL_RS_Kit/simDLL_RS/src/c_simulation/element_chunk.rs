@@ -551,9 +551,11 @@ pub(crate) fn update_element_chunks_inner(
             delta_kj: delta_out,
         });
         // 相变（原版 L140185-140196）：T ≥ highTemp+3 或 < lowTemp−3 → elementChunkMeltedInfo
-        // 2026-11-26：仍以 in_region 门控——区域外碎片不参与模拟，
-        // 不能因为"现在也上报温度"就给未激活星球凭空发熔化事件。
-        if in_region && (chunk.high_temp + 3.0 <= t || t < chunk.low_temp - 3.0) {
+        // 2026-11-28 更正：去掉 11-26 擅自加的 in_region 门控，回归原版语义。
+        // 加门控的后果是"未激活星球上的碎片永不触发相变"——那是可观察的行为差异，
+        // 不是优化。原版本身每个区域 pass 都会重复推 melted 事件，那是它的既有行为，
+        // 重写不该替它"修"。
+        if chunk.high_temp + 3.0 <= t || t < chunk.low_temp - 3.0 {
             let events = unsafe { &mut *sim.sim_events.ptr };
             events
                 .element_chunk_melted_info
@@ -1112,7 +1114,6 @@ mod tests {
         );
         assert!((out.temperature - 300.0).abs() < 1e-3);
     }
-
 
     #[test]
     fn element_chunk_output_swaps_into_game_data() {

@@ -10,27 +10,24 @@
 
 use crate::a_framework::sim_data::SimData;
 
-/// 回调句柄合法性校验（2026-11-26 加固）。
-///
-/// C# `Game.StepTheSim` 把 `callbackInfo.callbackIdx` 当作 HandleVector 的 handle，
-/// `HandleVector.IsVersionValid` 只做 `versions[index & 0xFFFFFF]`，**没有边界检查**。
-/// 因此：
-///   -1 → 约定「无回调」，本就不该推送；
-///   -2（手动释放）→ `& 0xFFFFFF` 得 0xFFFFFF → 必然越界 → ArgumentOutOfRangeException。
-/// 负值一律丢弃并记一条 error（前 5 次），其余值保持原样以维持与原版一致的行为。
+/// 回调句柄合法性：只有 -1 表示"无回调"。
 pub(crate) fn callback_ok(callback_idx: i32) -> bool {
-    if callback_idx >= 0 {
-        return true;
-    }
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static BAD: AtomicUsize = AtomicUsize::new(0);
-    if BAD.fetch_add(1, Ordering::Relaxed) < 5 {
-        tracing::error!(
-            callback_idx,
-            "非法 callback_idx 已丢弃（防止 C# HandleVector 越界）"
-        );
-    }
-    false
+    callback_ok_at("unknown", callback_idx)
+}
+
+/// 带来源标签的版本（诊断用：定位异常值来自哪条消息路径）。
+pub(crate) fn callback_ok_at(_tag: &'static str, callback_idx: i32) -> bool {
+    // 只有 -1 是"无回调"哨兵（原版 `if (callbackIdx != -1)`）。
+    //
+    // 2026-11-27 更正（严重）：此前把**所有负值**当非法丢弃是错的。
+    // callbackIdx 是 C# 的**完整句柄** = (版本 << 24) | 索引，C# 侧
+    // Game.StepTheSim 直接 `new Handle { index = callbackInfo.callbackIdx }`。
+    // 版本号 0x80..0xFF 时高位为 1，值就表现为负数——那是**合法句柄**。
+    // 当成垃圾丢掉 → 该句柄的回调永不触发。机械气闸"开门消失"即此：
+    // 门格句柄版本累积到 0x80 后，OnSimDoorOpened 被丢 → 门保持 bypass
+    // → Door.Sim200ms 冻裂检查发现格已非固体 → 销毁门。
+    // -2（手动释放）交由 C# 的 IsManuallyReleasedHandle 处理，与原版一致。
+    callback_idx != -1
 }
 use crate::a_framework::sim_frame_manager::SimFrameInfo;
 use crate::b_elements::elements_table;
@@ -165,8 +162,29 @@ pub fn process_dig_points(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
         };
 
         // 3. 如果 callback_idx != -1，push 到 callback_info
-        if callback_ok(dig_point.callback_idx) {
+        if callback_ok_at("dig", dig_point.callback_idx) {
             let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
+            // 诊断（2026-11-27）：记录推出去的挖掘回调，用于与"未被消费"告警对账。
+            // 机械气闸开门 = Dig + 回调；若这里记了而 C# 没执行 OnSimDoorOpened，
+            // 就能区分"没推"还是"推了但丢了"。前 50 条，避免刷屏。
+            {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static PUSHED: AtomicUsize = AtomicUsize::new(0);
+                let n = PUSHED.fetch_add(1, Ordering::Relaxed);
+                if n < 50 {
+                    tracing::info!(
+                        cell = cell_idx,
+                        callback_idx = dig_point.callback_idx,
+                        // 同时打印十六进制：句柄是 (版本<<24)|索引，版本 >= 0x80 时
+                        // 十进制显示为负数，极易被误读成"非法值"（2026-11-27 气闸事故）
+                        callback_hex = format_args!("0x{:08X}", dig_point.callback_idx as u32),
+                        backwall = dig_point.backwall,
+                        elem_idx,
+                        seq = n + 1,
+                        "dig 回调已推送"
+                    );
+                }
+            }
             sim_events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
                 callback_idx: dig_point.callback_idx,
             });
@@ -388,7 +406,7 @@ fn process_cell_properties(frame: &mut SimFrameInfo, sim_data: &mut SimData) {
             }
         }
         // 原版 L298-311：callback_idx != -1 → 推 callback_info（C# 协程等待该回调）
-        if callback_ok(entry.callback_idx) {
+        if callback_ok_at("cell_mod", entry.callback_idx) {
             let events = unsafe { &mut *sim_data.sim_events.ptr };
             events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
                 callback_idx: entry.callback_idx,
@@ -524,7 +542,7 @@ fn process_cell_modifications(frame: &mut SimFrameInfo, sim_data: &mut SimData) 
         }
 
         // callback_idx != -1 → push callback_info（源码 L135019-135031）
-        if callback_ok(entry.callback_idx) {
+        if callback_ok_at("replace", entry.callback_idx) {
             let sim_events = unsafe { &mut *sim_data.sim_events.ptr };
             sim_events.callback_info.push(crate::a_framework::game_data::CallbackInfo {
                 callback_idx: entry.callback_idx,
@@ -2654,6 +2672,44 @@ mod tests {
         assert_eq!(updated_cells.element_idx.get(7), sd.vacuum_element_idx);
     }
 
+    /// 回归（2026-11-28，机械气闸"开门瞬间消失"）：**完整句柄**必须原样进入
+    /// callback_info，哪怕版本号 ≥ 0x80 使其表现为负数。
+    ///
+    /// 实机日志抓到的真实值：0x80000738 / 0x80000739（版本 0x80，索引相邻），
+    /// 正是气闸两个门格。RC-4.3 曾把这类值当"非法负数"丢弃 →
+    /// OnSimDoorOpened 不触发 → 门保持 bypass → Door.Sim200ms 冻裂检查销毁门。
+    /// 这条测试走的是真实消息处理链路，不是只测判定函数。
+    #[test]
+    fn process_dig_points_keeps_full_handle_with_high_version() {
+        let _lock = LIB_TESTS_LOCK.lock();
+        init_elements_table();
+        let mut sd = make_test_sim_data();
+        let mut frame = SimFrameInfo::default();
+        let updated_cells = unsafe { &mut *sd.updated_cells.ptr };
+        updated_cells.element_idx.set(7, 0u16);
+        updated_cells.mass.set(7, 50.0f32);
+
+        for (i, handle) in [0x80000738u32, 0x80000739u32, 0xFF000001u32].into_iter().enumerate() {
+            frame.dig_points.push(crate::a_framework::sim_events::DigPoint {
+                game_cell: 0,
+                callback_idx: handle as i32,
+                skip_event: 1,
+                backwall: 0,
+                _pad: [0, 0],
+            });
+            // 每个点挖同一格即可：回调推送发生在清格之前，不受格内容影响
+            let _ = i;
+        }
+
+        process_dig_points(&mut frame, &mut sd);
+
+        let sim_events = unsafe { &*sd.sim_events.ptr };
+        assert_eq!(sim_events.callback_info.len(), 3, "三个高版本句柄都必须被推送");
+        assert_eq!(sim_events.callback_info.get(0).callback_idx, 0x80000738u32 as i32);
+        assert_eq!(sim_events.callback_info.get(1).callback_idx, 0x80000739u32 as i32);
+        assert_eq!(sim_events.callback_info.get(2).callback_idx, 0xFF000001u32 as i32);
+    }
+
     /// Add（mode 0）语义（2026-08-02 液滴回注修复）：向真空格添加液体 → 直接放置
     /// （add_liquid 真空分支，原版 L134426-134431），并产生 substance 事件。
     #[test]
@@ -3246,13 +3302,16 @@ mod tests {
 mod callback_guard_tests {
     use super::callback_ok;
 
-    /// 2026-11-26：负值句柄不得进入 callback_info。
-    /// -2 会变成 0xFFFFFF 索引，C# HandleVector 无边界检查 → 越界崩溃。
+    /// 2026-11-27：只有 -1 是"无回调"。
+    /// 高位为 1 的值是**合法句柄**（版本号 ≥ 0x80），必须放行——
+    /// 曾被误判为负数丢弃，导致机械气闸收不到 OnSimDoorOpened 而消失。
     #[test]
-    fn callback_ok_rejects_negative() {
+    fn callback_ok_only_rejects_minus_one() {
         assert!(!callback_ok(-1));
-        assert!(!callback_ok(-2));
         assert!(callback_ok(0));
         assert!(callback_ok(0x1234));
+        // 0x80000738 = 版本 0x80 | 索引 0x738，是真实出现过的气闸门格句柄
+        assert!(callback_ok(0x80000738u32 as i32));
+        assert!(callback_ok(-2));
     }
 }

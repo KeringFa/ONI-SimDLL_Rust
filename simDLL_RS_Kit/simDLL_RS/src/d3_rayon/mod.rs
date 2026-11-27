@@ -42,10 +42,23 @@ pub fn pool() -> &'static rayon::ThreadPool {
         // 物理核数用 Ex API 拓扑（旧 API 在本机返回全 Group → fallback 逻辑核 16，
         // 导致线程池 15 线程超额订阅）。复用 affinity::CpuTopology。
         let reserve = reserve_cores();
-        let threads = crate::d3_rayon::affinity::CpuTopology::cached()
-            .physical_cores
-            .saturating_sub(reserve)
-            .max(1);
+        let topo = crate::d3_rayon::affinity::CpuTopology::cached();
+        let phys_avail = topo.physical_cores.saturating_sub(reserve).max(1);
+        let logical = topo.logical_cores.max(1);
+        let requested = crate::d3_rayon::scheduler::utilize_threads();
+        // 2026-11-28：显式线程数优先；未指定时按模式自动推导。
+        //   D1（超线程优化）：沿用"物理核 − 预留"（亲和分组本就依赖物理核组）
+        //   其他：取物理核的一半 —— 实测 8 核上 4 线程 8.2ms 优于 7 线程 8.8ms，
+        //         再多是内存带宽竞争；同时给主线程（渲染/寻路）留出余量。
+        let threads = if requested > 0 {
+            (requested as usize).clamp(1, logical)
+        } else if crate::d3_rayon::scheduler::current_mode()
+            == crate::d3_rayon::scheduler::SchedulerMode::D1
+        {
+            phys_avail.min(logical)
+        } else {
+            phys_avail.min((topo.physical_cores / 2).max(2))
+        };
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("simdll-d3-{i}"))
             .num_threads(threads)
